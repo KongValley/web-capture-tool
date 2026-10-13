@@ -167,7 +167,7 @@ function reloadAndWait(wc, ms = 900) {
   });
 }
 
-async function run({ state, store, gpu, extract, settings, automation, format, files, capture, logger, session, recorder, resetActive, PARTITION }) {
+async function run({ state, store, gpu, extract, settings, automation, format, files, capture, logger, session, recorder, picker, resetActive, PARTITION }) {
   const results = [];
   const check = (name, cond, extra = '') => {
     results.push({ name, pass: !!cond, extra });
@@ -1298,6 +1298,295 @@ async function run({ state, store, gpu, extract, settings, automation, format, f
         others117.ok && others117.closed >= 1 && tabs117.length === 1 && tabs117[0].id === active117.id,
         `关闭 ${others117.closed} 个 / 剩余 ${tabs117.length}`);
     } catch (e) { check('「关闭其他」标签', false, e.message); }
+
+    /* ============================================ 118-132 第三轮：分析 / 导出 / 录制二期 / 页面工具 / 性能 */
+
+    // 118 记录标记与备注（全走界面路径：行 → ★ 标记 → 备注输入）
+    try {
+      const id118 = await peval(`(() => {
+        const row = [...document.querySelectorAll('#list .row')].find((n) => rows.get(Number(n.dataset.id)).rec.method === 'GET');
+        if (!row) return null;
+        row.click();
+        return Number(row.dataset.id);
+      })()`);
+      await sleep(400);
+      await peval(`(() => { document.getElementById('markStar').click(); return true; })()`);
+      await sleep(400);
+      await peval(`(() => { const c = document.getElementById('markComment'); c.value = 'probe-star'; c.dispatchEvent(new Event('change', { bubbles: true })); return true; })()`);
+      await sleep(400);
+      const ui118 = await peval(`(() => {
+        const row = document.querySelector('#list .row[data-id="${id118}"]');
+        return {
+          star: row ? row.dataset.star : '',
+          btn: (document.getElementById('markStar') || {}).textContent || '',
+          comment: (document.getElementById('markComment') || {}).value || '',
+        };
+      })()`);
+      const d118 = await pinvoke('cap:detail', id118);
+      await peval(`(() => {                                  // 复位：清备注 + 取消标记
+        const c = document.getElementById('markComment');
+        c.value = '';
+        c.dispatchEvent(new Event('change', { bubbles: true }));
+        document.getElementById('markStar').click();
+        return true;
+      })()`);
+      await sleep(400);
+      const off118 = await pinvoke('cap:detail', id118);
+      check('记录标记与备注',
+        id118 != null && ui118.star === '1' && ui118.btn.includes('已标记') && ui118.comment === 'probe-star'
+          && !!d118 && d118.star === true && d118.comment === 'probe-star'
+          && off118.star === false && off118.comment === '',
+        `id=${id118} 列表标记=${ui118.star} 按钮=${JSON.stringify(ui118.btn)} 备注=${JSON.stringify(ui118.comment)} 详情=${d118 && d118.star}/${d118 && d118.comment} 复位=${off118 && off118.star}/${JSON.stringify(off118 && off118.comment)}`);
+    } catch (e) { check('记录标记与备注', false, e.message); }
+
+    // 119 概览统计
+    try {
+      const s119 = format.buildStats(state.records);
+      const r119 = await pinvoke('cap:stats');
+      const sumType = s119.byType.reduce((n, x) => n + x.count, 0);
+      const sumStatus = s119.byStatus.reduce((n, x) => n + x.count, 0);
+      check('概览统计',
+        s119.total === state.records.length && s119.total > 0 && sumType === s119.total && sumStatus === s119.total
+          && s119.byDomain.length >= 1 && s119.slowest.length >= 1 && !!s119.slowest[0].url && !!r119 && r119.total === s119.total,
+        `总数=${s119.total} 域名=${s119.byDomain.length} 类型合计=${sumType} 状态合计=${sumStatus} 最慢=${s119.slowest.length} 主进程=${r119 && r119.total}`);
+    } catch (e) { check('概览统计', false, e.message); }
+
+    // 120 瀑布图视图
+    try {
+      const w120 = await peval(`(() => {
+        view = 'wf';
+        syncTabs();
+        const expect = [...rows.values()].filter((v) => v.rec.time && v.rec.duration != null).length;
+        const bars = [...document.querySelectorAll('#wf .wfrow')];
+        const lefts = bars.map((b) => parseFloat(b.querySelector('.wfbar2').style.left));
+        let mono = true;
+        for (let i = 1; i < lefts.length; i++) if (lefts[i] < lefts[i - 1] - 0.01) mono = false;
+        const out = {
+          bars: bars.length, expect, mono,
+          info: document.getElementById('wfInfo').textContent,
+          n: document.getElementById('nWf').textContent,
+          titled: bars.length ? bars[0].title : '',
+        };
+        view = 'list';
+        syncTabs();
+        return out;
+      })()`);
+      check('瀑布图视图',
+        w120.bars === w120.expect && w120.bars >= 1 && w120.mono && w120.info.includes('跨度') && Number(w120.n) === w120.bars && w120.titled.includes('ms'),
+        `条形=${w120.bars}/${w120.expect} 偏移单调=${w120.mono} 信息=${JSON.stringify(w120.info)} 计数=${w120.n}`);
+    } catch (e) { check('瀑布图视图', false, e.message); }
+
+    // 121 响应体全文搜索
+    try {
+      const s121 = await pinvoke('cap:searchBody', '"ok":true');
+      const ids121 = new Set(state.records.map((r) => r.id));
+      await peval(`(() => { const f = document.getElementById('filter'); f.value = 'body:"ok":true'; f.dispatchEvent(new Event('input', { bubbles: true })); return true; })()`);
+      await sleep(900);
+      const ui121 = await peval(`(() => {
+        let scan = 0;
+        for (const r of rows.values()) if (r.node && r.node.style.display !== 'none') scan++;
+        return {
+          n: document.getElementById('nReq').textContent,
+          note: document.getElementById('listNote').hidden ? '' : document.getElementById('listNote').textContent,
+          scan,
+          dom: document.querySelectorAll('#list .row').length,
+          size: rows.size,
+        };
+      })()`);
+      await peval(`(() => { const f = document.getElementById('filter'); f.value = ''; f.dispatchEvent(new Event('input', { bubbles: true })); return true; })()`);
+      await sleep(400);
+      const after121 = await peval(`document.getElementById('nReq').textContent`);
+      check('响应体全文搜索',
+        s121.ok && s121.count >= 1 && s121.ids.every((id) => ids121.has(id)) && Number(ui121.n) === s121.count
+          && ui121.note.includes('响应体命中') && Number(after121) > s121.count,
+        `命中=${s121.count} 面板可见=${ui121.n}（DOM 扫描 ${ui121.scan}/${ui121.dom}，内存 ${ui121.size}）提示=${JSON.stringify(ui121.note)} 清空过滤后=${after121}`);
+    } catch (e) { check('响应体全文搜索', false, e.message); }
+
+    // 122 转代码（Python / Node）
+    try {
+      const post = state.records.find((r) => r.method === 'POST' && r.postData)
+        || { id: -1, method: 'POST', url: 'http://127.0.0.1/x', postData: 'ping=1', requestHeaders: { 'Content-Type': 'application/x-www-form-urlencoded' } };
+      const py = format.buildPythonRequests(post);
+      const nf = format.buildNodeFetch(post);
+      const ax = format.buildNodeAxios(post);
+      check('转代码（Python/Node）',
+        py.includes('import requests') && py.includes('requests.request("POST"') && py.includes("'ping=1'") && py.includes(post.url)
+          && nf.includes('await fetch(') && nf.includes('body: "ping=1"') && nf.includes(post.url)
+          && ax.includes('axios.request({') && ax.includes(post.url),
+        `python=${py.length} fetch=${nf.length} axios=${ax.length} url=${post.url}`);
+    } catch (e) { check('转代码（Python/Node）', false, e.message); }
+
+    // 123 Postman 导出
+    try {
+      const rec123 = state.records.find((r) => r.method === 'POST' && r.postData) || state.records[state.records.length - 1];
+      const f123 = path.join(outDir, 'postman.json');
+      const r123 = await pinvoke('cap:exportPostman', { ids: [rec123.id], file: f123 });
+      const col = r123.ok && fs.existsSync(f123) ? JSON.parse(fs.readFileSync(f123, 'utf8')) : null;
+      check('Postman 导出',
+        r123.ok && !!col && String(col.info.schema).includes('v2.1.0') && col.item.length === 1
+          && col.item[0].request.method === rec123.method && col.item[0].request.header.length >= 1,
+        r123.error || `${path.basename(f123)} item=${col && col.item.length} method=${col && col.item[0].request.method} header=${col && col.item[0].request.header.length}`);
+    } catch (e) { check('Postman 导出', false, e.message); }
+
+    // 124 Markdown 表格
+    try {
+      const syn124 = [0, 1, 2].map((i) => ({
+        id: 900 + i, method: 'GET', url: i === 1 ? 'http://x/a|b' : `http://x/${i}`,
+        status: 200, type: 'XHR', encodedDataLength: 10, duration: 5, star: i === 0,
+      }));
+      const md124 = format.buildMarkdownTable(syn124);
+      const lines124 = md124.split('\n').filter(Boolean);
+      check('Markdown 表格',
+        lines124.length === 5 && lines124[0].includes('| URL |') && md124.includes('\\|') && md124.includes('★'),
+        `行数=${lines124.length} 表头=${JSON.stringify(lines124[0])} 转义=${md124.includes('\\|')} 星标=${md124.includes('★')}`);
+    } catch (e) { check('Markdown 表格', false, e.message); }
+
+    // 125 录制重放（输入 + 点击 → 对新页面重放，服务端命中数增加）
+    try {
+      const view125 = state.view.webContents;      // 117 关掉了最早那个标签，这里重新取当前活动视图
+      await view125.loadURL(base + '/');
+      await sleep(900);
+      const st125 = await pinvoke('cap:recStart', { shots: false });
+      await extract.evalPage(`(() => {
+        const inp = document.querySelector('form input[name=q]');
+        inp.focus();
+        inp.value = 'replay-probe';
+        inp.dispatchEvent(new Event('input', { bubbles: true }));
+        return true;
+      })()`);
+      await sleep(400);
+      const before125 = hits['/b'] || 0;
+      await extract.evalPage(`(() => { document.querySelector('a[href="/b"]').click(); return true; })()`);
+      await sleep(900);
+      const stopped125 = await pinvoke('cap:recStop');
+      await view125.loadURL(base + '/');                     // 回到起始页，重放时元素才在
+      await sleep(800);
+      const rp125 = await pinvoke('cap:recReplay', { file: stopped125.file, speed: 0 });
+      await sleep(400);
+      const idle125 = await pinvoke('cap:recReplayStop');
+      const after125 = hits['/b'] || 0;
+      check('录制重放',
+        stopped125.ok && rp125.ok && rp125.total >= 2 && rp125.done === rp125.total && (rp125.failed || []).length === 0
+          && after125 > before125 && idle125.ok === false,
+        `动作 ${rp125.done}/${rp125.total} 失败=${(rp125.failed || []).length} /b 命中 ${before125}→${after125} 空闲停止=${idle125.error}`);
+    } catch (e) { check('录制重放', false, e.message); }
+
+    // 126 录制列表与读取
+    try {
+      const list126 = await pinvoke('cap:recList');
+      const file126 = Array.isArray(list126) && list126.length ? list126[0].file : '';
+      const r126 = file126 ? await pinvoke('cap:recRead', { file: file126 }) : null;
+      const outside126 = await pinvoke('cap:recRead', { file: path.join(outDir, 'nope.jsonl') });
+      check('录制列表与读取',
+        Array.isArray(list126) && list126.length >= 1 && !!list126[0].file && list126[0].size > 0 && typeof list126[0].entries === 'number'
+          && !!r126 && r126.ok && r126.md.includes('## 时间线') && r126.actions.length >= 1 && outside126.ok === false,
+        `列表=${list126.length} 首项=${list126[0].base} entries=${list126[0].entries} md=${r126 && r126.md.length} 动作=${r126 && r126.actions.length} 越界=${outside126.error}`);
+    } catch (e) { check('录制列表与读取', false, e.message); }
+
+    // 127 录制转脚本（纯函数）
+    try {
+      const sc127 = recorder.buildScript([
+        { n: 1, t: 0, a: 'click', sel: '#go' },
+        { n: 2, t: 100, a: 'input', sel: '#q', value: 'abc' },
+        { n: 3, t: 200, a: 'scroll', y: 1200 },
+      ], { url: 'http://x/' });
+      check('录制转脚本',
+        sc127.includes("await page.goto('http://x/')") && sc127.includes("await page.click('#go')")
+          && sc127.includes("await page.fill('#q', 'abc')") && sc127.includes('window.scrollTo(0, 1200)'),
+        `${sc127.length} 字符`);
+    } catch (e) { check('录制转脚本', false, e.message); }
+
+    // 128 元素拾取（页面里点选 → 选择器进剪贴板，取消后标志复位）
+    try {
+      await state.view.webContents.loadURL(base + '/');
+      await sleep(800);
+      const p128 = await pinvoke('cap:pickStart');
+      await sleep(300);
+      const armed128 = await extract.evalPage('!!window.__wctPickArmed');
+      await extract.evalPage(`(() => {
+        const el = document.querySelector('#pw');
+        el.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: 20, clientY: 20 }));
+        el.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+        return true;
+      })()`);
+      await sleep(700);
+      const clip128 = electronClipboard.readText();
+      const cancel128 = await pinvoke('cap:pickCancel');
+      const off128 = await extract.evalPage('!!window.__wctPickArmed');
+      check('元素拾取', p128.ok && armed128 === true && clip128 === '#pw' && cancel128.ok && off128 === false,
+        `注入=${p128.ok} 页面标志=${armed128} 剪贴板=${JSON.stringify(clip128)} 取消=${cancel128.ok} 复位=${off128 === false}`);
+    } catch (e) { check('元素拾取', false, e.message); }
+
+    // 129 执行 JS
+    try {
+      const e129a = await pinvoke('cap:eval', '1+1');
+      const e129b = await pinvoke('cap:eval', 'throw new Error("boom")');
+      const e129c = await pinvoke('cap:eval', '   ');
+      check('执行 JS',
+        e129a.ok && e129a.value === '2' && e129b.ok === false && String(e129b.error).includes('boom') && e129c.ok === false,
+        `1+1=${JSON.stringify(e129a.value)} 异常=${JSON.stringify((e129b.error || '').slice(0, 40))} 空串=${e129c.ok}`);
+    } catch (e) { check('执行 JS', false, e.message); }
+
+    // 130 一键清理运行时数据
+    try {
+      await pinvoke('cap:cookieSet', { url: base + '/', name: 'wipe_ck', value: '1' });
+      await pinvoke('cap:storageSet', { area: 'local', key: 'wipe_k', value: '1' });
+      logger.log('test', 'WIPEPROBE');
+      const w130 = await pinvoke('cap:wipe', { targets: ['cookies', 'storage', 'logs'] });
+      await sleep(300);
+      const ck130 = await pinvoke('cap:cookies');
+      const pd130 = await extract.collectPageData();
+      const log130 = logger.tail(50);
+      const leftCk = (ck130.cookies || []).some((c) => c.name === 'wipe_ck');
+      const leftLs = (pd130.page.localStorage || {}).wipe_k;
+      check('一键清理运行时数据',
+        w130.ok && w130.done.length === 3 && w130.failed.length === 0 && !leftCk && !leftLs && log130 === '',
+        `done=${w130.done.join('/')} failed=${w130.failed.join('/')} 残留 cookie=${leftCk} localStorage=${leftLs} 日志残留=${log130.length} 字符`);
+    } catch (e) { check('一键清理运行时数据', false, e.message); }
+
+    // 131 抓包事件批处理（100ms 合并后与主进程一致；已 drop 的更新不复活行）
+    try {
+      resetActive();
+      await reloadAndWait(state.view.webContents);
+      await sleep(500);
+      const l131 = await pinvoke('cap:list');
+      await peval(`ipcRenderer.invoke('cap:list').then((d) => { refreshActiveList(d); return true; })`);
+      await sleep(300);
+      const ui131 = await peval(`(() => {
+        const rowsAll = [...rows.values()];
+        const scan = rowsAll.filter((r) => r.node && r.node.style.display !== 'none').length;
+        applyBatch({ records: [{ id: 991001, method: 'GET', url: 'http://batch/probe', type: 'XHR', status: 200, size: 1, duration: 1, time: new Date().toISOString() }] });
+        const appended = rows.has(991001);
+        applyBatch({ drops: [991001], updates: [{ id: 991001, method: 'GET', url: 'http://batch/probe', type: 'XHR', status: 500, size: 1, duration: 1, time: new Date().toISOString() }] });
+        return { memory: rows.size, scan, nReq: Number(document.getElementById('nReq').textContent), dom: document.querySelectorAll('#list .row').length, appended, revived: rows.has(991001) };
+      })()`);
+      check('抓包事件批处理',
+        ui131.memory === l131.records.length && ui131.dom === ui131.memory && ui131.nReq === ui131.scan
+          && ui131.appended === true && ui131.revived === false,
+        `主进程 ${l131.records.length} 条 / 面板内存 ${ui131.memory} / DOM ${ui131.dom} / nReq=${ui131.nReq}（扫描 ${ui131.scan}）放入=${ui131.appended} drop 后更新复活=${ui131.revived}`);
+    } catch (e) { check('抓包事件批处理', false, e.message); }
+
+    // 132 计数增量与列表差量同步
+    try {
+      const sync132 = await peval(`(async () => {
+        const first = document.querySelector('#list .row');
+        const d = await ipcRenderer.invoke('cap:list');
+        refreshActiveList(d);
+        const firstAfter = document.querySelector('#list .row');
+        let scan = 0;
+        for (const r of rows.values()) if (r.node && r.node.style.display !== 'none') scan++;
+        return {
+          same: first === firstAfter,
+          n: Number(document.getElementById('nReq').textContent),
+          scan,
+          total: Number(document.getElementById('count').textContent),
+          size: rows.size,
+        };
+      })()`);
+      check('计数与差量同步',
+        sync132.same && sync132.n === sync132.scan && sync132.total === sync132.size && sync132.scan >= 1,
+        `首行节点保持=${sync132.same} nReq=${sync132.n}（扫描 ${sync132.scan}）count=${sync132.total}=${sync132.size}`);
+    } catch (e) { check('计数与差量同步', false, e.message); }
   } catch (e) {
     check('自检执行', false, `${e.message} | status=${state.status} attached=${wc.debugger.isAttached()}`);
   }
