@@ -20,6 +20,7 @@ const values = {
   ignoreCertErrors: false,
   authUser: '',           // Basic 认证用户名（空 = 不自动应答）
   authPass: '',           // Basic 认证密码（明文存盘，仅本地使用）
+  recShots: false,        // 录制时是否给每次点击存一张视口截图
 };
 
 const MAX_REQ_DELAY = 10000;
@@ -143,6 +144,10 @@ async function applyInner(key, value, target) {
       values.authPass = String(value == null ? '' : value);
       return { ok: true };
 
+    case 'recShots':
+      values.recShots = !!value;
+      return { ok: true };
+
     case 'throttle': {
       if (!Object.prototype.hasOwnProperty.call(THROTTLE, value)) return { ok: false, error: '未知限速档位' };
       const wc = viewWc(target);
@@ -230,7 +235,27 @@ async function restoreRuntime(target) {
   return failed;
 }
 
+// 把当前 UA / 请求头 / 限速应用到所有已打开标签（UA 空串 = 复位成默认 UA）
+async function applyToAllTabs() {
+  const failed = [];
+  for (const tab of state.tabs) {
+    const wc = tab.wc;
+    if (!wc || wc.isDestroyed()) continue;
+    try {
+      wc.setUserAgent(values.ua || state.defaultUA);
+    } catch (e) { failed.push(`ua@${tab.id}: ${e.message}`); }
+    for (const key of ['headers', 'throttle']) {
+      if (!values[key]) continue;                        // 空请求头 / 不限速对该标签没有意义
+      try {
+        const r = await applyInner(key, values[key], wc);
+        if (!r.ok) failed.push(`${key}@${tab.id}: ${r.error}`);
+      } catch (e) { failed.push(`${key}@${tab.id}: ${e.message}`); }
+    }
+  }
+  return { ok: failed.length === 0, tabs: state.tabs.length, failed };
+}
+
 module.exports = {
   values, applySetting, applyInner, hydrate, restoreRuntime, registerBlocker, parseKeywords, parseHeaders,
-  MAX_REQ_DELAY, nextPaceWait, resetPacer, pacerState, decide, release,
+  MAX_REQ_DELAY, nextPaceWait, resetPacer, pacerState, decide, release, applyToAllTabs,
 };

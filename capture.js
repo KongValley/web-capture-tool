@@ -6,6 +6,7 @@ const { net, session } = require('electron');
 const { state, send, setStatus, normalizeUrl, PARTITION, MAX_RECORDS, MAX_BODY, MAX_TOTAL_BODY, MAX_WS_FRAMES } = require('./state');
 const settings = require('./settings');
 const format = require('./format');
+const recorder = require('./recorder');
 
 function summarize(r) {
   return {
@@ -14,6 +15,7 @@ function summarize(r) {
     size: r.encodedDataLength || 0, duration: r.duration,
     failed: r.failed, hasBody: r.body !== null, note: r.note,
     redirects: r.redirects.length,
+    restored: !!r.restored,
   };
 }
 
@@ -27,6 +29,7 @@ function fullRecord(r) {
     redirects: r.redirects, failed: r.failed,
     encodedDataLength: r.encodedDataLength, durationMs: r.duration,
     bodyBase64: r.bodyBase64, bodyError: r.bodyError, body: r.body,
+    restored: !!r.restored,
   };
 }
 
@@ -51,6 +54,7 @@ function onRequestWillBeSent(tab, ev) {
     prev.bodyBase64 = false;
     prev.bodyError = null;
     sendTab(tab, 'cap:update', summarize(prev));
+    recorder.onRequest(tab, prev, true);
     return;
   }
   const extra = tab.pendingExtra.get(requestId);
@@ -74,6 +78,7 @@ function onRequestWillBeSent(tab, ev) {
     sendTab(tab, 'cap:drop', gone.id);
   }
   sendTab(tab, 'cap:record', summarize(rec));
+  recorder.onRequest(tab, rec);
 }
 
 function onResponseReceived(tab, ev) {
@@ -87,6 +92,7 @@ function onResponseReceived(tab, ev) {
   rec.protocol = ev.response.protocol || '';
   if (!rec.type && ev.type) rec.type = ev.type;
   sendTab(tab, 'cap:update', summarize(rec));
+  recorder.onResponse(tab, rec);
 }
 
 function onResponseExtraInfo(tab, ev) {
@@ -125,6 +131,7 @@ async function onLoadingFinished(tab, ev) {
     }
   }
   sendTab(tab, 'cap:update', summarize(rec));
+  recorder.onBody(tab, rec);
 }
 
 function onLoadingFailed(tab, ev) {
@@ -133,12 +140,14 @@ function onLoadingFailed(tab, ev) {
   rec.failed = { errorText: ev.errorText, blockedReason: ev.blockedReason || '', canceled: !!ev.canceled };
   if (typeof rec.startedAt === 'number') rec.duration = Math.round((ev.timestamp - rec.startedAt) * 1000);
   sendTab(tab, 'cap:update', summarize(rec));
+  recorder.onFail(tab, rec);
 }
 
 function pushWs(tab, frame) {
   tab.wsFrames.push(frame);
   if (tab.wsFrames.length > MAX_WS_FRAMES) tab.wsFrames.shift();
   sendTab(tab, 'cap:ws', frame);
+  recorder.onWs(tab, frame);
 }
 
 async function attachCapture(tab) {
@@ -169,6 +178,9 @@ async function attachCapture(tab) {
       case 'Network.webSocketFrameReceived': pushWs(tab, { kind: 'recv', requestId: params.requestId, opcode: params.response.opcode, payload: params.response.payloadData, time: Date.now() }); break;
       case 'Network.webSocketClosed': pushWs(tab, { kind: 'close', requestId: params.requestId, time: Date.now() }); break;
       case 'Network.webSocketFrameError': pushWs(tab, { kind: 'error', requestId: params.requestId, error: params.errorMessage, time: Date.now() }); break;
+      case 'Runtime.bindingCalled':
+        if (params.name === recorder.BINDING) recorder.onBinding(tab, params);
+        break;
       default: break;
     }
   });

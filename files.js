@@ -101,4 +101,28 @@ async function saveBodies(dir) {
   return { ok: true, dir: target, written, skipped };
 }
 
-module.exports = { sanitizeName, uniquePath, mimeExt, saveWithDialog, saveTextFile, saveBinaryFile, saveBodies };
+// 站点前缀：只取主机名，非法字符换成 _，解析失败返回空串
+function siteHost(url) {
+  try {
+    return new URL(String(url)).hostname.replace(/[^a-z0-9.-]/gi, '_').replace(/^\.+|\.+$/g, '');
+  } catch (e) { return ''; }
+}
+
+// 导出默认文件名：<主机名-><kind>-<ISO 时间戳，: 和 . 换成 ->
+function exportBaseName(kind, url, at) {
+  const stamp = new Date(at == null ? Date.now() : at).toISOString().replace(/[:.]/g, '-');
+  const host = siteHost(url);
+  return `${host ? `${host}-` : ''}${kind}-${stamp}`;
+}
+
+// 选一个 JSON 文件（设置导入用）
+async function pickJsonFile() {
+  const r = await dialog.showOpenDialog(state.win, { properties: ['openFile'], filters: [{ name: 'JSON', extensions: ['json'] }] });
+  if (r.canceled || !r.filePaths || !r.filePaths.length) return { ok: false, canceled: true };
+  return { ok: true, file: r.filePaths[0] };
+}
+
+module.exports = {
+  sanitizeName, uniquePath, mimeExt, saveWithDialog, saveTextFile, saveBinaryFile, saveBodies,
+  siteHost, exportBaseName, pickJsonFile,
+};

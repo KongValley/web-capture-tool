@@ -55,6 +55,10 @@ function snapshot() {
     title: state.view && !state.view.webContents.isDestroyed() ? state.view.webContents.getTitle() : '',
     records,
     wsFrames: state.wsFrames.slice(-MAX_WS),
+    tabs: state.tabs
+      .filter((t) => t.url && t.url !== 'about:blank')
+      .slice(0, 5)
+      .map((t) => ({ url: t.url, title: t.title || '' })),
   };
 }
 
@@ -101,6 +105,7 @@ function toInternal(f) {
     body: f.body === undefined ? null : f.body, bodyBase64: !!f.bodyBase64,
     bodyError: f.bodyError || null, failed: f.failed || null,
     remoteIP: f.remoteIP || '', protocol: f.protocol || '', redirects: f.redirects || [], note: f.note || '',
+    restored: true,
   };
 }
 
@@ -131,6 +136,7 @@ function load() {
     title: data.title || '',
     records: raw.map(toInternal),
     wsFrames: Array.isArray(data.wsFrames) ? data.wsFrames : [],
+    tabs: Array.isArray(data.tabs) ? data.tabs : [],
     count: raw.length,
   };
 }

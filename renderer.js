@@ -3,11 +3,15 @@
 const { ipcRenderer, clipboard } = require('electron');
 
 const $ = (id) => document.getElementById(id);
-const el = { list: $('list'), ws: $('ws'), detail: $('detail'), filter: $('filter'), type: $('typeFilter') };
+const el = { list: $('list'), ws: $('ws'), wsView: $('wsView'), detail: $('detail'), filter: $('filter'), type: $('typeFilter') };
 
-const rows = new Map();     // id -> {rec, node}
+const rows = new Map();     // id -> {rec, node}（node 可能为 null：超出渲染上限后仅保留数据）
+const LIST_MAX_ROWS = 3000; // 列表最多渲染的行数（超出后移除最早的 DOM，数据仍在内存与导出里）
+let domRows = 0;            // 当前 DOM 里的行数
+let listNew = 0;            // 未读新记录数（用户不在底部时累计）
 let selected = null;
 let detailId = null;
+let detailData = null;      // 当前详情面板对应的记录（复制按钮用）
 let view = 'list';
 
 const BODY_PREVIEW = 200 * 1024;          // 详情里文本响应体的预览上限
@@ -125,6 +129,11 @@ function makeRow(rec) {
   node.dataset.id = rec.id;
   node.innerHTML = '<span class="m"></span><span class="s"></span><span class="u"></span><span class="t"></span><span class="z"></span>';
   node.onclick = () => select(rec.id);
+  node.oncontextmenu = (e) => {
+    e.preventDefault();
+    select(rec.id);
+    showContextMenu(e.clientX, e.clientY, rowMenuItems(rec.id));
+  };
   return node;
 }
 
@@ -138,6 +147,7 @@ function humanSize(n) {
 function paintRow(node, rec) {
   const mode = $('colSet').value;
   el.list.dataset.cols = mode;
+  node.dataset.restored = rec.restored ? '1' : '';
   node.dataset.m = rec.method;
   node.children[0].textContent = rec.method;
   const s = node.children[1];
@@ -158,6 +168,21 @@ function paintRow(node, rec) {
   z.className = 'z';
 }
 
+function listAtBottom() {
+  return el.list.scrollHeight - el.list.scrollTop - el.list.clientHeight <= 40;
+}
+
+function updateListNew() {
+  $('listNew').hidden = listNew <= 0;
+  $('listNew').textContent = `↓ ${listNew} 条新记录`;
+}
+
+function updateListNote() {
+  const hidden = rows.size - domRows;
+  $('listNote').hidden = hidden <= 0;
+  $('listNote').textContent = hidden > 0 ? `已隐藏更早 ${hidden} 条（可导出）` : '';
+}
+
 function appendRecord(rec) {
   if (rows.has(rec.id)) return;
   const node = makeRow(rec);
@@ -167,29 +192,44 @@ function appendRecord(rec) {
   if (empty) empty.remove();
   el.list.appendChild(node);
   rows.set(rec.id, { rec, node });
+  domRows++;
   if (selected === rec.id) node.classList.add('sel');
   updateCounts();
+  if (listAtBottom()) el.list.scrollTop = el.list.scrollHeight;
+  else { listNew++; updateListNew(); }
+  while (domRows > LIST_MAX_ROWS) {
+    const first = el.list.querySelector('.row');
+    if (!first) break;
+    const item = rows.get(Number(first.dataset.id));
+    if (item) item.node = null;
+    first.remove();
+    domRows--;
+  }
+  updateListNote();
 }
 
 function updateRecord(rec) {
   const r = rows.get(rec.id);
   if (!r) return appendRecord(rec);
   r.rec = rec;
-  paintRow(r.node, rec);
-  r.node.style.display = matches(rec) ? '' : 'none';
+  if (r.node) {
+    paintRow(r.node, rec);
+    r.node.style.display = matches(rec) ? '' : 'none';
+  }
   if (selected === rec.id) scheduleDetailRender(rec.id);
   updateCounts();
 }
 
 function updateCounts() {
   let n = 0;
-  for (const { node } of rows.values()) if (visible(node)) n++;
+  for (const { node } of rows.values()) if (node && visible(node)) n++;
   $('nReq').textContent = n;
   $('count').textContent = rows.size;
 }
 
 function refilter() {
   for (const { rec, node } of rows.values()) {
+    if (!node) continue;                              // 已超出渲染上限的行只在内存里
     paintRow(node, rec);                              // 列预设可能刚切换，逐行重画
     node.style.display = matches(rec) ? '' : 'none';
   }
@@ -200,7 +240,8 @@ function refilter() {
 
 const esc = (s) => String(s == null ? '' : s);
 
-function headersBlock(title, headers, raw) {
+// 原始头优先去重后的「名称: 值」行（列表展示与复制共用一份实现）
+function headersLines(headers, raw) {
   const merged = [];
   const seen = new Set();
   for (const src of [raw, headers]) {
@@ -211,6 +252,15 @@ function headersBlock(title, headers, raw) {
       merged.push(`${k}: ${Array.isArray(v) ? v.join(', ') : v}`);
     }
   }
+  return merged;
+}
+
+function headersText(headers, raw) {
+  return headersLines(headers, raw).join('\n');
+}
+
+function headersBlock(title, headers, raw) {
+  const merged = headersLines(headers, raw);
   return merged.length ? `<h3>${title}</h3><pre>${merged.map(esc).join('\n')}</pre>` : '';
 }
 
@@ -241,13 +291,15 @@ function renderDetail(id) {
   if (!entry) { el.detail.innerHTML = '<div class="empty">记录已被清理</div>'; return; }
   ipcRenderer.invoke('cap:detail', id).then((d) => {
     if (!d) { el.detail.innerHTML = '<div class="empty">未找到记录 #' + esc(id) + '</div>'; return; }
+    detailData = d;
     el.detail.innerHTML =
-      `<div class="dbar"><button id="copyCurl">复制 cURL</button><button id="replayReq">重放请求</button><button id="expOne">导出此条</button><button id="saveReq">请求体另存</button></div>` +
+      `<div class="dbar"><button id="copyCurl">复制 cURL</button><button id="replayReq">重放请求</button><button id="expOne">导出此条</button><button id="saveReq">请求体另存</button><button id="copyUrl">复制 URL</button><button id="copyRespHeaders">复制响应头</button><button id="copyBody">复制响应体</button></div>` +
       `<h3>概要</h3><pre><span class="kv">URL     </span>${esc(d.url)}
 <span class="kv">方法    </span>${esc(d.method)}  <span class="kv">状态</span> ${esc(d.status)} ${esc(d.statusText)}
 <span class="kv">类型    </span>${esc(d.type)}  <span class="kv">MIME</span> ${esc(d.mime)}
 <span class="kv">远端    </span>${esc(d.remoteIP)}  ${esc(d.protocol)}  <span class="kv">耗时</span> ${d.durationMs == null ? '-' : d.durationMs + 'ms'}  <span class="kv">大小</span> ${d.encodedDataLength}B
 <span class="kv">时间    </span>${esc(d.time)}</pre>` +
+      (d.restored ? '<h3>来源</h3><pre class="muted">上次会话恢复（不是本次抓取）</pre>' : '') +
       (d.failed ? `<h3>失败</h3><pre class="s4">${esc(d.failed.errorText)}${d.failed.blockedReason ? ' · ' + esc(d.failed.blockedReason) : ''}</pre>` : '') +
       (d.redirects.length ? `<h3>重定向链</h3><pre>${d.redirects.map((x) => `${x.status} ${esc(x.url)}\n   → ${esc(x.location)}`).join('\n')}</pre>` : '') +
       headersBlock('请求头（原始，含 Cookie）', d.requestHeaders, d.requestHeadersRaw) +
@@ -261,9 +313,11 @@ function select(id) {
   clearTimeout(detailTimer);
   detailTimer = null;
   detailDirty = false;
-  if (selected && rows.has(selected)) rows.get(selected).node.classList.remove('sel');
+  const prev = selected != null ? rows.get(selected) : null;
+  if (prev && prev.node) prev.node.classList.remove('sel');
   selected = id;
-  if (rows.has(id)) rows.get(id).node.classList.add('sel');
+  const cur = rows.get(id);
+  if (cur && cur.node) cur.node.classList.add('sel');
   view = 'list';
   syncTabs();
   renderDetail(id);
@@ -285,11 +339,36 @@ function scheduleDetailRender(id) {
 function syncTabs() {
   document.querySelectorAll('.tab').forEach((t) => t.classList.toggle('on', t.dataset.view === view));
   el.list.classList.toggle('on', view === 'list');
-  el.ws.classList.toggle('on', view === 'ws');
+  el.wsView.classList.toggle('on', view === 'ws');
   el.detail.classList.toggle('on', view === 'list' && selected != null);
 }
 
 /* -------------------------------------------------------------- 多标签 */
+
+// 关闭标签后的可撤销提示（撤销窗口由主进程控制，超时会提示「撤销已过期」）
+async function closeTabUi(t) {
+  const r = await ipcRenderer.invoke('cap:tabClose', t.id);
+  if (!r || !r.ok) return toast('关闭标签失败：' + ((r && r.error) || '未知错误'), 'err');
+  toast(`已关闭「${String(r.title || '').slice(0, 30)}」`, 'info', r.undoMs || 8000, {
+    label: '撤销',
+    onClick: async () => {
+      const u = await ipcRenderer.invoke('cap:tabUndo');
+      if (!u || !u.ok) return toast('撤销失败：' + ((u && u.error) || '未知错误'), 'err');
+      toast(`已恢复标签（${u.records} 条记录）`, 'ok');
+      return undefined;
+    },
+  });
+  return undefined;
+}
+
+function tabMenuItems(t) {
+  return [
+    { label: '复制 URL', onClick: () => { clipboard.writeText(t.url || ''); toast('已复制 URL', 'ok', 2000); } },
+    { label: '重新加载', onClick: () => ipcRenderer.invoke('cap:tabReload', t.id) },
+    { label: '关闭其他', onClick: () => ipcRenderer.invoke('cap:tabCloseOthers', t.id) },
+    { label: '关闭', onClick: () => closeTabUi(t) },
+  ];
+}
 
 function renderTabs(list, activeId) {
   const box = $('tabList');
@@ -306,9 +385,10 @@ function renderTabs(list, activeId) {
     x.className = 'x';
     x.textContent = '✕';
     x.title = '关闭标签';
-    x.onclick = (e) => { e.stopPropagation(); ipcRenderer.invoke('cap:tabClose', t.id); };
+    x.onclick = (e) => { e.stopPropagation(); closeTabUi(t); };
     chip.appendChild(x);
     chip.onclick = () => ipcRenderer.invoke('cap:tabActivate', t.id);
+    chip.oncontextmenu = (e) => { e.preventDefault(); showContextMenu(e.clientX, e.clientY, tabMenuItems(t)); };
     box.appendChild(chip);
   }
 }
@@ -316,6 +396,10 @@ function renderTabs(list, activeId) {
 // 整表刷新（切换标签 / 恢复会话后）：记录、WebSocket、标签条、状态一次同步
 function refreshActiveList(d) {
   rows.clear();
+  domRows = 0;
+  listNew = 0;
+  updateListNew();
+  updateListNote();
   el.list.innerHTML = '<div class="empty">等待抓取…</div>';
   el.ws.innerHTML = '';
   el.detail.innerHTML = '';
@@ -333,18 +417,85 @@ function refreshActiveList(d) {
   syncTabs();
 }
 
+/* -------------------------------------------------------------- 右键菜单 */
+
+function hideContextMenu() {
+  $('ctxMenu').hidden = true;
+  $('ctxMenu').innerHTML = '';
+}
+
+// items: [{ label, onClick }]
+function showContextMenu(x, y, items) {
+  const box = $('ctxMenu');
+  box.innerHTML = '';
+  for (const it of items) {
+    const b = document.createElement('button');
+    b.className = 'ghost ctx-item';
+    b.textContent = it.label;
+    b.onclick = () => { hideContextMenu(); it.onClick(); };
+    box.appendChild(b);
+  }
+  box.hidden = false;
+  box.style.left = `${Math.min(x, window.innerWidth - 180)}px`;
+  box.style.top = `${Math.min(y, window.innerHeight - (items.length * 26 + 8))}px`;
+}
+
+// 记录行菜单：复制类不动选中项；重放/导出/另存先切到该行
+function rowMenuItems(id) {
+  const r = rows.get(id);
+  if (!r) return [];
+  return [
+    { label: '复制 URL', onClick: () => { clipboard.writeText(r.rec.url); toast('已复制 URL', 'ok', 2000); } },
+    { label: '复制 cURL', onClick: async () => {
+      const f = await ipcRenderer.invoke('cap:format', 'curl', id);
+      if (!f || !f.ok) return toast('复制失败：' + ((f && f.error) || '未知错误'), 'err');
+      clipboard.writeText(f.text);
+      toast('已复制 cURL', 'ok', 2000);
+      return undefined;
+    } },
+    { label: '重放', onClick: () => { select(id); openReplayModal(); } },
+    { label: '导出此条', onClick: () => exportResult(ipcRenderer.invoke('cap:exportAll', [id])) },
+    { label: '另存响应体', onClick: async () => {
+      const r2 = await ipcRenderer.invoke('cap:saveBody', id, 'response');
+      if (r2 && r2.ok) toast('已保存：' + r2.file, 'ok');
+      else if (r2 && r2.canceled) $('status').textContent = '已取消保存';
+      else toast('保存失败：' + ((r2 && r2.error) || '未知错误'), 'err');
+      return undefined;
+    } },
+  ];
+}
+
 /* -------------------------------------------------------------- WebSocket */
 
+function wsText(frame) {
+  const t = new Date(frame.time).toLocaleTimeString();
+  const map = { open: '⇡ 建立', close: '✕ 关闭', error: '! 错误', sent: '→ 发送', recv: '← 接收' };
+  return `[${t}] ${map[frame.kind] || frame.kind} ${frame.url || ''} ${frame.error || ''}\n${frame.payload || ''}`.trimEnd();
+}
+
+function wsMatch(frame) {
+  const f = $('wsFilter').value.trim().toLowerCase();
+  if (!f) return true;
+  return wsText(frame).toLowerCase().includes(f);
+}
+
 function appendWs(frame) {
+  if ($('wsPause').checked) return;                 // 暂停只影响显示，数据仍在主进程
+  if (!wsMatch(frame)) return;
   const empty = el.ws.querySelector('.empty');
   if (empty) empty.remove();
   const div = document.createElement('div');
-  const t = new Date(frame.time).toLocaleTimeString();
-  const map = { open: '⇡ 建立', close: '✕ 关闭', error: '! 错误', sent: '→ 发送', recv: '← 接收' };
-  div.textContent = `[${t}] ${map[frame.kind] || frame.kind} ${frame.url || ''} ${frame.error || ''}\n${frame.payload || ''}`.trimEnd();
+  div.textContent = wsText(frame);
   el.ws.appendChild(div);
   $('nWs').textContent = el.ws.children.length;
   if (view === 'ws') el.ws.scrollTop = el.ws.scrollHeight;
+}
+
+// 过滤/恢复暂停时按主进程的当前标签帧整体重画
+function rebuildWs(frames) {
+  el.ws.innerHTML = '';
+  $('nWs').textContent = '0';
+  for (const f of frames || []) appendWs(f);
 }
 
 /* ---------------------------------------------------------------- 模态框 */
@@ -655,12 +806,20 @@ async function openReplayModal() {
 
 /* ---------------------------------------------------------------- 轻提示 */
 
-// 非阻塞提示：最多同时 4 条，超出移除最早的一条
-function toast(msg, kind = 'info', ms = 4000) {
+// 非阻塞提示：最多同时 4 条，超出移除最早的一条；action = { label, onClick } 会在提示里加一个按钮
+function toast(msg, kind = 'info', ms = 4000, action) {
   const box = $('toasts');
   const div = document.createElement('div');
   div.className = 'toast' + (kind && kind !== 'info' ? ' ' + kind : '');
   div.textContent = String(msg);
+  if (action && action.label) {
+    const btn = document.createElement('button');
+    btn.className = 'ghost';
+    btn.textContent = action.label;
+    btn.style.marginLeft = '8px';
+    btn.onclick = () => { div.remove(); action.onClick(); };
+    div.appendChild(btn);
+  }
   box.appendChild(div);
   while (box.children.length > 4) box.removeChild(box.firstChild);
   setTimeout(() => div.remove(), ms);
@@ -689,8 +848,15 @@ function onKey(e) {
     if (k === 'l') { e.preventDefault(); $('url').focus(); $('url').select(); return; }
     if (k === 'f') { e.preventDefault(); $('filter').focus(); $('filter').select(); return; }
     if (k === 'p') { e.preventDefault(); $('toggle').click(); return; }
+    if (k === 's') { e.preventDefault(); $('expFiltered').click(); return; }
     return;
   }
+  if (e.altKey && !e.ctrlKey && !e.shiftKey) {
+    if (e.key === 'ArrowLeft') { e.preventDefault(); $('back').click(); return; }
+    if (e.key === 'ArrowRight') { e.preventDefault(); $('fwd').click(); return; }
+    return;
+  }
+  if (e.key === 'F5') { e.preventDefault(); $('reload').click(); return; }
   if (e.key === 'Escape') {
     if (!$('modal').hidden) { closeModal(); return; }
     if (!$('findbar').hidden) { $('findbar').hidden = true; ipcRenderer.invoke('cap:findStop'); return; }
@@ -746,6 +912,12 @@ $('expHtml').onclick = () => exportResult(ipcRenderer.invoke('cap:exportHtml'));
 $('expCookie').onclick = () => exportResult(ipcRenderer.invoke('cap:exportCookieJson'));
 $('expHar').onclick = () => exportResult(ipcRenderer.invoke('cap:exportHar', {}));
 $('modalClose').onclick = closeModal;
+$('status').onclick = () => {
+  const t = $('status').textContent;
+  if (!t) return;
+  clipboard.writeText(t);
+  toast('已复制状态栏内容', 'ok', 2000);
+};
 
 /* ---- 详情：复制 cURL / 重放（详情 HTML 每次重建，只能事件委托）---- */
 el.detail.addEventListener('click', async (e) => {
@@ -767,6 +939,16 @@ el.detail.addEventListener('click', async (e) => {
   } else if (id === 'expOne') {
     if (detailId == null) return;
     exportResult(ipcRenderer.invoke('cap:exportAll', [detailId]));
+  } else if (id === 'copyUrl' || id === 'copyRespHeaders' || id === 'copyBody') {
+    if (!detailData) return;
+    let text = '';
+    if (id === 'copyUrl') text = detailData.url;
+    else if (id === 'copyRespHeaders') text = headersText(detailData.responseHeaders, detailData.responseHeadersRaw);
+    else text = detailData.bodyBase64
+      ? `[base64 ${detailData.body ? detailData.body.length : 0} 字符，已省略]`
+      : String(detailData.body == null ? '' : detailData.body);
+    clipboard.writeText(text);
+    $('status').textContent = `已复制${id === 'copyUrl' ? ' URL' : id === 'copyRespHeaders' ? '响应头' : '响应体'}（${text.length} 字符）`;
   } else if (id === 'bodyToggle') {
     if (detailId == null) return;
     if (detailFull.has(detailId)) detailFull.delete(detailId); else detailFull.add(detailId);
@@ -804,6 +986,12 @@ $('headers').addEventListener('change', () => cfg('headers', $('headers').value)
 $('proxy').addEventListener('change', () => cfg('proxy', $('proxy').value));
 $('colSet').addEventListener('change', () => { refilter(); cfg('colSet', $('colSet').value); });
 $('reqDelay').addEventListener('change', () => cfg('reqDelay', +$('reqDelay').value));
+$('cfgAllTabs').onclick = async () => {
+  const r = await ipcRenderer.invoke('cap:cfgAllTabs');
+  if (!r || !r.ok) return toast(`部分标签应用失败：${((r && r.failed) || []).join('；')}`, 'err');
+  toast(`已应用到 ${r.tabs} 个标签`, 'ok');
+  return undefined;
+};
 $('uaSel').addEventListener('change', () => {
   const v = $('uaSel').value;
   const custom = v === 'custom';
@@ -957,6 +1145,91 @@ $('pageTools').onclick = () => {
   ]);
 };
 
+/* ---- 会话录制 ---- */
+let recTimer = null;
+
+function resetRecorderUi(reason) {
+  $('recToggle').classList.remove('on');
+  $('recToggle').textContent = '● 开始录制';
+  $('recPanel').hidden = true;
+  $('recItems').innerHTML = '';
+  if (reason === 'limit') toast('录制达到条数上限，已自动停止', 'warn');
+}
+
+// 录制中「最近 20 条」的一行文案
+function recItemLine(it) {
+  const acts = { click: '点击', input: '输入', change: '变更', submit: '提交', keydown: '按键', scroll: '滚动' };
+  const head = `#${it.tab == null ? '-' : it.tab}`;
+  if (it.k === 'action') return `${head} ${acts[it.a] || it.a} ${it.sel || ''}${it.text ? `「${String(it.text).slice(0, 24)}」` : ''}`;
+  if (it.k === 'req') return `${head} → ${it.method} ${it.url || ''}`;
+  if (it.k === 'res') return `${head} ← ${it.status} ${it.url || ''}`;
+  if (it.k === 'nav') return `${head} 跳转 ${it.url || ''}`;
+  if (it.k === 'page') return `${head} ${it.url || ''} — ${it.title || ''}`;
+  return `${head} ${it.k}`;
+}
+
+async function recStart() {
+  const r = await ipcRenderer.invoke('cap:recStart', { shots: $('recShots').checked });
+  if (!r || !r.ok) return toast('开始录制失败：' + ((r && r.error) || '未知错误'), 'err');
+  $('recToggle').classList.add('on');
+  $('recToggle').textContent = '■ 停止录制 0s · 0 条';
+  clearInterval(recTimer);
+  recTimer = setInterval(async () => {
+    const s = await ipcRenderer.invoke('cap:recStatus');
+    if (!s || !s.active) return resetRecorderUi('');
+    $('recToggle').textContent = `■ 停止录制 ${Math.floor((Date.now() - s.startedAt) / 1000)}s · ${s.entries} 条`;
+  }, 1000);
+  toast('录制已开始：' + r.file, 'ok');
+}
+
+async function recStop() {
+  clearInterval(recTimer);
+  recTimer = null;
+  resetRecorderUi('');
+  const r = await ipcRenderer.invoke('cap:recStop');
+  if (!r || !r.ok) return toast('停止录制失败：' + ((r && r.error) || '未知错误'), 'err');
+  $('status').textContent = `录制完成：${r.mdFile}`;      // 路径常驻状态栏（可点复制）
+  toast(`录制完成：${r.entries} 条 → ${r.mdFile}`, 'ok', 8000);
+  return undefined;
+}
+
+$('recToggle').onclick = () => ($('recToggle').classList.contains('on') ? recStop() : recStart());
+$('recOpen').onclick = () => ipcRenderer.invoke('cap:recOpen');
+$('recSummary').onclick = () => ipcRenderer.invoke('cap:recInfo').then((r) => {
+  if (!r || !r.ok) return undefined;
+  return ipcRenderer.invoke('cap:recOpen');
+});
+$('recShots').addEventListener('change', () => cfg('recShots', $('recShots').checked));
+ipcRenderer.on('cap:rec', (_e, d) => {
+  if (!d || d.active) return;
+  clearInterval(recTimer);
+  recTimer = null;
+  resetRecorderUi(d.reason);
+});
+ipcRenderer.on('cap:recItems', (_e, batch) => {
+  const box = $('recItems');
+  for (const it of batch || []) {
+    const div = document.createElement('div');
+    div.textContent = recItemLine(it);
+    box.appendChild(div);
+  }
+  while (box.children.length > 20) box.removeChild(box.firstChild);
+  $('recPanel').hidden = false;
+  box.scrollTop = box.scrollHeight;
+});
+
+/* ---- WebSocket 视图：暂停 / 过滤 / 清空显示 ---- */
+$('wsFilter').addEventListener('change', () => ipcRenderer.invoke('cap:ws').then((r) => rebuildWs((r && r.frames) || [])));
+$('wsPause').onchange = () => {
+  if ($('wsPause').checked) return;
+  ipcRenderer.invoke('cap:ws').then((r) => rebuildWs((r && r.frames) || []));
+};
+$('wsClear').onclick = () => {
+  el.ws.innerHTML = '';
+  $('nWs').textContent = '0';
+  $('wsNote').textContent = '已清空显示（数据仍在，切标签会重新载入）';
+};
+
 /* ---- 响应体存盘 ---- */
 $('saveBodies').onclick = () => ipcRenderer.invoke('cap:saveBodies').then((r) => {
   if (!r) return;
@@ -1047,17 +1320,48 @@ GPU 进程异常次数：${gs.crashes}
   box.appendChild(labelled('Basic 认证用户名', uIn));
   box.appendChild(labelled('Basic 认证密码（明文保存在 settings.json，仅本地使用）', pIn));
 
+  const cfgBar = document.createElement('div');
+  cfgBar.className = 'dbar';
+  const mkCfgBtn = (label, fn) => {
+    const b = document.createElement('button');
+    b.textContent = label;
+    b.onclick = fn;
+    cfgBar.appendChild(b);
+    return b;
+  };
+  mkCfgBtn('导出设置', () => exportResult(ipcRenderer.invoke('cap:cfgExport', {})));
+  mkCfgBtn('导入设置', async () => {
+    const r = await ipcRenderer.invoke('cap:cfgImport', {});
+    if (!r || !r.ok) {
+      if (r && r.canceled) return undefined;
+      return toast('导入失败：' + ((r && r.error) || '未知错误'), 'err');
+    }
+    const extra = `${r.skipped.length ? `，忽略 ${r.skipped.length} 项未知键` : ''}${r.failed.length ? `，失败 ${r.failed.length} 项` : ''}`;
+    toast(`已导入 ${r.applied} 项${extra}`, r.failed.length ? 'warn' : 'ok', 6000);
+    return undefined;
+  });
+  box.appendChild(cfgBar);
+
   const logTitle = document.createElement('div');
   logTitle.className = 'lbl';
-  logTitle.textContent = '诊断日志（最近 200 行）';
+  logTitle.textContent = '诊断日志（最近 1000 行）';
   logTitle.style.margin = '10px 0 4px';
+  const logFilter = document.createElement('input');
+  logFilter.id = 'logFilter';
+  logFilter.placeholder = '过滤关键字，例如 ipc 或 fatal';
+  logFilter.style.marginBottom = '4px';
   const logPre = document.createElement('pre');
   logPre.id = 'logTail';
-  const refreshLog = () => ipcRenderer.invoke('cap:logTail').then((r) => {
-    logPre.textContent = (r && r.ok && r.text) || '(暂无日志)';
-  });
+  const refreshLog = () => ipcRenderer.invoke('cap:logTail', { lines: 1000, filter: logFilter.value.trim() })
+    .then((r) => {
+      const count = r && r.ok ? (r.count || 0) : 0;
+      logTitle.textContent = `诊断日志（${logFilter.value.trim() ? '过滤命中 ' : '最近 '}${count} 行）`;
+      logPre.textContent = (r && r.ok && r.text) || '(暂无日志)';
+    });
+  logFilter.addEventListener('change', refreshLog);
   refreshLog();
   box.appendChild(logTitle);
+  box.appendChild(logFilter);
   box.appendChild(logPre);
 
   openModal('设置', [box], [
@@ -1126,7 +1430,16 @@ document.querySelectorAll('.tab').forEach((t) => { t.onclick = () => { view = t.
 
 ipcRenderer.on('cap:record', (_e, rec) => appendRecord(rec));
 ipcRenderer.on('cap:update', (_e, rec) => updateRecord(rec));
-ipcRenderer.on('cap:drop', (_e, id) => { const r = rows.get(id); if (r) r.node.remove(); rows.delete(id); updateCounts(); });
+ipcRenderer.on('cap:drop', (_e, id) => {
+  const r = rows.get(id);
+  if (r) {
+    if (r.node) r.node.remove();
+    domRows--;
+    rows.delete(id);
+  }
+  updateCounts();
+  updateListNote();
+});
 ipcRenderer.on('cap:ws', (_e, frame) => appendWs(frame));
 ipcRenderer.on('cap:status', (_e, s) => { $('status').textContent = s; });
 ipcRenderer.on('cap:navigated', (_e, d) => {
@@ -1136,6 +1449,13 @@ ipcRenderer.on('cap:navigated', (_e, d) => {
 });
 
 $('tabNew').onclick = () => ipcRenderer.invoke('cap:tabNew');
+$('listNew').onclick = () => {
+  el.list.scrollTop = el.list.scrollHeight;
+  listNew = 0;
+  updateListNew();
+};
+window.addEventListener('click', hideContextMenu);
+window.addEventListener('blur', hideContextMenu);
 ipcRenderer.on('cap:tabs', (_e, d) => renderTabs(d && d.tabs, d && d.activeTabId));
 ipcRenderer.on('cap:tabChanged', async () => refreshActiveList(await ipcRenderer.invoke('cap:list')));
 
@@ -1159,6 +1479,7 @@ let toggleState = true;
   $('colSet').value = cfgAll.colSet || 'd';
   refilter();
   $('reqDelay').value = Number.isFinite(Number(cfgAll.reqDelay)) ? Number(cfgAll.reqDelay) : 0;
+  $('recShots').checked = !!cfgAll.recShots;
   if (cfgAll.ua) {
     const preset = Object.keys(UA_PRESETS).find((k) => UA_PRESETS[k] === cfgAll.ua);
     if (preset) $('uaSel').value = preset;

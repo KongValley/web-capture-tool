@@ -18,6 +18,7 @@ const DEFAULTS = {
     blockMode: 'none', blockKeywords: '', recordOnly: false,
     throttle: 'off', ua: '', headers: '', proxy: '',
     colSet: 'd', reqDelay: 0, ignoreCertErrors: false, authUser: '', authPass: '',
+    recShots: false,
   },
   app: { softwareRendering: false, panelWidth: 520, window: { width: 1440, height: 900, x: null, y: null } },
 };
@@ -57,6 +58,7 @@ function normalize(raw) {
     for (const k of Object.keys(out.settings)) if (s[k] !== undefined) out.settings[k] = s[k];
     out.settings.recordOnly = !!out.settings.recordOnly;
     out.settings.ignoreCertErrors = !!out.settings.ignoreCertErrors;
+    out.settings.recShots = !!out.settings.recShots;
     out.settings.reqDelay = clampInt(out.settings.reqDelay, 0, 10000, 0);
     for (const k of ['blockMode', 'blockKeywords', 'throttle', 'ua', 'headers', 'proxy', 'authUser', 'authPass']) {
       out.settings[k] = String(out.settings[k] == null ? '' : out.settings[k]);

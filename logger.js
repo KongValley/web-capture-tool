@@ -9,7 +9,7 @@ const path = require('node:path');
 const { app } = require('electron');
 
 const MAX_BYTES = 2 * 1024 * 1024;
-const MAX_TAIL_LINES = 500;
+const MAX_TAIL_LINES = 2000;
 
 let overrideFile = null;
 let file = null;
@@ -50,11 +50,12 @@ function log(kind, message, extra) {
   } catch (e) { /* 日志失败不能反过来影响主流程 */ }
 }
 
-// 读文件尾 n 行；文件不存在返回空串
-function tail(n = 200) {
+// 读文件尾 n 行（可带子串过滤）；文件不存在返回空串
+function tail(n = 200, filter = '') {
   try {
-    const lines = fs.readFileSync(filePath(), 'utf8').split('\n');
+    let lines = fs.readFileSync(filePath(), 'utf8').split('\n');
     if (lines.length && lines[lines.length - 1] === '') lines.pop();
+    if (filter) lines = lines.filter((l) => l.includes(filter));
     return lines.slice(-Math.min(n, MAX_TAIL_LINES)).join('\n');
   } catch (e) {
     return '';

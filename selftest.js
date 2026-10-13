@@ -62,6 +62,7 @@ function page(title, port, nextHref, extraScript) {
 <div class="item"><span class="t">C</span><a href="/c">linkC</a></div>
 <table><thead><tr><th>名称</th><th>数量</th></tr></thead>
 <tbody><tr><td>苹果</td><td>3</td></tr><tr><td>香蕉</td><td>5</td></tr></tbody></table>
+<input type="password" id="pw" name="pw">
 <form action="/submit" method="post"><input name="q"><input name="page"></form>
 ${nextHref ? `<a class="next" href="${nextHref}">下一页</a>` : ''}
 <div id="tall" style="height:900px"></div><div id="extraBox"></div>
@@ -166,7 +167,7 @@ function reloadAndWait(wc, ms = 900) {
   });
 }
 
-async function run({ state, store, gpu, extract, settings, automation, format, files, capture, logger, session, resetActive, PARTITION }) {
+async function run({ state, store, gpu, extract, settings, automation, format, files, capture, logger, session, recorder, resetActive, PARTITION }) {
   const results = [];
   const check = (name, cond, extra = '') => {
     results.push({ name, pass: !!cond, extra });
@@ -863,6 +864,7 @@ async function run({ state, store, gpu, extract, settings, automation, format, f
 
     // 95 多标签创建与隔离
     try {
+      const before95 = (await pinvoke('cap:tabList')).length;   // 会话恢复可能已经重建了若干标签
       await pinvoke('cap:tabNew', `${base}/page/2?tab=2`);
       await sleep(1800);
       await pinvoke('cap:tabNew', `${base}/page/3?tab=3`);
@@ -881,7 +883,7 @@ async function run({ state, store, gpu, extract, settings, automation, format, f
         });
       }
       const bad = per.filter((p) => !p.hasOwn || p.foreign > 0);
-      check('多标签创建与隔离', tabs.length === 3 && bad.length === 0,
+      check('多标签创建与隔离', tabs.length === before95 + 2 && bad.length === 0,
         per.map((p) => `#${p.id}${p.url.replace(base, '')} ${p.count}条 foreign=${p.foreign}`).join(' | '));
     } catch (e) { check('多标签创建与隔离', false, e.message); }
 
@@ -901,7 +903,7 @@ async function run({ state, store, gpu, extract, settings, automation, format, f
       await pinvoke('cap:navigate', `${base}/`);
       await sleep(1500);
       const l2 = await pinvoke('cap:list');
-      check('标签切换与关闭', switched && closed.ok && after.length === 2 && destroyed && l2.records.some((r) => r.url === `${base}/`),
+      check('标签切换与关闭', switched && closed.ok && after.length === tabs.length - 1 && destroyed && l2.records.some((r) => r.url === `${base}/`),
         `切换=${switched} 剩余=${after.length} 视图已销毁=${destroyed} 新标签记录=${l2.records.length}`);
     } catch (e) { check('标签切换与关闭', false, e.message); }
 
@@ -917,6 +919,385 @@ async function run({ state, store, gpu, extract, settings, automation, format, f
       }))()`);
       check('标签栏 UI', ui.strip && ui.list && ui.btn && ui.chips === tabs.length, `chips=${ui.chips} tabs=${tabs.length}`);
     } catch (e) { check('标签栏 UI', false, e.message); }
+
+    /* ================================================== 98-102 会话录制 */
+
+    const readRec = (file) => fs.readFileSync(file, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
+    const recDir = recorder.dirPath();
+    let recFile = '';
+
+    // 98 录制启动与清单
+    try {
+      const st = await pinvoke('cap:recStart', { shots: false });
+      recFile = st.file || '';
+      const man = st.ok && fs.existsSync(recFile) ? readRec(recFile).find((l) => l.k === 'manifest') : null;
+      check('录制启动与清单',
+        st.ok === true && !!man && man.v === 1 && !!man.viewport && man.viewport.w > 0
+          && !!man.settings && man.settings.reqDelay !== undefined,
+        `${path.basename(recFile)} ${man ? `viewport=${man.viewport.w}x${man.viewport.h}` : (st.error || '无 manifest')}`);
+    } catch (e) { check('录制启动与清单', false, e.message); }
+
+    // 99 交互事件（含密码掩码）
+    try {
+      await extract.evalPage(`(() => {
+        const pw = document.getElementById('pw');
+        pw.value = 'secret';
+        pw.dispatchEvent(new Event('input', { bubbles: true }));
+        pw.dispatchEvent(new Event('change', { bubbles: true }));
+        return true;
+      })()`);
+      await extract.evalPage(`(() => { const a = document.querySelector('.item a'); if (a) a.click(); return !!a; })()`);
+      await sleep(800);
+      const lines = readRec(recFile);
+      const inputEv = lines.find((l) => l.k === 'action' && l.a === 'input' && String(l.sel || '').includes('#pw'));
+      const clickEv = lines.find((l) => l.k === 'action' && l.a === 'click');
+      check('录制交互事件（含密码掩码）',
+        !!inputEv && inputEv.value === '[password]' && !!clickEv,
+        `input=${inputEv ? `${inputEv.sel}/${inputEv.value}` : '无'} click=${clickEv ? clickEv.sel : '无'} 共 ${lines.length} 行`);
+    } catch (e) { check('录制交互事件（含密码掩码）', false, e.message); }
+
+    // 100 请求/响应/导航与关联
+    try {
+      const lines = readRec(recFile);
+      const clickEv = lines.find((l) => l.k === 'action' && l.a === 'click');
+      const reqEv = lines.find((l) => l.k === 'req' && /\/a$/.test(String(l.url)));
+      const resEv = reqEv ? lines.find((l) => l.k === 'res' && l.id === reqEv.id) : null;
+      const navEv = lines.find((l) => l.k === 'nav' && /\/a$/.test(String(l.url)));
+      check('录制网络与导航（关联触发它的点击）',
+        !!reqEv && !!resEv && !!navEv && !!clickEv && reqEv.after === clickEv.n,
+        `req=${reqEv ? `${reqEv.method} ${reqEv.url}` : '无'} res=${resEv ? resEv.status : '无'} nav=${!!navEv} after=${reqEv && reqEv.after}/${clickEv && clickEv.n}`);
+    } catch (e) { check('录制网络与导航（关联触发它的点击）', false, e.message); }
+
+    // 101 停止、摘要与负例
+    try {
+      const st = await pinvoke('cap:recStop');
+      const lines = readRec(recFile);
+      const summary = lines[lines.length - 1];
+      const md = st.ok && fs.existsSync(st.mdFile) ? fs.readFileSync(st.mdFile, 'utf8') : '';
+      const again = await pinvoke('cap:recStop');
+      const st2 = await pinvoke('cap:recStart', { shots: false });
+      const dup = await pinvoke('cap:recStart', { shots: false });
+      await pinvoke('cap:recStop');
+      check('录制停止与摘要',
+        st.ok === true && fs.existsSync(st.mdFile) && md.includes('## 时间线') && md.includes('统计：')
+          && !!summary && summary.k === 'summary' && summary.reason === 'manual' && st.entries === summary.entries
+          && again.ok === false && again.error === '当前没有录制'
+          && st2.ok === true && dup.ok === false && dup.error === '已在录制中',
+        `${path.basename(recFile)} ${st.entries} 条 · md=${md.length} 字符 · 负例=${again.error}/${dup.error}`);
+    } catch (e) { check('录制停止与摘要', false, e.message); }
+
+    // 102 点击截图开关
+    try {
+      await settings.applySetting('recShots', true);
+      await sleep(400);
+      store.flush();
+      const onDisk = JSON.parse(fs.readFileSync(store.filePath(), 'utf8'));
+      const st = await pinvoke('cap:recStart', {});         // 不传 shots → 走设置值
+      await sleep(200);
+      await extract.evalPage(`(() => { document.body.dispatchEvent(new MouseEvent('click', { bubbles: true, clientX: 10, clientY: 10 })); return true; })()`);
+      await sleep(1500);
+      const shots = fs.readdirSync(recDir).filter((f) => /-click-\d{3}\.png$/.test(f));
+      const shotEv = st.ok ? readRec(st.file).find((l) => l.k === 'shot') : null;
+      await pinvoke('cap:recStop');
+      await settings.applySetting('recShots', false);
+      await sleep(300);
+      store.flush();
+      check('录制点击截图开关',
+        onDisk.settings.recShots === true && st.ok === true && shots.some((f) => f.endsWith('-click-001.png')) && !!shotEv,
+        `落盘=${onDisk.settings.recShots} 截图=${shots.length} [${shots.slice(0, 2).join(', ')}] shot 记录=${!!shotEv}`);
+    } catch (e) { check('录制点击截图开关', false, e.message); }
+
+    /* ============================================ 103-117 第二轮打磨 */
+
+    const electronClipboard = require('electron').clipboard;
+
+    // 103 导出文件名带站点（纯函数）
+    try {
+      const at = Date.UTC(2026, 9, 13, 10, 0, 0);
+      const n1 = files.exportBaseName('capture', 'https://example.com/a/b', at);
+      const n2 = files.exportBaseName('page', 'about:blank', at);
+      const n3 = files.exportBaseName('shot', 'http://127.0.0.1:8080/x', at);
+      const n4 = files.exportBaseName('capture', 'not a url', at);
+      check('导出文件名带站点前缀',
+        n1 === 'example.com-capture-2026-10-13T10-00-00-000Z' && n2 === 'page-2026-10-13T10-00-00-000Z'
+          && n3 === '127.0.0.1-shot-2026-10-13T10-00-00-000Z' && n4 === 'capture-2026-10-13T10-00-00-000Z',
+        `${n1} | ${n2} | ${n3} | ${n4}`);
+    } catch (e) { check('导出文件名带站点前缀', false, e.message); }
+
+    // 104 设置导出/导入
+    try {
+      const f104 = path.join(outDir, 'cfg-export.json');
+      await settings.applySetting('reqDelay', 700);
+      const ex = await pinvoke('cap:cfgExport', { file: f104 });
+      const exported = JSON.parse(fs.readFileSync(f104, 'utf8'));
+      await settings.applySetting('reqDelay', 0);
+      const im = await pinvoke('cap:cfgImport', { file: f104 });
+      const memAfter = settings.values.reqDelay;
+      store.flush();
+      const afterImport = JSON.parse(fs.readFileSync(store.filePath(), 'utf8'));
+      const bad = await pinvoke('cap:cfgImport', { file: path.join(outDir, 'not-exist.json') });
+      await settings.applySetting('reqDelay', 0);
+      store.flush();
+      check('设置导出/导入',
+        ex.ok && exported.settings.reqDelay === 700 && im.ok && im.applied >= 1
+          && memAfter === 700 && afterImport.settings.reqDelay === 700 && bad.ok === false,
+        `导出 reqDelay=${exported.settings.reqDelay} 导入 applied=${im.applied} 内存=${memAfter} 磁盘=${afterImport.settings.reqDelay} 坏文件=${bad.ok}`);
+    } catch (e) { check('设置导出/导入', false, e.message); }
+
+    // 105 快捷键补齐（F5 / Alt+←→ / Ctrl+S）
+    try {
+      const spy = await peval(`(() => {
+        window.__spy = { reload: 0, back: 0, fwd: 0, exp: 0 };
+        document.getElementById('reload').click = () => { window.__spy.reload++; };
+        document.getElementById('back').click = () => { window.__spy.back++; };
+        document.getElementById('fwd').click = () => { window.__spy.fwd++; };
+        document.getElementById('expFiltered').click = () => { window.__spy.exp++; };
+        const kd = (key, extra) => window.dispatchEvent(new KeyboardEvent('keydown', Object.assign({ key, bubbles: true, cancelable: true }, extra || {})));
+        kd('F5');
+        kd('ArrowLeft', { altKey: true });
+        kd('ArrowRight', { altKey: true });
+        kd('s', { ctrlKey: true });
+        return window.__spy;
+      })()`);
+      await peval(`(() => {
+        for (const id of ['reload', 'back', 'fwd', 'expFiltered']) delete document.getElementById(id).click;
+        return true;
+      })()`);
+      check('快捷键补齐（F5 / Alt+←→ / Ctrl+S）',
+        spy.reload === 1 && spy.back === 1 && spy.fwd === 1 && spy.exp === 1, JSON.stringify(spy));
+    } catch (e) { check('快捷键补齐（F5 / Alt+←→ / Ctrl+S）', false, e.message); }
+
+    // 106 详情复制按钮与状态栏复制
+    try {
+      await peval(`(() => { const row = document.querySelector('#list .row'); if (row) row.click(); return !!row; })()`);
+      await sleep(400);
+      const hasBtns = await peval(`['copyUrl', 'copyRespHeaders', 'copyBody'].every((id) => !!document.getElementById(id))`);
+      await peval(`(() => { const b = document.getElementById('copyUrl'); if (b) b.click(); return true; })()`);
+      await sleep(300);
+      const clipUrl = electronClipboard.readText();
+      const statusText = await peval(`document.getElementById('status').textContent`);
+      await peval(`(() => { const s = document.getElementById('status'); s.textContent = 'probe-status'; s.click(); return true; })()`);
+      await sleep(300);
+      const clipStatus = electronClipboard.readText();
+      check('详情复制按钮与状态栏复制',
+        hasBtns && clipUrl.startsWith('http') && statusText.includes('已复制') && clipStatus === 'probe-status',
+        `按钮=${hasBtns} 剪贴板=${clipUrl.slice(0, 40)} 状态=${statusText}`);
+    } catch (e) { check('详情复制按钮与状态栏复制', false, e.message); }
+
+    // 107 列表跟随与未读提示
+    try {
+      const follow = await peval(`(() => {
+        const list = document.getElementById('list');
+        for (let i = 0; i < 60; i++) appendRecord({ id: 991000 + i, method: 'GET', url: 'http://pad/' + i, type: 'XHR', status: 200, size: 1, duration: 1, time: new Date().toISOString() });
+        if (list.scrollHeight <= list.clientHeight) return { scrollable: false };
+        list.scrollTop = 0;
+        for (let i = 0; i < 3; i++) appendRecord({ id: 990001 + i, method: 'GET', url: 'http://x/new' + i, type: 'XHR', status: 200, size: 1, duration: 1, time: new Date().toISOString() });
+        const btn = document.getElementById('listNew');
+        return { scrollable: true, top: list.scrollTop, btn: btn.hidden ? '' : btn.textContent };
+      })()`);
+      const clickedNew = await peval(`(() => {
+        document.getElementById('listNew').click();
+        return { top: document.getElementById('list').scrollTop, hidden: document.getElementById('listNew').hidden };
+      })()`);
+      const cleaned = await peval(`(() => {
+        let removed = 0;
+        for (let i = 0; i < 60; i++) {
+          const r = rows.get(991000 + i);
+          if (r) { if (r.node) { r.node.remove(); domRows--; } rows.delete(991000 + i); removed++; }
+        }
+        for (let i = 0; i < 3; i++) {
+          const r = rows.get(990001 + i);
+          if (r) { if (r.node) { r.node.remove(); domRows--; } rows.delete(990001 + i); removed++; }
+        }
+        updateCounts(); updateListNote(); updateListNew();
+        return removed;
+      })()`);
+      check('列表跟随与未读提示',
+        follow.scrollable === true && follow.top === 0 && follow.btn.includes('3 条新记录')
+          && clickedNew.top > 0 && clickedNew.hidden === true && cleaned === 63,
+        `可滚动=${follow.scrollable} 未读按钮=${JSON.stringify(follow.btn)} 点击后 top=${clickedNew.top} 清理=${cleaned}`);
+    } catch (e) { check('列表跟随与未读提示', false, e.message); }
+
+    // 108 大列表渲染上限
+    try {
+      const cap108 = await peval(`(() => {
+        for (let i = 0; i < 3006; i++) appendRecord({ id: 992000 + i, method: 'GET', url: 'http://cap/' + i, type: 'XHR', status: 200, size: 1, duration: 1, time: new Date().toISOString() });
+        const note = document.getElementById('listNote');
+        return { max: LIST_MAX_ROWS, dom: document.querySelectorAll('#list .row').length, size: rows.size, note: note.hidden ? '' : note.textContent };
+      })()`);
+      await peval(`ipcRenderer.invoke('cap:list').then((d) => { refreshActiveList(d); return true; })`);
+      check('大列表渲染上限',
+        cap108.max === 3000 && cap108.dom <= 3000 && cap108.size >= 3006 && /已隐藏更早 \d+ 条/.test(cap108.note),
+        `上限=${cap108.max} DOM=${cap108.dom} 内存=${cap108.size} 提示=${JSON.stringify(cap108.note)}`);
+    } catch (e) { check('大列表渲染上限', false, e.message); }
+
+    // 109 关闭标签可撤销
+    try {
+      const before109 = (await pinvoke('cap:tabList')).length;
+      const nt = await pinvoke('cap:tabNew', `${base}/page/2`);
+      await sleep(1200);
+      const l109 = await pinvoke('cap:list');
+      const cl = await pinvoke('cap:tabClose', nt.id);
+      const un = await pinvoke('cap:tabUndo');
+      const un2 = await pinvoke('cap:tabUndo');
+      const after109 = await pinvoke('cap:tabList');
+      check('关闭标签可撤销',
+        cl.ok && cl.undoMs === 10000 && un.ok && un.records === l109.records.length
+          && after109.length === before109 + 1 && un2.ok === false,
+        `关闭=${cl.ok} 撤销记录=${un.records}/${l109.records.length} 标签 ${before109}→${after109.length}（新建+关闭+撤销）二次撤销=${un2.error}`);
+    } catch (e) { check('关闭标签可撤销', false, e.message); }
+
+    // 110 右键菜单（标签 / 记录行）
+    try {
+      const menus = await peval(`(() => {
+        const chip = document.querySelector('#tabList .tabchip');
+        chip.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, clientX: 30, clientY: 60 }));
+        const tabItems = [...document.querySelectorAll('#ctxMenu .ctx-item')].map((b) => b.textContent);
+        hideContextMenu();
+        const row = document.querySelector('#list .row');
+        row.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, clientX: 30, clientY: 120 }));
+        const rowItems = [...document.querySelectorAll('#ctxMenu .ctx-item')].map((b) => b.textContent);
+        const url = rows.get(Number(row.dataset.id)).rec.url;
+        const copyBtn = [...document.querySelectorAll('#ctxMenu .ctx-item')].find((b) => b.textContent === '复制 URL');
+        if (copyBtn) copyBtn.click();
+        return { tabItems, rowItems, url };
+      })()`);
+      await sleep(300);
+      const clip110 = electronClipboard.readText();
+      const need = (arr, label) => arr.includes(label);
+      check('右键菜单（标签 / 记录行）',
+        need(menus.tabItems, '复制 URL') && need(menus.tabItems, '重新加载') && need(menus.tabItems, '关闭其他') && need(menus.tabItems, '关闭')
+          && need(menus.rowItems, '复制 URL') && need(menus.rowItems, '复制 cURL') && need(menus.rowItems, '重放') && need(menus.rowItems, '导出此条') && need(menus.rowItems, '另存响应体')
+          && clip110 === menus.url,
+        `标签项=${menus.tabItems.join('/')} 行项=${menus.rowItems.join('/')} 剪贴板一致=${clip110 === menus.url}`);
+    } catch (e) { check('右键菜单（标签 / 记录行）', false, e.message); }
+
+    // 111 设置应用到所有标签
+    try {
+      await settings.applySetting('ua', 'PolishProbe/1.0');
+      const all = await pinvoke('cap:cfgAllTabs');
+      const uas = state.tabs.map((t) => t.wc.getUserAgent());
+      const okAll = all.ok && all.tabs === state.tabs.length && uas.every((u) => u === 'PolishProbe/1.0');
+      await settings.applySetting('ua', '');
+      await pinvoke('cap:cfgAllTabs');
+      const uas2 = state.tabs.map((t) => t.wc.getUserAgent());
+      check('设置应用到所有标签', okAll && uas2.every((u) => u === state.defaultUA),
+        `${uas.length} 个标签统一=${okAll} 复位=${uas2.every((u) => u === state.defaultUA)}`);
+    } catch (e) { check('设置应用到所有标签', false, e.message); }
+
+    // 112 会话恢复标签布局与来源标记
+    try {
+      const tabsBefore112 = (await pinvoke('cap:tabList')).length;
+      const realTabs = state.tabs.filter((t) => t.url && t.url !== 'about:blank').length;
+      session.saveSync();
+      const sess = JSON.parse(fs.readFileSync(session.filePath(), 'utf8'));
+      const restored112 = await pinvoke('cap:sessionRestore');
+      await sleep(1500);
+      const tabsAfter112 = (await pinvoke('cap:tabList')).length;
+      const l112 = await pinvoke('cap:list');
+      const domRestored = await peval(`!!document.querySelector('#list .row[data-restored="1"]')`);
+      check('会话恢复标签布局与来源标记',
+        Array.isArray(sess.tabs) && sess.tabs.length === Math.min(realTabs, 5) && restored112.ok
+          && tabsAfter112 === tabsBefore112 + sess.tabs.length
+          && l112.records.some((r) => r.restored === true) && domRestored,
+        `保存 ${sess.tabs && sess.tabs.length} 标签（真实 ${realTabs}）/ 恢复后 ${tabsAfter112} 标签 / restored=${l112.records.filter((r) => r.restored).length} 条 / DOM 标记=${domRestored}`);
+    } catch (e) { check('会话恢复标签布局与来源标记', false, e.message); }
+
+    // 113 录制收尾（摘要可达 / 关窗也生成 md / 行首标标签）——开始与停止都走工具栏按钮，顺带覆盖 UI 链路
+    try {
+      await peval(`document.getElementById('recToggle').click()`);
+      await sleep(500);
+      await extract.evalPage(`(() => { document.body.dispatchEvent(new MouseEvent('click', { bubbles: true, clientX: 5, clientY: 5 })); return true; })()`);
+      await sleep(700);
+      await peval(`document.getElementById('recToggle').click()`);
+      await sleep(700);
+      const i113 = await pinvoke('cap:recInfo');
+      const md113 = i113.ok && fs.existsSync(i113.mdFile) ? fs.readFileSync(i113.mdFile, 'utf8') : '';
+      const st113 = await peval(`document.getElementById('status').textContent`);
+      const label113 = await peval(`document.getElementById('recToggle').textContent`);
+      const r113b = await pinvoke('cap:recStart', { shots: false });
+      await sleep(200);
+      const flush113 = recorder.flushSync();
+      const md113b = r113b.ok && fs.existsSync(r113b.mdFile) ? fs.readFileSync(r113b.mdFile, 'utf8') : '';
+      const tabPrefix = /^\[\d\d:\d\d\.\d\d\d\] #\d+ /m.test(md113);
+      check('录制收尾（摘要可达 / 关窗也生成 md / 行首标标签）',
+        i113.ok && tabPrefix && st113.includes('.md') && label113.includes('开始录制')
+          && flush113.ok && md113b.includes('停止原因：退出'),
+        `md=${path.basename(i113.mdFile || '')} 行首标签=${tabPrefix} 状态栏含路径=${st113.includes('.md')} 按钮复位=${label113.includes('开始录制')} 退出 md=${md113b.includes('停止原因：退出')}`);
+    } catch (e) { check('录制收尾（摘要可达 / 关窗也生成 md / 行首标标签）', false, e.message); }
+
+    // 114 录制中最近条目浮层
+    try {
+      await peval(`(() => { document.getElementById('recItems').innerHTML = ''; return true; })()`);
+      const r114 = await pinvoke('cap:recStart', { shots: false });
+      await sleep(300);
+      await extract.evalPage(`(() => { document.body.dispatchEvent(new MouseEvent('click', { bubbles: true, clientX: 5, clientY: 5 })); return true; })()`);
+      await sleep(1000);
+      const p114 = await peval(`(() => {
+        const kids = [...document.querySelectorAll('#recItems > div')];
+        return {
+          hidden: document.getElementById('recPanel').hidden,
+          n: kids.length,
+          hasClick: kids.some((k) => k.textContent.includes('点击')),
+          first: (kids[0] || {}).textContent || '',
+        };
+      })()`);
+      await pinvoke('cap:recStop');
+      check('录制中最近条目浮层', r114.ok && p114.hidden === false && p114.n >= 1 && p114.hasClick,
+        `可见=${!p114.hidden} 行数=${p114.n} 含点击=${p114.hasClick} 首行=${JSON.stringify(p114.first.slice(0, 60))}`);
+    } catch (e) { check('录制中最近条目浮层', false, e.message); }
+
+    // 115 日志过滤与行数上限
+    try {
+      logger.log('test', 'RECPROBE-A');
+      logger.log('test', 'RECPROBE-B');
+      const t115 = await pinvoke('cap:logTail', { lines: 1000, filter: 'RECPROBE' });
+      const t115b = await pinvoke('cap:logTail', { lines: 1200 });
+      const lines115 = t115.text ? t115.text.split('\n') : [];
+      check('日志过滤与行数上限',
+        t115.ok && lines115.length >= 2 && lines115.every((l) => l.includes('RECPROBE')) && t115b.ok && t115b.count <= 1200,
+        `命中 ${lines115.length} 行全匹配=${lines115.every((l) => l.includes('RECPROBE'))} 无过滤 ${t115b.count} 行`);
+    } catch (e) { check('日志过滤与行数上限', false, e.message); }
+
+    // 116 WebSocket 视图过滤 / 暂停 / 清空
+    try {
+      await peval(`(() => { const f = document.getElementById('wsFilter'); f.value = 'hello-ws'; f.dispatchEvent(new Event('change', { bubbles: true })); return true; })()`);
+      await sleep(500);
+      const w1 = await peval(`(() => {
+        const kids = [...document.getElementById('ws').children];
+        return { n: kids.length, all: kids.every((k) => k.textContent.includes('hello-ws')) };
+      })()`);
+      const paused = await peval(`(() => {
+        document.getElementById('wsPause').checked = true;
+        const before = document.getElementById('ws').children.length;
+        appendWs({ kind: 'recv', payload: 'probe-frame', time: Date.now() });
+        return { before, after: document.getElementById('ws').children.length };
+      })()`);
+      const cleared = await peval(`(() => { document.getElementById('wsClear').click(); return document.getElementById('ws').children.length; })()`);
+      const frames116 = await pinvoke('cap:ws');
+      await peval(`(() => {
+        document.getElementById('wsPause').checked = false;
+        const f = document.getElementById('wsFilter');
+        f.value = '';
+        f.dispatchEvent(new Event('change', { bubbles: true }));
+        return true;
+      })()`);
+      await sleep(400);
+      check('WebSocket 视图过滤/暂停/清空',
+        w1.n >= 1 && w1.all && paused.before === paused.after && cleared === 0 && frames116.ok && frames116.frames.length > 0,
+        `过滤后 ${w1.n} 行全命中=${w1.all} 暂停不动=${paused.before === paused.after} 清空后=${cleared} 主进程帧=${frames116.frames.length}`);
+    } catch (e) { check('WebSocket 视图过滤/暂停/清空', false, e.message); }
+
+    // 117 「关闭其他」标签
+    try {
+      const active117 = (await pinvoke('cap:tabList')).find((t) => t.active);
+      const others117 = await pinvoke('cap:tabCloseOthers', active117.id);
+      await sleep(400);
+      const tabs117 = await pinvoke('cap:tabList');
+      check('「关闭其他」标签',
+        others117.ok && others117.closed >= 1 && tabs117.length === 1 && tabs117[0].id === active117.id,
+        `关闭 ${others117.closed} 个 / 剩余 ${tabs117.length}`);
+    } catch (e) { check('「关闭其他」标签', false, e.message); }
   } catch (e) {
     check('自检执行', false, `${e.message} | status=${state.status} attached=${wc.debugger.isAttached()}`);
   }

@@ -17,6 +17,7 @@
 const { app, BrowserWindow, BrowserView, ipcMain, session, screen, shell } = require('electron');
 const path = require('node:path');
 const os = require('node:os');
+const fs = require('node:fs');
 
 const { PARTITION, TOOLBAR_H, state, send, setStatus, normalizeUrl, syncActive, resetActive } = require('./state');
 const store = require('./store');
@@ -29,6 +30,7 @@ const settings = require('./settings');
 const automation = require('./automation');
 const format = require('./format');
 const files = require('./files');
+const recorder = require('./recorder');
 
 const ICON = path.join(__dirname, 'build', 'icon.ico');
 if (process.platform === 'win32') app.setAppUserModelId('com.kongvalley.web-capture-tool');
@@ -38,6 +40,7 @@ if (state.selftest) {
   store.useFile(path.join(os.tmpdir(), 'wct-selftest-settings', 'settings.json'));
   logger.useFile(path.join(os.tmpdir(), 'wct-selftest-logs', 'app.log'));
   sessionStore.useFile(path.join(os.tmpdir(), 'wct-selftest-session', 'last.json'));
+  recorder.useDir(path.join(os.tmpdir(), 'wct-selftest-rec'));
 }
 const boot = store.load();
 state.panelWidth = boot.app.panelWidth;
@@ -139,6 +142,8 @@ function watchGpu() {
 /* ------------------------------------------------------------------ 标签 */
 
 let tabSeq = 0;
+const TAB_UNDO_MS = 10000;   // 关闭标签后的可撤销窗口
+let lastClosed = null;       // { at, title, snapshot }
 
 function tabList() {
   return state.tabs.map((t) => ({
@@ -151,7 +156,8 @@ function tabsPayload() {
 }
 
 // 新建标签：建视图 → 激活 → 空导航挂 CDP → 载入目标 URL（目标首次加载不能漏抓）
-function newTab(url = 'about:blank') {
+// opts.background = true 时只建视图与加载，不抢当前标签（会话恢复用）
+function newTab(url = 'about:blank', opts = {}) {
   const win = state.win;
   if (!win || win.isDestroyed()) return null;
   const target = String(url || 'about:blank');
@@ -186,24 +192,30 @@ function newTab(url = 'about:blank') {
     tab.title = wc.getTitle();
     if (tab === state.activeTab) send('cap:navigated', { url: u, canGoBack: wc.canGoBack(), canGoForward: wc.canGoForward() });
     send('cap:tabs', tabsPayload());
+    recorder.onNav(tab, { url: u, kind: 'did-navigate' });
   });
   wc.on('did-navigate-in-page', (_e, u, isMainFrame) => {
     if (!isMainFrame) return;
     tab.url = u;
     if (tab === state.activeTab) send('cap:navigated', { url: u, canGoBack: wc.canGoBack(), canGoForward: wc.canGoForward() });
+    recorder.onNav(tab, { url: u, kind: 'in-page' });
   });
   wc.on('did-finish-load', () => {
     tab.title = wc.getTitle();
     send('cap:tabs', tabsPayload());
+    recorder.onPage(tab, { url: wc.getURL(), title: wc.getTitle() });
+    if (recorder.isRecording()) recorder.arm(wc).catch(() => {});   // 兜底：录制开始时尚未挂 CDP 的标签在这里补挂
   });
   wc.on('did-fail-load', (_e, code, desc, u, isMainFrame) => {
     if (isMainFrame && code !== -3) {
       logger.log('load', `${code} ${desc} ${u}`);
       setStatus(`加载失败 ${code} ${desc} ${u}`);
+      recorder.onNav(tab, { url: u, kind: 'fail' });
     }
   });
 
-  activateTab(tab);
+  if (!opts.background) activateTab(tab);
+  else send('cap:tabs', tabsPayload());
   // 渲染进程是惰性创建的：先空导航让 CDP 目标就绪，挂上抓取后再真正导航，目标的首次加载才不会漏抓
   wc.loadURL('about:blank')
     .then(async () => {
@@ -211,6 +223,8 @@ function newTab(url = 'about:blank') {
       if (!ok) return;
       const failed = await settings.restoreRuntime(wc);   // 该标签沿用当前 UA/请求头/限速（重启后恢复）
       if (failed.length) setStatus(`部分设置恢复失败：${failed.join('；')}`);
+      // CDP 挂上之后才可能注入binding，所以录制中的新标签在这里补挂（did-finish-load 还有一次兜底）
+      if (recorder.isRecording()) recorder.arm(wc).catch(() => {});
       if (target !== 'about:blank') await wc.loadURL(target);
     })
     .catch((e) => setStatus(`初始化失败：${e.message}`));
@@ -234,6 +248,16 @@ function closeTab(id) {
   if (idx < 0) return { ok: false, error: '标签不存在' };
   const tab = state.tabs[idx];
   const wasActive = state.activeTab === tab;
+  // 撤销快照：零拷贝持有该标签自己的数组（标签对象随后被丢弃，视图另行销毁）
+  lastClosed = {
+    at: Date.now(),
+    title: tab.title || tab.url || '',
+    snapshot: {
+      title: tab.title, url: tab.url,
+      records: tab.records, byId: tab.byId, pendingExtra: tab.pendingExtra,
+      wsFrames: tab.wsFrames, seq: tab.seq, storedBytes: tab.storedBytes, enabled: tab.enabled,
+    },
+  };
   state.tabs.splice(idx, 1);
   // 先把窗口切到相邻标签，再销毁旧视图（避免窗口短暂挂着一个已销毁的 BrowserView）
   if (wasActive) {
@@ -248,7 +272,7 @@ function closeTab(id) {
   } catch (e) { logger.log('tab', `关闭标签失败：${e.message}`); }
   if (!state.tabs.length) newTab();          // 最后一个标签关掉后回到全新标签
   send('cap:tabs', tabsPayload());
-  return { ok: true };
+  return { ok: true, id, title: lastClosed.title, undoMs: TAB_UNDO_MS };
 }
 
 function createWindow() {
@@ -281,6 +305,12 @@ function createWindow() {
 }
 
 /* -------------------------------------------------------------- 导出组装 */
+
+// 导出默认名用的当前页地址（取不到就返回空串，文件名退化为无站点前缀）
+function currentPageUrl() {
+  const v = state.view;
+  return v && !v.webContents.isDestroyed() ? v.webContents.getURL() : '';
+}
 
 // Cookie 的统一字段映射（面板、导出、会话数据模态共用一份）
 function mapCookie(c) {
@@ -360,7 +390,7 @@ function registerIpc() {
   ipcMain.handle('cap:exportAll', async (_e, ids, file) => {
     try {
       const data = await buildExport(ids);
-      const name = `capture-${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
+      const name = `${files.exportBaseName('capture', currentPageUrl())}.json`;
       if (file) return await files.saveTextFile({ defaultName: name, content: JSON.stringify(data, null, 2), file });
       return await files.saveWithDialog(name, JSON.stringify(data, null, 2));
     } catch (e) { logger.log('ipc', `cap:exportAll: ${e.message}`); return { ok: false, error: e.message }; }
@@ -369,13 +399,13 @@ function registerIpc() {
     try {
       const pd = await extract.collectPageData();
       const html = pd.html.replace('<head>', `<head>\n<!-- 抓取自 ${pd.url} @ ${new Date().toISOString()} -->`);
-      return await files.saveWithDialog(`page-${new Date().toISOString().replace(/[:.]/g, '-')}.html`, html);
+      return await files.saveWithDialog(`${files.exportBaseName('page', pd.url)}.html`, html);
     } catch (e) { logger.log('ipc', `cap:exportHtml: ${e.message}`); return { ok: false, error: e.message }; }
   });
   ipcMain.handle('cap:exportCookieJson', async () => {
     try {
       const cookies = await session.fromPartition(PARTITION).cookies.get({});
-      return await files.saveWithDialog(`cookies-${new Date().toISOString().replace(/[:.]/g, '-')}.json`, JSON.stringify(cookies, null, 2));
+      return await files.saveWithDialog(`${files.exportBaseName('cookies', currentPageUrl())}.json`, JSON.stringify(cookies, null, 2));
     } catch (e) { logger.log('ipc', `cap:exportCookieJson: ${e.message}`); return { ok: false, error: e.message }; }
   });
 
@@ -462,7 +492,7 @@ function registerIpc() {
   ipcMain.handle('cap:exportCookies', async (_e, payload) => {
     try {
       const { format, file } = payload || {};
-      const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+      const base = files.exportBaseName('cookies', currentPageUrl());
       const cookies = await session.fromPartition(PARTITION).cookies.get({});
       if (format === 'netscape') {
         const lines = ['# Netscape HTTP Cookie File'];
@@ -478,12 +508,12 @@ function registerIpc() {
             c.value == null ? '' : String(c.value),
           ].join('\t'));
         }
-        return await files.saveTextFile({ defaultName: `cookies-${stamp}.txt`, content: lines.join('\n') + '\n', file });
+        return await files.saveTextFile({ defaultName: `${base}.txt`, content: lines.join('\n') + '\n', file });
       }
       if (format !== 'json' && format !== undefined && format !== null && format !== '') {
         return { ok: false, error: '未知导出格式' };
       }
-      return await files.saveTextFile({ defaultName: `cookies-${stamp}.json`, content: JSON.stringify(cookies.map(mapCookie), null, 2), file });
+      return await files.saveTextFile({ defaultName: `${base}.json`, content: JSON.stringify(cookies.map(mapCookie), null, 2), file });
     } catch (e) { logger.log('ipc', `cap:exportCookies: ${e.message}`); return { ok: false, error: e.message }; }
   });
 
@@ -494,6 +524,39 @@ function registerIpc() {
     return settings.applySetting(key, value);
   });
   ipcMain.handle('cap:cfgAll', () => Object.assign({}, settings.values));
+  ipcMain.handle('cap:cfgExport', async (_e, payload) => {
+    const { file } = payload || {};
+    const content = JSON.stringify({
+      version: 1, exportedAt: new Date().toISOString(), settings: settings.values,
+    }, null, 2);
+    return files.saveTextFile({ defaultName: `${files.exportBaseName('settings', '', Date.now())}.json`, content, file });
+  });
+  ipcMain.handle('cap:cfgImport', async (_e, payload) => {
+    let { file } = payload || {};
+    if (!file) {
+      const picked = await files.pickJsonFile();
+      if (!picked.ok) return picked;
+      file = picked.file;
+    }
+    let data;
+    try { data = JSON.parse(fs.readFileSync(file, 'utf8')); }
+    catch (e) { return { ok: false, error: `配置文件无法解析：${e.message}` }; }
+    const src = data && typeof data === 'object' && data.settings && typeof data.settings === 'object' ? data.settings : null;
+    if (!src) return { ok: false, error: '配置文件里没有 settings 段' };
+    const applied = [];
+    const skipped = [];
+    const failed = [];
+    for (const [key, value] of Object.entries(src)) {
+      if (key === 'softwareRendering') { await settings.applyInner(key, value); continue; }   // app 段设置，单独处理（需重启生效）
+      if (!Object.prototype.hasOwnProperty.call(settings.values, key)) { skipped.push(key); continue; }
+      const r = await settings.applyInner(key, value);
+      if (r.ok) applied.push(key); else failed.push(`${key}: ${r.error}`);
+    }
+    store.setSettings(settings.values);
+    store.flush();
+    return { ok: true, applied: applied.length, skipped, failed };
+  });
+  ipcMain.handle('cap:cfgAllTabs', () => settings.applyToAllTabs());
   ipcMain.handle('cap:auto', (_e, opts) => automation.autoRun(opts));
   ipcMain.handle('cap:autoStop', () => automation.autoStop());
   ipcMain.handle('cap:extract', (_e, payload) => {
@@ -543,7 +606,12 @@ function registerIpc() {
       return { ok: false, error: e.message };
     }
   });
-  ipcMain.handle('cap:logTail', () => ({ ok: true, text: logger.tail(200), file: logger.filePath() }));
+  ipcMain.handle('cap:logTail', (_e, payload) => {
+    const { lines = 1000, filter = '' } = payload || {};
+    const text = logger.tail(lines, filter);
+    return { ok: true, text, file: logger.filePath(), count: text ? text.split('\n').length : 0 };
+  });
+  ipcMain.handle('cap:ws', () => ({ ok: true, frames: state.wsFrames }));
   ipcMain.handle('cap:openLog', () => {
     shell.showItemInFolder(logger.filePath());
     return { ok: true };
@@ -554,7 +622,7 @@ function registerIpc() {
       const set = Array.isArray(ids) && ids.length ? new Set(ids) : null;
       const list = set ? state.records.filter((r) => set.has(r.id)) : state.records;
       const har = format.buildHar(list, state.view ? state.view.webContents.getTitle() : '');
-      const name = `capture-${new Date().toISOString().replace(/[:.]/g, '-')}.har`;
+      const name = `${files.exportBaseName('capture', currentPageUrl())}.har`;
       return await files.saveTextFile({ defaultName: name, content: JSON.stringify(har, null, 2), file });
     } catch (e) { logger.log('ipc', `cap:exportHar: ${e.message}`); return { ok: false, error: e.message }; }
   });
@@ -596,16 +664,14 @@ function registerIpc() {
         const image = await wc.capturePage();
         buffer = image.toPNG();
       }
-      const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-      return await files.saveBinaryFile({ defaultName: `shot-${stamp}.png`, buffer, file });
+      return await files.saveBinaryFile({ defaultName: `${files.exportBaseName('shot', currentPageUrl())}.png`, buffer, file });
     } catch (e) { logger.log('ipc', `cap:screenshot: ${e.message}`); return { ok: false, error: e.message }; }
   });
   ipcMain.handle('cap:pdf', async (_e, payload) => {
     try {
       const { file } = payload || {};
       const buffer = await state.view.webContents.printToPDF({ printBackground: true, pageSize: 'A4', landscape: false });
-      const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-      return await files.saveBinaryFile({ defaultName: `page-${stamp}.pdf`, buffer, file });
+      return await files.saveBinaryFile({ defaultName: `${files.exportBaseName('page', currentPageUrl())}.pdf`, buffer, file });
     } catch (e) { logger.log('ipc', `cap:pdf: ${e.message}`); return { ok: false, error: e.message }; }
   });
   ipcMain.handle('cap:find', (_e, text, opts) => new Promise((resolve) => {
@@ -636,6 +702,19 @@ function registerIpc() {
     return { ok: true };
   });
 
+  /* ------------------------------------------------------------ 会话录制 */
+
+  ipcMain.handle('cap:recStart', (_e, opts) => recorder.start(opts || {}));
+  ipcMain.handle('cap:recStop', () => recorder.stop('manual'));
+  ipcMain.handle('cap:recStatus', () => recorder.status());
+  ipcMain.handle('cap:recInfo', () => Object.assign({ ok: true, dir: recorder.dirPath() }, recorder.lastInfo()));
+  ipcMain.handle('cap:recOpen', () => {
+    const f = recorder.lastFile();
+    if (f && fs.existsSync(f)) shell.showItemInFolder(f);
+    else shell.openPath(recorder.dirPath());
+    return { ok: true, dir: recorder.dirPath(), file: f };
+  });
+
   /* ---------------------------------------------------------- 会话持久化 */
 
   ipcMain.handle('cap:sessionInfo', () => sessionStore.info());
@@ -652,7 +731,14 @@ function registerIpc() {
     }
     state.seq = state.records.reduce((m, x) => Math.max(m, x.id || 0), 0);
     for (const f of r.wsFrames) state.wsFrames.push(f);
-    return { ok: true, savedAt: r.savedAt, count: state.records.length, records: state.records.map(capture.summarize), wsFrames: state.wsFrames };
+    // 标签布局：记录灌进当前活动标签（列表立刻可用），保存的标签在后台整体重建，不抢当前标签
+    const savedTabs = Array.isArray(r.tabs) ? r.tabs : [];
+    for (const t of savedTabs) newTab(t.url, { background: true });
+    send('cap:tabChanged', { id: state.activeTab ? state.activeTab.id : null });   // 让面板重新拉取（记录已换成本次恢复的内容）
+    return {
+      ok: true, savedAt: r.savedAt, count: state.records.length,
+      records: state.records.map(capture.summarize), wsFrames: state.wsFrames, tabs: savedTabs.length,
+    };
   });
   ipcMain.handle('cap:sessionDiscard', () => sessionStore.discard());
 
@@ -670,6 +756,39 @@ function registerIpc() {
     return { ok: true, tabs: tabList() };
   });
   ipcMain.handle('cap:tabClose', (_e, id) => closeTab(id));
+  ipcMain.handle('cap:tabUndo', () => {
+    if (!lastClosed) return { ok: false, error: '没有可撤销的关闭' };
+    if (Date.now() - lastClosed.at > TAB_UNDO_MS) { lastClosed = null; return { ok: false, error: '撤销已过期' }; }
+    const snap = lastClosed.snapshot;
+    const tab = newTab(snap.url || 'about:blank');
+    if (!tab) return { ok: false, error: '窗口未就绪' };
+    Object.assign(tab, {
+      title: snap.title, records: snap.records, byId: snap.byId, pendingExtra: snap.pendingExtra,
+      wsFrames: snap.wsFrames, seq: snap.seq, storedBytes: snap.storedBytes, enabled: snap.enabled,
+    });
+    syncActive();
+    send('cap:tabChanged', { id: tab.id });
+    lastClosed = null;
+    return { ok: true, id: tab.id, records: tab.records.length };
+  });
+  ipcMain.handle('cap:tabReload', (_e, id) => {
+    const tab = state.tabs.find((t) => t.id === id);
+    if (!tab) return { ok: false, error: '标签不存在' };
+    tab.wc.reload();
+    return { ok: true };
+  });
+  ipcMain.handle('cap:tabCloseOthers', (_e, id) => {
+    const keep = state.tabs.find((t) => t.id === id);
+    if (!keep) return { ok: false, error: '标签不存在' };
+    let closed = 0;
+    for (const t of [...state.tabs]) {
+      if (t === keep) continue;
+      closeTab(t.id);
+      closed++;
+    }
+    if (state.activeTab !== keep) activateTab(keep);
+    return { ok: true, closed };
+  });
 
   /* ------------------------------------------------------ 应用级（重启/GPU）*/
 
@@ -722,7 +841,7 @@ app.whenReady().then(() => {
   if (state.selftest) {
     require('./selftest.js').run({
       state, store, gpu, capture, extract, settings, automation, format, files, logger,
-      session: sessionStore, resetActive, PARTITION,
+      session: sessionStore, recorder, resetActive, PARTITION,
     });
   }
   app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
@@ -732,5 +851,6 @@ app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(
 
 app.on('before-quit', () => {
   sessionStore.stop();
+  recorder.flushSync();                            // 录制中的会话补一条 summary（reason:'quit'）
   if (!state.selftest) sessionStore.saveSync();   // 自检退出时不写会话文件，避免污染断言数据
 });

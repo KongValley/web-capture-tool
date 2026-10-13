@@ -70,6 +70,7 @@
     overflow-x: auto; overflow-y: hidden; white-space: nowrap;
   }
   .lbl { color: var(--muted); font-size: 12px; flex: none; }
+  #recToggle.on { background: #f8514922; border-color: var(--err); color: var(--err); }
 
   /* 标签栏（第四行，全宽；高度计入 TOOLBAR_H） */
   #tabstrip {
@@ -94,7 +95,7 @@
     flex: none;
   }
   #url { flex: 1; min-width: 80px; }
-  #status { color: var(--muted); font-size: 12px; max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #status { color: var(--muted); font-size: 12px; max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
   #count { color: var(--accent); font-variant-numeric: tabular-nums; font-weight: 600; }
 
   #body { height: calc(100% - 164px); display: flex; }
@@ -116,6 +117,9 @@
   #bannerText { flex: 1; min-width: 0; }
   #bannerActions { display: flex; gap: 6px; flex: none; }
   #banner button { height: 22px; font-size: 12px; }
+  #recPanel { max-height: 150px; overflow: auto; border-bottom: 1px solid var(--line); background: var(--bg-2); }
+  #recHead { padding: 4px 8px; position: sticky; top: 0; background: var(--bg-2); }
+  #recItems > div { padding: 1px 8px; font: 11px/1.4 Consolas, monospace; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
   #panelHead { display: flex; gap: 6px; padding: 6px; border-bottom: 1px solid var(--line); }
   #filter { flex: 1; min-width: 40px; }
@@ -125,6 +129,15 @@
   #findbar { display: flex; align-items: center; gap: 6px; padding: 6px; border-bottom: 1px solid var(--line); }
   #findText { flex: 1; min-width: 40px; }
   #list { flex: 1; overflow: auto; scrollbar-gutter: stable; }
+  #listNote { padding: 2px 8px; }
+  #listNew { position: absolute; left: 50%; transform: translateX(-50%); bottom: 8px; z-index: 5; }
+  #ctxMenu {
+    position: fixed; z-index: 90; display: flex; flex-direction: column;
+    background: var(--elev); border: 1px solid var(--line); border-radius: var(--radius);
+    box-shadow: var(--shadow); padding: 4px;
+  }
+  #ctxMenu .ctx-item { text-align: left; height: 24px; border: none; background: transparent; }
+  #ctxMenu .ctx-item:hover { background: var(--elev-2); }
   .row {
     display: flex; align-items: center; gap: 6px; height: 26px; padding: 0 8px;
     border-bottom: 1px solid var(--line); cursor: pointer; white-space: nowrap;
@@ -144,6 +157,7 @@
   .row[data-m="DELETE"] .m { color: #f87171; }
   .row .s { width: 34px; flex: none; text-align: right; }
   .row .u { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; direction: rtl; text-align: left; }
+  .row[data-restored="1"] .u::before { content: '⟲ '; color: var(--warn); }
   .row .t { width: 62px; flex: none; color: var(--muted); text-align: right; }
   .row .z { width: 96px; flex: none; color: var(--muted); text-align: right; overflow: hidden; text-overflow: ellipsis; }
   #list[data-cols="d"] .z, #list[data-cols="t"] .z { display: none; }
@@ -165,8 +179,11 @@
   #detail .kv { color: var(--muted); }
   .dbar { display: flex; gap: 6px; margin-bottom: 8px; }
 
-  #ws { flex: 1; overflow: auto; scrollbar-gutter: stable; padding: 8px; display: none; font: 12px/1.45 Consolas, monospace; }
-  #ws.on { display: block; }
+  #wsView { flex: 1; display: none; flex-direction: column; min-height: 0; }
+  #wsView.on { display: flex; }
+  #wsbar { display: flex; align-items: center; gap: 6px; padding: 6px; border-bottom: 1px solid var(--line); }
+  #wsFilter { flex: 1; min-width: 40px; }
+  #ws { flex: 1; overflow: auto; scrollbar-gutter: stable; padding: 8px; font: 12px/1.45 Consolas, monospace; }
   #ws div { white-space: pre-wrap; word-break: break-all; border-bottom: 1px solid var(--line); padding: 2px 0; }
   .empty { color: var(--muted); padding: 16px; text-align: center; }
 
@@ -259,6 +276,7 @@
     <span class="sep"></span>
     <span class="lbl">间隔</span>
     <input id="reqDelay" class="num" type="number" min="0" max="10000" step="100" value="0" title="请求最小间隔 ms（礼貌抓取）">
+    <button id="cfgAllTabs" class="ghost" title="把当前 UA / 请求头 / 限速应用到所有已打开标签">应用到所有标签</button>
   </div>
 
   <div id="toolbar3">
@@ -282,6 +300,11 @@
     <button id="expHar">导出 HAR</button>
     <button id="expFiltered" title="导出当前列表里筛出来的记录">导出筛选结果</button>
     <span class="sep"></span>
+    <button id="recToggle" title="记录点击/输入/提交/滚动/按键 + 请求 + 跳转，落盘为 JSONL">● 开始录制</button>
+    <label class="lbl" title="每次点击额外存一张视口截图（默认关，单次录制上限 300 张）"><input id="recShots" type="checkbox"> 点击截图</label>
+    <button id="recOpen" class="ghost" title="打开录制目录">录制目录</button>
+    <button id="recSummary" class="ghost" title="打开最近一次录制的 .md 摘要">打开摘要</button>
+    <span class="sep"></span>
     <button id="appSettings" class="ghost" title="应用设置：软件渲染 / GPU 状态">设置</button>
   </div>
 
@@ -299,6 +322,7 @@
         <span id="bannerActions"></span>
         <button id="bannerClose" class="ghost">忽略</button>
       </div>
+      <div id="recPanel" hidden><div id="recHead" class="lbl">录制中 · 最近 20 条</div><div id="recItems"></div></div>
       <div id="panelHead">
         <input id="filter" placeholder="过滤：url 子串 / method:post / status:4xx / type:xhr / mime:json / domain:x / size:&gt;100k / time:&gt;500（前缀 ! 取反）">
         <select id="typeFilter">
@@ -313,6 +337,7 @@
           <option value="t">时间戳</option>
         </select>
       </div>
+      <div id="listNote" class="lbl" hidden></div>
       <div id="tabs">
         <button class="tab on" data-view="list">请求 <span id="nReq">0</span></button>
         <button class="tab" data-view="ws">WebSocket <span id="nWs">0</span></button>
@@ -325,7 +350,13 @@
         <button id="findClose" class="ghost" title="结束查找">✕</button>
       </div>
       <div id="list"><div class="empty">等待抓取…</div></div>
-      <div id="ws"></div>
+      <div id="wsView"><div id="wsbar">
+        <label class="lbl" title="暂停后新帧不再进入列表（数据仍在主进程）"><input id="wsPause" type="checkbox"> 暂停</label>
+        <input id="wsFilter" placeholder="帧内容过滤">
+        <button id="wsClear" class="ghost">清空显示</button>
+        <span id="wsNote" class="lbl"></span>
+      </div><div id="ws"></div></div>
+      <button id="listNew" class="ghost" hidden></button>
       <div id="detail"></div>
     </div>
   </div>
@@ -339,6 +370,7 @@
   </div>
 
   <div id="toasts"></div>
+  <div id="ctxMenu" hidden></div>
 
   <script src="./renderer.js"></script>
 </body>
