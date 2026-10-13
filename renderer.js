@@ -14,10 +14,12 @@ let selected = null;
 let detailId = null;
 let detailData = null;      // 当前详情面板对应的记录（复制按钮用）
 let view = 'list';
-let pickTarget = '';      // 元素拾取的回填目标：'tools' | 'extract' | ''（空 = 只写剪贴板）
+let pickTarget = '';      // 元素拾取的回填目标：'tools' | 'extract' | 'field' | ''（空 = 只写剪贴板）
+const REC_WARN_BYTES = 1024 ** 3;   // 录制目录超过 1GB 时在「录制历史」里提醒
 
 const BODY_PREVIEW = 200 * 1024;          // 详情里文本响应体的预览上限
 const detailFull = new Set();             // 记录「已展开全文」的记录 id
+const detailPretty = new Set();           // 记录「响应体已美化 JSON」的记录 id
 
 /* ---------------------------------------------------------- 面板宽度拖拽 */
 
@@ -148,9 +150,8 @@ function setRowVisible(id, want) {
 function dropRow(id) {
   const r = rows.get(id);
   if (!r) return;
-  if (r.node) r.node.remove();
+  if (r.node) { r.node.remove(); domRows--; }   // 已超出渲染上限的行没有 DOM，不能减 domRows
   if (r.visible) visibleCount--;
-  domRows--;
   rows.delete(id);
 }
 
@@ -290,6 +291,14 @@ function refilter() {
     setRowVisible(id, matches(r.rec));
   }
   updateCounts();
+  if (view === 'wf') scheduleWaterfall();      // 瀑布图跟随筛选
+}
+
+// 过滤结果的唯一来源：按内存记录算 id（DOM 只渲染最近 3000 行，不能作为导出依据）
+function filteredIds() {
+  const out = [];
+  for (const [id, r] of rows) if (matches(r.rec)) out.push(id);
+  return out;
 }
 
 /* ------------------------------------------------------------- 详情渲染 */
@@ -330,15 +339,22 @@ function bodyBlock(r) {
     return `<h3>响应体（二进制）</h3><pre class="muted">二进制 ≈${kb}KB，不在此展开</pre>` +
       '<div class="dbar"><button id="bodySave">另存为文件</button></div>';
   }
-  const big = r.body.length > BODY_PREVIEW;
+  let parsed = null;                                  // 只有小体积的文本体才尝试解析（避免大 JSON 卡住面板）
+  try {
+    if (r.body && r.body.length <= 4 * 1048576 && /^[\[{]/.test(r.body.trim())) parsed = JSON.parse(r.body);
+  } catch (e) { parsed = null; }
+  const pretty = parsed !== null && detailPretty.has(r.id);
+  const src = pretty ? JSON.stringify(parsed, null, 2) : r.body;
+  const big = src.length > BODY_PREVIEW;
   const expanded = !!detailFull.has(r.id);
-  const shown = big && !expanded ? r.body.slice(0, BODY_PREVIEW) : r.body;
-  const size = (r.body.length / 1048576).toFixed(1);
+  const shown = big && !expanded ? src.slice(0, BODY_PREVIEW) : src;
+  const size = (src.length / 1048576).toFixed(1);
   const note = !big ? '' : expanded
     ? `<div class="lbl">已展开全部 ${size}MB</div>`
     : `<div class="lbl">已截断显示前 200KB（完整 ${size}MB）</div>`;
+  const prettyBtn = parsed !== null ? `<button id="bodyPretty">${pretty ? '还原原文' : '美化 JSON'}</button>` : '';
   return `<h3>响应体</h3><pre>${esc(shown)}</pre>${note}` +
-    `<div class="dbar"><button id="bodySave">另存为文件</button>${big ? `<button id="bodyToggle">${expanded ? '收起' : '查看全文'}</button>` : ''}</div>`;
+    `<div class="dbar">${prettyBtn}<button id="bodySave">另存为文件</button>${big ? `<button id="bodyToggle">${expanded ? '收起' : '查看全文'}</button>` : ''}</div>`;
 }
 
 function renderDetail(id) {
@@ -419,7 +435,8 @@ function scheduleWaterfall() {
 
 // 时间轴：t0 = 最早一条的开始，span = 最晚结束 - t0；每条按开始时间偏移、按时长定宽
 function renderWaterfall() {
-  const list = [...rows.values()].map((v) => v.rec).filter((r) => r.time && r.duration != null);
+  const all = [...rows.values()].map((v) => v.rec);
+  const list = all.filter((r) => matches(r) && r.time && r.duration != null);
   const box = $('wf');
   box.innerHTML = '';
   $('nWf').textContent = String(list.length);
@@ -448,7 +465,7 @@ function renderWaterfall() {
     row.onclick = () => select(r.id);          // 与列表一致：切回列表并展开该条详情
     box.appendChild(row);
   }
-  $('wfInfo').textContent = `${list.length} 条 · 跨度 ${Math.round(span)}ms`;
+  $('wfInfo').textContent = `${list.length} 条 · 命中 ${list.length}/${all.length} · 跨度 ${Math.round(span)}ms`;
   $('wfScale').textContent = `起点 ${new Date(t0).toLocaleTimeString()}`;
 }
 
@@ -1042,7 +1059,7 @@ $('toggle').onclick = () => ipcRenderer.invoke('cap:setEnabled', !toggleState).t
 $('pageData').onclick = () => openSessionData();
 $('expAll').onclick = () => exportResult(ipcRenderer.invoke('cap:exportAll'));
 $('expFiltered').onclick = () => {
-  const ids = [...el.list.querySelectorAll('.row')].filter(visible).map((n) => Number(n.dataset.id));
+  const ids = filteredIds();
   if (!ids.length) return toast('当前没有筛选项', 'warn');
   exportResult(ipcRenderer.invoke('cap:exportAll', ids));
 };
@@ -1051,7 +1068,7 @@ $('expCookie').onclick = () => exportResult(ipcRenderer.invoke('cap:exportCookie
 $('expHar').onclick = () => exportResult(ipcRenderer.invoke('cap:exportHar', {}));
 $('expPostman').onclick = () => exportResult(ipcRenderer.invoke('cap:exportPostman', {}));
 $('copyMd').onclick = async () => {
-  const ids = [...el.list.querySelectorAll('.row')].filter(visible).map((n) => Number(n.dataset.id));
+  const ids = filteredIds();
   if (!ids.length) return toast('当前没有筛选项', 'warn');
   const f = await ipcRenderer.invoke('cap:format', 'markdown', ids);
   if (!f || !f.ok) return toast('生成失败：' + ((f && f.error) || '未知错误'), 'err');
@@ -1113,6 +1130,10 @@ el.detail.addEventListener('click', async (e) => {
   } else if (id === 'bodyToggle') {
     if (detailId == null) return;
     if (detailFull.has(detailId)) detailFull.delete(detailId); else detailFull.add(detailId);
+    renderDetail(detailId);
+  } else if (id === 'bodyPretty') {
+    if (detailId == null) return;
+    if (detailPretty.has(detailId)) detailPretty.delete(detailId); else detailPretty.add(detailId);
     renderDetail(detailId);
   } else if (id === 'bodySave') {
     if (detailId == null) return;
@@ -1183,7 +1204,7 @@ function pickButton(target) {
       pickTarget = '';
       return toast('无法开始拾取：' + ((r && r.error) || '未知错误'), 'err');
     }
-    toast('请在页面上点击目标元素（Esc 取消）', 'info', 5000);
+    toast('请在页面上点击目标元素（Esc 取消）', 'info', 5000, { label: '取消', onClick: () => ipcRenderer.invoke('cap:pickCancel') });
     return undefined;
   };
   return b;
@@ -1198,6 +1219,12 @@ ipcRenderer.on('cap:picked', (_e, p) => {
   else if (pickTarget === 'extract') {
     const tas = document.querySelectorAll('#modalBody textarea');
     if (tas[0]) tas[0].value = p.sel;
+  } else if (pickTarget === 'field') {
+    const tas = document.querySelectorAll('#modalBody textarea');   // [0]=行选择器 [1]=字段
+    if (tas[1]) {
+      const t = tas[1];
+      t.value = (t.value.trim() ? t.value.replace(/\n+$/, '') + '\n' : '') + p.sel;   // 追加一行，名称由用户改成「名称=选择器」
+    }
   } else {
     clipboard.writeText(p.sel);
   }
@@ -1227,6 +1254,16 @@ $('recordOnly').addEventListener('change', () => cfg('recordOnly', $('recordOnly
 $('throttle').addEventListener('change', () => cfg('throttle', $('throttle').value));
 $('headers').addEventListener('change', () => cfg('headers', $('headers').value));
 $('proxy').addEventListener('change', () => cfg('proxy', $('proxy').value));
+$('proxyTest').onclick = async () => {
+  const r = await ipcRenderer.invoke('cap:proxyTest', {});
+  if (r && r.ok) {
+    $('status').textContent = `代理连通：${r.proxy} → ${r.status}（${r.tookMs}ms）`;
+    toast(`代理连通：${r.proxy} → ${r.status}（${r.tookMs}ms）`, 'ok', 6000);
+    return undefined;
+  }
+  toast(`代理测试失败：${(r && r.error) || '未知错误'}（解析：${(r && r.proxy) || '-'}）`, 'err', 7000);
+  return undefined;
+};
 $('colSet').addEventListener('change', () => { refilter(); cfg('colSet', $('colSet').value); });
 $('reqDelay').addEventListener('change', () => cfg('reqDelay', +$('reqDelay').value));
 $('cfgAllTabs').onclick = async () => {
@@ -1292,8 +1329,17 @@ $('extract').onclick = () => {
     $('status').textContent = `提取 ${r.count} 行`;
   };
 
+  const pickBar = document.createElement('div');
+  pickBar.className = 'dbar';
+  const bRow = pickButton('extract');
+  bRow.textContent = '拾取（行选择器）';
+  const bField = pickButton('field');
+  bField.textContent = '拾取到字段';
+  pickBar.appendChild(bRow);
+  pickBar.appendChild(bField);
+
   openModal('CSS 选择器提取', [
-    pickButton('extract'),
+    pickBar,
     labelled('行选择器（每条记录的容器）', selRows),
     labelled('字段（每行 名称=选择器[@属性]）', selFields),
     out,
@@ -1432,7 +1478,7 @@ function resetRecorderUi(reason) {
 function recItemLine(it) {
   const acts = { click: '点击', input: '输入', change: '变更', submit: '提交', keydown: '按键', scroll: '滚动' };
   const head = `#${it.tab == null ? '-' : it.tab}`;
-  if (it.k === 'action') return `${head} ${acts[it.a] || it.a} ${it.sel || ''}${it.text ? `「${String(it.text).slice(0, 24)}」` : ''}`;
+  if (it.k === 'action') return `${head} ${acts[it.a] || it.a} ${it.label || it.sel || ''}${it.text ? `「${String(it.text).slice(0, 24)}」` : ''}`;
   if (it.k === 'req') return `${head} → ${it.method} ${it.url || ''}`;
   if (it.k === 'res') return `${head} ← ${it.status} ${it.url || ''}`;
   if (it.k === 'nav') return `${head} 跳转 ${it.url || ''}`;
@@ -1483,6 +1529,11 @@ ipcRenderer.on('cap:recItems', (_e, batch) => {
   for (const it of batch || []) {
     const div = document.createElement('div');
     div.textContent = recItemLine(it);
+    if (it.sel) {                                  // 写爬虫主路径：点一下就把该元素的选择器拿走
+      div.title = `点击复制选择器：${it.sel}`;
+      div.style.cursor = 'pointer';
+      div.onclick = () => { clipboard.writeText(it.sel); toast('已复制选择器：' + it.sel, 'ok', 3000); };
+    }
     box.appendChild(div);
   }
   while (box.children.length > 20) box.removeChild(box.firstChild);
@@ -1506,22 +1557,30 @@ function openReplayRecording(file) {
   wrap.className = 'lbl';
   wrap.appendChild(stopOnErr);
   wrap.appendChild(document.createTextNode(' 失败即停'));
+  const withNav = document.createElement('input');
+  withNav.type = 'checkbox';                                   // 默认不回放导航：跳转由点击/提交自然发生
+  const wrapNav = document.createElement('label');
+  wrapNav.className = 'lbl';
+  wrapNav.appendChild(withNav);
+  wrapNav.appendChild(document.createTextNode(' 重放导航（跳转页面）'));
   const out = document.createElement('pre');
   out.textContent = '尚未开始';
   const progress = (_e, d) => { out.textContent = `进度 ${d.done}/${d.total} · 失败 ${d.failed}${d.last ? ' · ' + d.last : ''}`; };
 
-  openModal('重放录制', [labelled('倍速', speed), wrap, out], [
+  openModal('重放录制', [labelled('倍速', speed), wrap, wrapNav, out], [
     { id: 'recReplayStart', label: '开始', primary: true, onClick: async () => {
       out.textContent = '重放中…';
       ipcRenderer.on('cap:replayProgress', progress);
-      const r = await ipcRenderer.invoke('cap:recReplay', { file, speed: Number(speed.value), stopOnError: stopOnErr.checked });
+      const r = await ipcRenderer.invoke('cap:recReplay', { file, speed: Number(speed.value), stopOnError: stopOnErr.checked, withNav: withNav.checked });
       ipcRenderer.removeListener('cap:replayProgress', progress);
       if (!r || !r.ok) {
         out.textContent = '重放失败：' + ((r && r.error) || '未知错误');
         return toast('重放失败：' + ((r && r.error) || '未知错误'), 'err');
       }
       const fails = (r.failed || []).slice(0, 10).map((f) => `#${f.n} ${f.a} ${f.sel || ''} → ${f.reason}`).join('\n');
-      out.textContent = `完成 ${r.done}/${r.total}${r.stopped ? '（已中止）' : ''}\n失败 ${(r.failed || []).length} 条\n${fails}`;
+      out.textContent = `完成 ${r.done}/${r.total}${r.stopped ? '（已中止）' : ''}`
+        + `${r.skipped ? `\n跳过导航 ${r.skipped} 步（未勾选「重放导航」）` : ''}`
+        + `\n失败 ${(r.failed || []).length} 条\n${fails}`;
       toast(`重放完成：${r.done}/${r.total}`, (r.failed || []).length ? 'warn' : 'ok', 6000);
       return undefined;
     } },
@@ -1570,13 +1629,36 @@ async function openRecHistory() {
   search.addEventListener('input', paint);
   await load();
 
-  openModal('录制历史', [labelled('录制文件（新的在前）', sel), labelled('过滤', search), view], [
+  const usage = document.createElement('div');
+  usage.className = 'lbl';
+  const sum = list.reduce((n, r) => n + (r.bytes || r.size || 0), 0);
+  usage.textContent = `目录占用 ${humanSize(sum)}（${list.length} 条）${sum > REC_WARN_BYTES ? ' · 超过 1GB，建议删除旧录制' : ''}`;
+
+  openModal('录制历史', [labelled('录制文件（新的在前）', sel), usage, labelled('过滤', search), view], [
     { id: 'recReplay', label: '重放', primary: true, onClick: () => { openReplayRecording(sel.value); return undefined; } },
     { id: 'recScript', label: '导出回放脚本', onClick: async () => {
       const r = await ipcRenderer.invoke('cap:recScript', { file: sel.value });
       if (r && r.ok) toast('已保存：' + r.file, 'ok', 7000);
       else if (r && r.canceled) $('status').textContent = '已取消保存';
       else toast('导出失败：' + ((r && r.error) || '未知错误'), 'err');
+      return undefined;
+    } },
+    { id: 'recDelete', label: '删除此条', onClick: () => {
+      const r = list.find((x) => x.file === sel.value);
+      if (!r) return toast('录制不存在', 'err');
+      const info = document.createElement('div');
+      info.className = 'lbl';
+      info.textContent = `将删除 ${r.base}：.jsonl${r.md ? ' + .md' : ''}${r.shots ? ` + ${r.shots} 张点击截图` : ''}（共 ${humanSize(r.bytes || r.size)}），不可恢复。`;
+      openModal('删除录制', [info], [
+        { id: 'recDeleteConfirm', label: '确认删除', primary: true, onClick: async () => {
+          const d = await ipcRenderer.invoke('cap:recDelete', { file: r.file });
+          if (!d || !d.ok) return toast('删除失败：' + ((d && d.error) || '未知错误'), 'err');
+          toast(`已删除 ${r.base}（${d.removed} 个文件）`, 'ok', 4000);
+          openRecHistory();
+          return undefined;
+        } },
+        { label: '取消', onClick: () => openRecHistory() },
+      ]);
       return undefined;
     } },
     { label: '关闭', onClick: closeModal },
@@ -1654,6 +1736,7 @@ const WIPE_ITEMS = [
   ['storage', 'Storage', 'localStorage / IndexedDB / 缓存存储 / Service Worker'],
   ['cache', '缓存', 'HTTP 缓存（下次访问会重新下载）'],
   ['logs', '日志', '诊断日志文件（含滚动的上一代）'],
+  ['recordings', '录制记录', '录制目录里的 .jsonl / .md / 点击截图（保留目录本身）'],
   ['session', '会话文件', '上次会话的落盘记录（恢复横幅不再出现）'],
 ];
 
@@ -1885,16 +1968,26 @@ function syncBodySearch() {
   if (raw === bodyQuery) return;
   bodyQuery = raw;
   clearTimeout(bodySearchTimer);
-  bodySearchTimer = setTimeout(async () => {
-    const r = await ipcRenderer.invoke('cap:searchBody', raw);
-    if (!r || !r.ok) {
-      bodyQuery = '';
-      return toast('响应体搜索失败：' + ((r && r.error) || '未知错误'), 'err');
-    }
-    bodyHits = new Set(r.ids);
-    updateListNote();
-    refilter();
-  }, 300);
+  bodySearchTimer = setTimeout(runBodySearch, 300);
+}
+
+// 命中集合的重算入口：过滤框变化（300ms 防抖）与新记录到达（1s 合并）都走这里
+async function runBodySearch() {
+  if (!bodyQuery) return;
+  const r = await ipcRenderer.invoke('cap:searchBody', bodyQuery);
+  if (!r || !r.ok) {
+    bodyQuery = '';                                        // 失败即放弃该关键词，与原实现一致
+    return toast('响应体搜索失败：' + ((r && r.error) || '未知错误'), 'err');
+  }
+  bodyHits = new Set(r.ids);
+  updateListNote();
+  refilter();
+}
+
+let bodyRefreshTimer = null;
+function scheduleBodyRefresh() {                            // 新记录到达时 1s 合并重算一次
+  if (!bodyQuery || bodyRefreshTimer) return;
+  bodyRefreshTimer = setTimeout(() => { bodyRefreshTimer = null; runBodySearch(); }, 1000);
 }
 
 el.filter.addEventListener('input', () => { syncBodySearch(); refilter(); });
@@ -1913,9 +2006,25 @@ function applyBatch(b) {
     updateCounts();
     updateListNote();
   }
+  if (bodyQuery && (b && (b.records || []).length)) scheduleBodyRefresh();   // body: 命中随新记录刷新
 }
 ipcRenderer.on('cap:batch', (_e, b) => applyBatch(b));
 ipcRenderer.on('cap:status', (_e, s) => { $('status').textContent = s; });
+ipcRenderer.on('cap:download', (_e, d) => {
+  if (!d) return;
+  if (d.state === 'start') {
+    $('status').textContent = `下载中：${d.name}`;
+    toast(`开始下载：${d.name}`, 'info', 4000);
+    return;
+  }
+  if (d.state === 'done') {
+    $('status').textContent = `已下载：${d.name}`;
+    toast(`下载完成：${d.file || d.name}`, 'ok', 7000);
+    return;
+  }
+  toast(`下载失败：${d.name}（${d.status}）`, 'err', 7000);
+  $('status').textContent = `下载失败：${d.name}`;
+});
 ipcRenderer.on('cap:navigated', (_e, d) => {
   $('url').value = d.url;
   $('back').disabled = !d.canGoBack;

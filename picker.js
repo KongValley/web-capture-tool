@@ -33,8 +33,10 @@ const PICK_SCRIPT = `(() => {
     document.removeEventListener('click', click, true);
     document.removeEventListener('keydown', onKey, true);
     window.__wctPickArmed = false;
+    try { delete window.__wctPickCleanup; } catch (e) {}
     if (hl.parentNode) hl.parentNode.removeChild(hl);
   }
+  window.__wctPickCleanup = cleanup;             // 面板侧取消时主进程会调它把页面摘干净
   function click(e) {
     e.preventDefault(); e.stopPropagation();
     const el = last || e.target;
@@ -84,6 +86,15 @@ async function stop() {
   armed = null;
   const wc = state.tabs.map((t) => t.wc).find((c) => c.id === item.wcId) || activeWc();
   if (!wc || wc.isDestroyed()) return { ok: true };
+  // 页面侧也要摘干净：否则高亮框与三个事件监听会留在页面上（用户点一下才自清理）
+  try {
+    if (wc.debugger.isAttached()) {
+      await wc.debugger.sendCommand('Runtime.evaluate', {
+        expression: '(() => { if (typeof window.__wctPickCleanup === "function") { window.__wctPickCleanup(); return true; } window.__wctPickArmed = false; return false; })()',
+        returnByValue: true,
+      });
+    }
+  } catch (e) { /* 页面已导航或目标失效 */ }
   try {
     if (item.identifier) await wc.debugger.sendCommand('Page.removeScriptToEvaluateOnNewDocument', { identifier: item.identifier });
   } catch (e) { /* 目标已失效 */ }

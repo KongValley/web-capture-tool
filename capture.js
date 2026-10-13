@@ -304,4 +304,15 @@ function replay(id, overrides = {}) {
   });
 }
 
-module.exports = { summarize, fullRecord, attachCapture, replay, flushBatch };
+// 旁路事件（下载完成等）：给活动标签里匹配 url 的记录补一条 note 并推给面板
+function markNote(url, note) {
+  const tab = state.activeTab;
+  if (!tab) return false;
+  const rec = [...tab.records].reverse().find((r) => r.url === url && !r.note);
+  if (!rec) return false;
+  rec.note = String(note).slice(0, 200);
+  queueBatch(tab, 'update', summarize(rec));
+  return true;
+}
+
+module.exports = { summarize, fullRecord, attachCapture, replay, flushBatch, markNote };

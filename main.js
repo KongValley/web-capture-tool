@@ -14,7 +14,7 @@
  * 模块：state.js 共享状态 / capture.js 抓取 / extract.js 页面提取 / 其余见各文件头。
  * 依赖方向单向：所有模块 require('./state')，禁止任何模块 require main.js。
  */
-const { app, BrowserWindow, BrowserView, ipcMain, session, screen, shell, Menu } = require('electron');
+const { app, BrowserWindow, BrowserView, ipcMain, session, screen, shell, Menu, net } = require('electron');
 const path = require('node:path');
 const os = require('node:os');
 const fs = require('node:fs');
@@ -42,6 +42,9 @@ if (state.selftest) {
   logger.useFile(path.join(os.tmpdir(), 'wct-selftest-logs', 'app.log'));
   sessionStore.useFile(path.join(os.tmpdir(), 'wct-selftest-session', 'last.json'));
   recorder.useDir(path.join(os.tmpdir(), 'wct-selftest-rec'));
+  const dlDir = path.join(os.tmpdir(), 'wct-selftest-dl');     // 自检触发的下载落这里，不碰真实下载目录
+  fs.mkdirSync(dlDir, { recursive: true });
+  app.setPath('downloads', dlDir);
 }
 const boot = store.load();
 state.panelWidth = boot.app.panelWidth;
@@ -701,6 +704,29 @@ function registerIpc() {
     } catch (e) { logger.log('ipc', `cap:exportHar: ${e.message}`); return { ok: false, error: e.message }; }
   });
   ipcMain.handle('cap:replay', (_e, id, overrides) => capture.replay(id, overrides));
+  // 代理连通性：给 url 只解析（毫秒级、无流量），不给才真发一次请求（10s 超时）
+  ipcMain.handle('cap:proxyTest', async (_e, payload) => {
+    const want = String((payload && payload.url) || '');
+    const ses = session.fromPartition(PARTITION);
+    const target = want || (state.view ? state.view.webContents.getURL() : '');
+    if (!/^https?:/i.test(target)) return { ok: false, error: '先打开一个 http(s) 页面再测' };
+    let proxy = '';
+    try { proxy = await ses.resolveProxy(target); } catch (e) { proxy = ''; }
+    if (want) return { ok: true, proxy, mode: 'resolve' };
+    const t0 = Date.now();
+    return await new Promise((resolve) => {
+      let req;
+      try { req = net.request({ method: 'GET', url: target, session: ses, redirect: 'follow' }); }
+      catch (e) { return resolve({ ok: false, proxy, error: e.message }); }
+      const timer = setTimeout(() => {
+        try { req.abort(); } catch (e) { /* 已结束 */ }
+        resolve({ ok: false, proxy, error: '超时（10s）' });
+      }, 10000);
+      req.on('response', (res) => { clearTimeout(timer); resolve({ ok: true, proxy, status: res.statusCode, tookMs: Date.now() - t0 }); });
+      req.on('error', (e) => { clearTimeout(timer); resolve({ ok: false, proxy, error: e.message }); });
+      req.end();
+    });
+  });
   ipcMain.handle('cap:exportPostman', async (_e, payload) => {
     try {
       const { file, ids } = payload || {};
@@ -831,6 +857,10 @@ function registerIpc() {
           const r = logger.clear();
           if (!r.ok) throw new Error(r.error);
           done.push(t);
+        } else if (t === 'recordings') {
+          const r = recorder.purgeRecordings();
+          if (!r.ok) throw new Error(r.error);
+          done.push(t);
         } else if (t === 'session') {
           const r = sessionStore.discard();
           if (!r.ok) throw new Error(r.error);
@@ -852,6 +882,7 @@ function registerIpc() {
   ipcMain.handle('cap:recStop', () => recorder.stopWhenIdle('manual'));
   ipcMain.handle('cap:recStatus', () => recorder.status());
   ipcMain.handle('cap:recList', () => recorder.listRecordings());
+  ipcMain.handle('cap:recDelete', (_e, payload) => recorder.deleteRecording((payload || {}).file));
   ipcMain.handle('cap:recRead', (_e, payload) => recorder.readRecording((payload || {}).file));
   ipcMain.handle('cap:recScript', async (_e, payload) => {
     const { file, outFile } = payload || {};
@@ -967,6 +998,19 @@ app.whenReady().then(() => {
   // （文本框的 Ctrl+C/V/X/A/Z 是 Chromium 原生编辑命令，与菜单无关，仍然可用）。
   Menu.setApplicationMenu(null);
   session.fromPartition(PARTITION).setPermissionRequestHandler((_wc, _perm, cb) => cb(true));
+
+  // 下载没有任何 UI 反馈，这里补上：状态栏/toast 提示 + 给它对应的抓包记录补一条 note
+  session.fromPartition(PARTITION).on('will-download', (_e, item) => {
+    const url = item.getURL();
+    const name = item.getFilename();
+    logger.log('download', `${name} ← ${url}`);
+    send('cap:download', { state: 'start', name, url, total: item.getTotalBytes() });
+    item.once('done', (_ev, st) => {
+      const file = item.getSavePath();
+      send('cap:download', { state: st === 'completed' ? 'done' : 'fail', name, url, file, status: st });
+      capture.markNote(url, `下载：${name}`);
+    });
+  });
   settings.registerBlocker();          // 必须在任何导航之前注册（同一 session 只能注册一个监听器）
   settings.hydrate();                  // 磁盘设置灌进内存，控件与拦截器都读同一份
 

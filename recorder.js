@@ -152,6 +152,23 @@ function note(text) {
   push({ k: 'note', text: String(text == null ? '' : text).slice(0, 300) });
 }
 
+// 面板与 .md 共用的展示文案：标签链，目标级带上类型（text / select-one 视为无信息，不显示）
+const TYPE_NOISE = new Set(['text', 'select-one', '']);
+function chainLabel(entry) {
+  const chain = String(entry.chain || '');
+  const type = String(entry.type || '');
+  const tag = String(entry.tag || '');
+  const suffix = TYPE_NOISE.has(type) ? '' : `[${type}]`;
+  if (chain) {
+    const parts = chain.split(' ← ');
+    const first = parts[0] || '';
+    const firstTag = first.split('#')[0].split('.')[0];
+    if (suffix && tag && firstTag === tag) parts[0] = `${tag}${suffix}${first.slice(tag.length)}`;   // 只有目标级加类型
+    return parts.join(' ← ');
+  }
+  return suffix ? `${tag}${suffix}` : (tag || entry.sel || '');                        // 老录制没有 chain 时退化
+}
+
 // 摘要与面板共用的一份精简副本；不需要的 kind 返回 null
 function reduceEntry(entry) {
   const k = entry.k;
@@ -160,6 +177,8 @@ function reduceEntry(entry) {
   if (k === 'action') {
     copy.a = entry.a; copy.sel = entry.sel; copy.text = entry.text;
     copy.value = entry.value; copy.key = entry.key; copy.x = entry.x; copy.y = entry.y;
+    copy.tag = entry.tag || ''; copy.type = entry.type || ''; copy.chain = entry.chain || '';
+    copy.label = chainLabel(entry);
   } else if (k === 'req') {
     copy.id = entry.id; copy.method = entry.method; copy.url = entry.url;
   } else if (k === 'res') {
@@ -371,11 +390,12 @@ function buildMarkdown(r) {
       if (e.a === 'scroll') {
         body = `滚动 y=${e.y == null ? '' : e.y}`;
       } else {
-        body = `${verbs[e.a] || e.a} ${e.sel || ''}`.trimEnd();
+        body = `${verbs[e.a] || e.a} ${e.label || e.sel || ''}`.trimEnd();
         if (e.text) body += `「${String(e.text).slice(0, 40)}」`;
         if (e.key) body += ` ${e.key}`;
         if (e.value !== undefined && e.value !== null && e.value !== '') body += ` 值=${String(e.value).slice(0, 40)}`;
         if (e.x != null) body += ` (${e.x},${e.y})`;
+        if (e.sel && e.sel !== e.label) body += ` · ${e.sel}`;   // 行尾带可直接复制使用的 CSS 选择器（写爬虫用）
       }
     } else if (e.k === 'req') {
       const res = resById.get(e.id);
@@ -437,11 +457,28 @@ const RECORD_SCRIPT = `(() => {
   const txt = (s, n) => String(s == null ? '' : s).trim().slice(0, n);
   const valOf = (el) => (el && el.type === 'password' ? '[password]' : txt(el && el.value, 200));
   const tagOf = (el) => (el && el.tagName ? el.tagName.toLowerCase() : '');
+  const levelOf = (el) => {                        // 单级：标签 + #id 或首个 .class（最长 40 字符）
+    try {
+      if (!el || !el.tagName) return '';
+      const tag = el.tagName.toLowerCase();
+      const id = el.id ? '#' + el.id : '';
+      const cls = !id && el.classList && el.classList.length ? '.' + el.classList[0] : '';
+      return (tag + id + cls).slice(0, 40);
+    } catch (e) { return ''; }
+  };
+  const chainOf = (el) => {                        // 从目标元素到 html，最多 6 级，用 ' ← ' 连接
+    try {
+      const out = [];
+      let n = el;
+      for (let d = 0; n && n.nodeType === 1 && d < 6; d++, n = n.parentElement) out.push(levelOf(n));
+      return out.filter(Boolean).join(' ← ');
+    } catch (e) { return ''; }
+  };
   document.addEventListener('click', (e) => {
     const t = e.target;
     let href = '';
     try { const a = t && t.closest ? t.closest('a') : null; if (a) href = a.href; } catch (err) {}
-    send({ t: Date.now(), a: 'click', sel: selOf(t), tag: tagOf(t), text: txt(t && t.textContent, 80), href, x: e.clientX, y: e.clientY, url: location.href });
+    send({ t: Date.now(), a: 'click', sel: selOf(t), tag: tagOf(t), chain: chainOf(t), text: txt(t && t.textContent, 80), href, x: e.clientX, y: e.clientY, url: location.href });
   }, true);
   let lastInputSel = '';
   let lastInputAt = 0;
@@ -451,10 +488,10 @@ const RECORD_SCRIPT = `(() => {
     if (sel === lastInputSel && now - lastInputAt < 300) return;
     lastInputSel = sel;
     lastInputAt = now;
-    send({ t: now, a: 'input', sel, tag: tagOf(e.target), type: (e.target && e.target.type) || '', value: valOf(e.target), url: location.href });
+    send({ t: now, a: 'input', sel, tag: tagOf(e.target), chain: chainOf(e.target), type: (e.target && e.target.type) || '', value: valOf(e.target), url: location.href });
   }, true);
   document.addEventListener('change', (e) => {
-    send({ t: Date.now(), a: 'change', sel: selOf(e.target), tag: tagOf(e.target), type: (e.target && e.target.type) || '', value: valOf(e.target), checked: !!(e.target && e.target.checked), url: location.href });
+    send({ t: Date.now(), a: 'change', sel: selOf(e.target), tag: tagOf(e.target), chain: chainOf(e.target), type: (e.target && e.target.type) || '', value: valOf(e.target), checked: !!(e.target && e.target.checked), url: location.href });
   }, true);
   document.addEventListener('submit', (e) => {
     const f = e.target;
@@ -462,11 +499,11 @@ const RECORD_SCRIPT = `(() => {
     try {
       fields = Array.prototype.slice.call(f.elements, 0, 20).map((x) => ({ name: x.name || '', value: x.type === 'password' ? '[password]' : txt(x.value, 120) }));
     } catch (err) {}
-    send({ t: Date.now(), a: 'submit', sel: selOf(f), action: f.action || '', method: String(f.method || 'get').toUpperCase(), fields, url: location.href });
+    send({ t: Date.now(), a: 'submit', sel: selOf(f), tag: tagOf(f), chain: chainOf(f), action: f.action || '', method: String(f.method || 'get').toUpperCase(), fields, url: location.href });
   }, true);
   document.addEventListener('keydown', (e) => {
     if (e.key.length === 1 && !e.ctrlKey && !e.altKey && !e.metaKey) return;
-    send({ t: Date.now(), a: 'keydown', sel: selOf(document.activeElement), key: e.key, ctrl: e.ctrlKey, alt: e.altKey, shift: e.shiftKey, meta: e.metaKey, url: location.href });
+    send({ t: Date.now(), a: 'keydown', sel: selOf(document.activeElement), tag: tagOf(document.activeElement), chain: chainOf(document.activeElement), key: e.key, ctrl: e.ctrlKey, alt: e.altKey, shift: e.shiftKey, meta: e.metaKey, url: location.href });
   }, true);
   let lastScrollAt = 0;
   document.addEventListener('scroll', () => {
@@ -650,11 +687,24 @@ function readTailText(file, maxBytes = 4096) {
   }
 }
 
-// 录制目录里的 .jsonl 列表（按 mtime 倒序）；entries/reason 取自最后一行 summary
+// 录制目录里的 .jsonl 列表（按 mtime 倒序）；entries/reason 取自最后一行 summary，
+// shots/bytes 是同一 base 的点击截图张数与「.jsonl + .md + 截图」的合计占用
 function listRecordings() {
   const dir = dirPath();
   let names = [];
   try { names = fs.readdirSync(dir); } catch (e) { return []; }
+  const extras = new Map();                                  // base -> { md, shots, shotBytes }
+  for (const name of names) {
+    if (name.endsWith('.jsonl')) continue;
+    const m = /^(rec-.+?)(?:-click-\d+)?\.(md|png)$/.exec(name);
+    if (!m) continue;
+    let st;
+    try { st = fs.statSync(path.join(dir, name)); } catch (e) { continue; }
+    const e = extras.get(m[1]) || { md: 0, shots: 0, shotBytes: 0 };
+    if (m[2] === 'md') e.md = st.size;
+    else { e.shots++; e.shotBytes += st.size; }
+    extras.set(m[1], e);
+  }
   const out = [];
   for (const name of names) {
     if (!name.endsWith('.jsonl')) continue;
@@ -667,15 +717,54 @@ function listRecordings() {
       try { last = JSON.parse(lines[i]); } catch (e) { last = null; }
     }
     const summary = last && last.k === 'summary' ? last : null;
+    const base = name.replace(/\.jsonl$/, '');
+    const ex = extras.get(base) || { md: 0, shots: 0, shotBytes: 0 };
     out.push({
-      file, base: name.replace(/\.jsonl$/, ''), size: st.size, mtime: st.mtimeMs,
+      file, base, size: st.size, mtime: st.mtimeMs,
       entries: summary ? (summary.entries || 0) : 0,
       reason: summary ? (summary.reason || '') : '',
       md: fs.existsSync(file.replace(/\.jsonl$/, '.md')),
+      shots: ex.shots,
+      bytes: st.size + ex.md + ex.shotBytes,
     });
   }
   out.sort((a, b) => b.mtime - a.mtime);
   return out;
+}
+
+// 删除单次录制：.jsonl + 同名 .md + 该 base 的所有点击截图（只允许录制目录内的文件）
+function deleteRecording(file) {
+  const dir = path.resolve(dirPath());
+  const p = path.resolve(String(file == null ? '' : file));
+  if (path.dirname(p) !== dir || !/^rec-.+\.jsonl$/.test(path.basename(p))) {
+    return { ok: false, error: '只能删除录制目录里的文件' };
+  }
+  const base = path.basename(p).replace(/\.jsonl$/, '');
+  const targets = [p, p.replace(/\.jsonl$/, '.md')];
+  try {
+    for (const name of fs.readdirSync(dir)) {
+      if (name.startsWith(`${base}-click-`) && name.endsWith('.png')) targets.push(path.join(dir, name));
+    }
+  } catch (e) { /* 目录读不到就只删已知的两个 */ }
+  let removed = 0;
+  for (const f of targets) {
+    if (!fs.existsSync(f)) continue;
+    try { fs.rmSync(f, { force: true }); removed++; } catch (e) { /* 单个失败不影响其它 */ }
+  }
+  return { ok: true, removed };
+}
+
+// 清空录制目录里的产物（保留目录本身，不递归删）
+function purgeRecordings() {
+  const dir = path.resolve(dirPath());
+  let names = [];
+  try { names = fs.readdirSync(dir); } catch (e) { return { ok: true, removed: 0 }; }
+  let removed = 0;
+  for (const name of names) {
+    if (!/^rec-.*\.(jsonl|md|png)$/.test(name)) continue;
+    try { fs.rmSync(path.join(dir, name), { force: true }); removed++; } catch (e) { /* 单个失败继续 */ }
+  }
+  return { ok: true, removed };
 }
 
 // 读单个录制：md 摘要 + 可重放的动作（只允许录制目录内的文件）
@@ -692,9 +781,12 @@ function readRecording(file) {
     try { e = JSON.parse(line); } catch (err) { continue; }
     if (e && e.k === 'action') {
       actions.push({
-        n: e.n, t: e.t, a: e.a, sel: e.sel, text: e.text, value: e.value,
-        key: e.key, checked: e.checked, x: e.x, y: e.y, url: e.url,
+        n: e.n, t: e.t, a: e.a, sel: e.sel, tag: e.tag, chain: e.chain, type: e.type,
+        text: e.text, value: e.value, key: e.key, checked: e.checked, x: e.x, y: e.y, url: e.url,
       });
+    } else if (e && e.k === 'nav') {
+      // 导航按文件顺序混进动作流：withNav 时重放会跳转，导出的 Playwright 脚本也照着 goto
+      actions.push({ n: e.n, t: e.t, a: 'nav', url: e.url || '', kind: e.kind || 'did-navigate' });
     }
   }
   let md = '';
@@ -723,6 +815,10 @@ function buildScript(actions, opts = {}) {
     const wait = Math.min(5000, Math.max(0, (a.t || prev) - prev));
     prev = a.t || prev;
     if (wait > 50) out.push(`  await page.waitForTimeout(${Math.round(wait)});   // 与上一条的实际间隔`);
+    if (a.a === 'nav') {                                                   // 录制里的跳转：脚本照做
+      if (a.url) out.push(`  await page.goto(${q1(a.url)});`);
+      continue;
+    }
     if (a.a === 'click') {
       if (!a.sel) out.push('  // 跳过一条点击：录制里没有选择器');
       else out.push(`  await page.click(${q1(a.sel)});`);
@@ -756,7 +852,13 @@ function buildScript(actions, opts = {}) {
 let replayState = null;
 
 // 单个动作的执行；选择器与值一律用 JSON.stringify 内插，避免引号注入
-async function runAction(dbg, a) {
+async function runAction(wc, a) {
+  if (a.a === 'nav') {                                       // 导航步骤（withNav 开启时才会跑到）
+    if (!a.url) return { ok: false, error: '导航步骤缺少 URL' };
+    try { await wc.loadURL(a.url); return { ok: true }; }
+    catch (e) { return { ok: false, error: e.message }; }
+  }
+  const dbg = wc.debugger;
   const evalIn = async (expression) => {
     const r = await dbg.sendCommand('Runtime.evaluate', { expression, returnByValue: true });
     if (r.exceptionDetails) return { ok: false, error: r.exceptionDetails.text || '页面脚本异常' };
@@ -820,19 +922,22 @@ async function replayRecording(file, opts = {}) {
   if (!dbg.isAttached()) return { ok: false, error: 'CDP 未就绪' };
   const speed = [0, 1, 2, 4].includes(opts.speed) ? opts.speed : 1;
   const stopOnError = opts.stopOnError !== false;
-  const actions = rd.actions.slice(0, 2000);                 // ponytail: 单次最多 2000 个动作，长录制请分段
-  replayState = { stop: false, done: 0, total: actions.length, failed: [] };
+  const withNav = !!opts.withNav;                            // 默认不回放导航：跳转由点击/提交自然发生
+  const all = rd.actions.slice(0, 2000);                     // ponytail: 单次最多 2000 个步骤，长录制请分段
+  const steps = withNav ? all : all.filter((a) => a.a !== 'nav');
+  const skipped = all.length - steps.length;
+  replayState = { stop: false, done: 0, total: steps.length, failed: [] };
   const t0 = Date.now();
-  const origin = actions[0].t || Date.now();
+  const origin = steps.length && steps[0].t ? steps[0].t : Date.now();
   try {
-    for (const a of actions) {
+    for (const a of steps) {
       if (replayState.stop) break;
       if (speed && a.t) {
         const wait = Math.min(60000, Math.max(0, (a.t - origin) / speed - (Date.now() - t0)));
         if (wait > 0) await new Promise((r) => setTimeout(r, wait));
       }
       let r;
-      try { r = await runAction(dbg, a); } catch (e) { r = { ok: false, error: e.message }; }   // 导航/关标签会让目标短暂失效
+      try { r = await runAction(wc, a); } catch (e) { r = { ok: false, error: e.message }; }   // 导航/关标签会让目标短暂失效
       if (r.ok) replayState.done++;
       else {
         replayState.failed.push({ n: a.n, a: a.a, sel: a.sel, reason: r.error });
@@ -840,7 +945,7 @@ async function replayRecording(file, opts = {}) {
       }
       send('cap:replayProgress', { done: replayState.done, total: replayState.total, failed: replayState.failed.length, last: a.sel || a.a });
     }
-    return { ok: true, done: replayState.done, total: replayState.total, failed: replayState.failed, stopped: replayState.stop };
+    return { ok: true, done: replayState.done, total: replayState.total, failed: replayState.failed, stopped: replayState.stop, skipped };
   } finally {
     replayState = null;
   }
@@ -856,7 +961,8 @@ module.exports = {
   VERSION, DIRNAME, BINDING, MAX_ENTRIES, MAX_BODY_WRITE, MAX_TOTAL_BODY_WRITE, MAX_POST_WRITE,
   MAX_WS_WRITE, MAX_SHOTS, FLUSH_MS, FLUSH_BYTES, MD_MAX_LINES,
   dirPath, useDir, isRecording, lastFile, lastInfo: () => Object.assign({}, lastInfo), status, start, stop, stopWhenIdle, flushSync,
+  chainLabel,
   arm, disarm, RECORD_SCRIPT, SELECTOR_SRC,
   onBinding, onRequest, onResponse, onBody, onFail, onWs, onNav, onPage, onNote: note,
-  listRecordings, readRecording, buildScript, replayRecording, stopReplay,
+  listRecordings, readRecording, buildScript, replayRecording, stopReplay, deleteRecording, purgeRecordings,
 };
