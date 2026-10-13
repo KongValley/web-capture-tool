@@ -143,7 +143,136 @@ function buildHar(records, title) {
   };
 }
 
+const STATUS_CLASS = (s) => (!s ? '失败/未响应' : s >= 500 ? '5xx' : s >= 400 ? '4xx' : s >= 300 ? '3xx' : '2xx');
+// 当前标签的抓包概览：按域名 / 类型 / 状态分组，外加最慢与最大的 top10（纯函数，面板「统计概览」用）
+function buildStats(records) {
+  const list = records || [];
+  const byDomain = new Map();
+  const byType = new Map();
+  const byStatus = new Map();
+  for (const r of list) {
+    let host = '';
+    try { host = new URL(r.url).host; } catch (e) { host = '(无法解析)'; }
+    const d = byDomain.get(host) || { host, count: 0, bytes: 0 };
+    d.count++;
+    d.bytes += r.encodedDataLength || 0;
+    byDomain.set(host, d);
+    const t = r.type || '(未知)';
+    byType.set(t, (byType.get(t) || 0) + 1);
+    const cls = STATUS_CLASS(r.status);
+    byStatus.set(cls, (byStatus.get(cls) || 0) + 1);
+  }
+  const top = (arr, cmp) => arr.slice().sort(cmp).slice(0, 10);
+  return {
+    total: list.length,
+    totalBytes: list.reduce((n, r) => n + (r.encodedDataLength || 0), 0),
+    byDomain: top([...byDomain.values()], (a, b) => b.bytes - a.bytes || b.count - a.count),
+    byType: [...byType.entries()].map(([type, count]) => ({ type, count })).sort((a, b) => b.count - a.count),
+    byStatus: [...byStatus.entries()].map(([cls, count]) => ({ cls, count })).sort((a, b) => b.count - a.count),
+    slowest: top(list.filter((r) => r.duration != null), (a, b) => b.duration - a.duration)
+      .map((r) => ({ method: r.method, url: r.url, ms: r.duration })),
+    largest: top(list, (a, b) => (b.encodedDataLength || 0) - (a.encodedDataLength || 0))
+      .map((r) => ({ method: r.method, url: r.url, size: r.encodedDataLength || 0 })),
+  };
+}
+
+/* ------------------------------------------------- 抓包转代码 / 表格导出 */
+
+const SNIPPET_SKIP = new Set(['content-length', 'host']);   // 由各语言的 HTTP 客户端自己算
+const pyStr = (s) => "'" + String(s).replace(/\\/g, '\\\\').replace(/'/g, "\\'") + "'";
+const jsStr = (s) => JSON.stringify(String(s));
+const bodyOf = (rec) => (rec.postData == null ? '' : String(rec.postData));
+const snippetHeaders = (rec) => requestHeaderList(rec).filter((h) => !SNIPPET_SKIP.has(h.name.toLowerCase()));
+
+function buildPythonRequests(rec) {
+  const hs = snippetHeaders(rec);
+  const body = bodyOf(rec);
+  const out = ['import requests', '', `url = ${pyStr(rec.url)}`];
+  if (hs.length) {
+    out.push('headers = {');
+    for (const h of hs) out.push(`    ${jsStr(h.name)}: ${jsStr(h.value)},`);
+    out.push('}');
+  } else {
+    out.push('headers = {}');
+  }
+  if (body) out.push(`data = ${pyStr(body)}`);
+  out.push('');
+  out.push(`r = requests.request(${jsStr(rec.method)}, url, headers=headers${body ? ', data=data.encode("utf-8")' : ''}, timeout=30)`);
+  out.push('print(r.status_code, len(r.content))');
+  return out.join('\n') + '\n';
+}
+
+function buildNodeFetch(rec) {
+  const hs = snippetHeaders(rec);
+  const body = bodyOf(rec);
+  const out = ['// Node 18+（内置 fetch）', 'const headers = {'];
+  for (const h of hs) out.push(`  ${jsStr(h.name)}: ${jsStr(h.value)},`);
+  out.push('};');
+  const opts = [`method: ${jsStr(rec.method)}`, 'headers'];
+  if (body) opts.push(`body: ${jsStr(body)}`);
+  out.push(`const res = await fetch(${jsStr(rec.url)}, { ${opts.join(', ')} });`);
+  out.push('console.log(res.status, await res.text());');
+  return out.join('\n') + '\n';
+}
+
+function buildNodeAxios(rec) {
+  const hs = snippetHeaders(rec);
+  const body = bodyOf(rec);
+  const out = ["const axios = require('axios');", '', 'const headers = {'];
+  for (const h of hs) out.push(`  ${jsStr(h.name)}: ${jsStr(h.value)},`);
+  out.push('};');
+  const opts = [`method: ${jsStr(rec.method)}`, `url: ${jsStr(rec.url)}`, 'headers'];
+  if (body) opts.push(`data: ${jsStr(body)}`);
+  out.push(`const res = await axios.request({ ${opts.join(', ')} });`);
+  out.push('console.log(res.status, res.data);');
+  return out.join('\n') + '\n';
+}
+
+// Postman Collection v2.1（可直接导入 Postman / Insomnia）
+function buildPostmanCollection(records, name) {
+  return {
+    info: {
+      name: name || 'web-capture-tool',
+      schema: 'https://schema.getpostman.com/json/collection/v2.1.0/collection.json',
+    },
+    item: (records || []).map((rec, i) => {
+      const request = {
+        method: rec.method,
+        header: snippetHeaders(rec).map((h) => ({ key: h.name, value: h.value })),
+        url: { raw: rec.url },
+      };
+      const body = bodyOf(rec);
+      if (body) request.body = { mode: 'raw', raw: body };
+      return { name: `${i + 1}. ${rec.method} ${rec.url}`, request };
+    }),
+  };
+}
+
+function humanSize(n) {
+  if (n == null) return '';
+  if (n < 1024) return n + 'B';
+  if (n < 1048576) return (n / 1024).toFixed(1) + 'K';
+  return (n / 1048576).toFixed(1) + 'M';
+}
+
+function buildMarkdownTable(records) {
+  const cells = (arr) => `| ${arr.join(' | ')} |`;
+  const escPipe = (v) => String(v == null ? '' : v).replace(/\|/g, '\\|');
+  const out = [];
+  out.push(cells(['#', '方法', '状态', '类型', '大小', '耗时', '★', 'URL']));
+  out.push(cells(['---', '---', '---', '---', '---', '---', '---', '---']));
+  (records || []).forEach((r, i) => {
+    out.push(cells([
+      i + 1, escPipe(r.method), escPipe(r.status || (r.failed ? '×' : '')), escPipe(r.type),
+      humanSize(r.encodedDataLength || 0), r.duration == null ? '' : `${r.duration}ms`,
+      r.star ? '★' : '', escPipe(r.url),
+    ]));
+  });
+  return out.join('\n') + '\n';
+}
+
 module.exports = {
   mergedHeaders, requestHeaderList, responseHeaderList, headerValue, parseHeaderLines,
-  buildCurl, csvEscape, rowsToCsv, tablesToCsv, buildHar,
+  buildCurl, csvEscape, rowsToCsv, tablesToCsv, buildHar, buildStats,
+  buildPythonRequests, buildNodeFetch, buildNodeAxios, buildPostmanCollection, buildMarkdownTable,
 };

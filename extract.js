@@ -11,7 +11,11 @@ async function evalPage(expression) {
   if (!wc) throw new Error('视图未就绪');
   if (wc.debugger.isAttached()) {
     const r = await wc.debugger.sendCommand('Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true });
-    if (r.exceptionDetails) throw new Error(r.exceptionDetails.text || '页面脚本执行异常');
+    if (r.exceptionDetails) {
+      // CDP 的 text 只有「Uncaught」，真正的错误信息在 exception.description（含堆栈）
+      const d = r.exceptionDetails.exception || {};
+      throw new Error(d.description || r.exceptionDetails.text || '页面脚本执行异常');
+    }
     return r.result.value;
   }
   return wc.executeJavaScript(expression, true);

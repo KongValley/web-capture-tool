@@ -62,4 +62,16 @@ function tail(n = 200, filter = '') {
   }
 }
 
-module.exports = { MAX_BYTES, filePath, useFile, log, tail, safeJson };
+// 清空日志（面板「清理数据 → 日志」）：主文件与滚动的上一代一起删
+function clear() {
+  try {
+    const p = filePath();
+    fs.rmSync(p, { force: true });
+    fs.rmSync(`${p}.1`, { force: true });
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
+module.exports = { MAX_BYTES, filePath, useFile, log, tail, clear, safeJson };

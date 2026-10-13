@@ -14,7 +14,7 @@
  * 模块：state.js 共享状态 / capture.js 抓取 / extract.js 页面提取 / 其余见各文件头。
  * 依赖方向单向：所有模块 require('./state')，禁止任何模块 require main.js。
  */
-const { app, BrowserWindow, BrowserView, ipcMain, session, screen, shell } = require('electron');
+const { app, BrowserWindow, BrowserView, ipcMain, session, screen, shell, Menu } = require('electron');
 const path = require('node:path');
 const os = require('node:os');
 const fs = require('node:fs');
@@ -31,6 +31,7 @@ const automation = require('./automation');
 const format = require('./format');
 const files = require('./files');
 const recorder = require('./recorder');
+const picker = require('./picker');
 
 const ICON = path.join(__dirname, 'build', 'icon.ico');
 if (process.platform === 'win32') app.setAppUserModelId('com.kongvalley.web-capture-tool');
@@ -181,6 +182,17 @@ function newTab(url = 'about:blank', opts = {}) {
   view.setBackgroundColor('#ffffff');
 
   const wc = tab.wc;
+  // 页面里按下的 Ctrl+R / Ctrl+Shift+R / Ctrl+Shift+I / F11：菜单栏移除后这些命令没了默认入口，
+  // 在页面视图这一侧用 before-input-event 补上（派发前拦截，不往页面注入脚本）
+  wc.on('before-input-event', (e, input) => {
+    if (!input || input.type !== 'keyDown' || wc.isDestroyed()) return;
+    const key = String(input.key || '').toLowerCase();
+    const ctrl = !!(input.control || input.meta);
+    if (ctrl && input.shift && key === 'r') { e.preventDefault(); wc.reloadIgnoringCache(); return; }
+    if (ctrl && key === 'r') { e.preventDefault(); wc.reload(); return; }
+    if (ctrl && input.shift && key === 'i') { e.preventDefault(); toggleViewDevTools(wc); return; }
+    if (input.key === 'F11' && !ctrl && !input.alt) { e.preventDefault(); toggleFullScreen(); }
+  });
   if (!state.defaultUA) state.defaultUA = wc.getUserAgent();
   wc.setWindowOpenHandler(({ url: u }) => {            // target=_blank / window.open 留在同一标签
     const n = normalizeUrl(u);
@@ -231,8 +243,25 @@ function newTab(url = 'about:blank', opts = {}) {
   return tab;
 }
 
+// 菜单栏移除后，这几个窗口级命令由面板快捷键（renderer onKey）与页面视图的
+// before-input-event 两处触发，都走下面这两个函数，行为一致。
+function toggleViewDevTools(wc) {
+  const target = wc && !wc.isDestroyed() ? wc : null;
+  if (!target) return { ok: false, error: '视图未就绪' };
+  if (target.isDevToolsOpened()) target.closeDevTools(); else target.openDevTools({ mode: 'detach' });
+  return { ok: true };
+}
+
+function toggleFullScreen() {
+  const { win } = state;
+  if (!win || win.isDestroyed()) return { ok: false, error: '窗口未就绪' };
+  win.setFullScreen(!win.isFullScreen());
+  return { ok: true, on: win.isFullScreen() };
+}
+
 function activateTab(tab) {
   if (!tab) return;
+  capture.flushBatch(true);       // 在途批次属于旧标签，直接丢（面板切过去后会全量同步）
   syncActive(tab);
   const { win } = state;
   if (win && !win.isDestroyed()) {
@@ -312,6 +341,12 @@ function currentPageUrl() {
   return v && !v.webContents.isDestroyed() ? v.webContents.getURL() : '';
 }
 
+// Postman Collection 的默认标题用当前页标题
+function currentPageTitle() {
+  const v = state.view;
+  return v && !v.webContents.isDestroyed() ? v.webContents.getTitle() : '';
+}
+
 // Cookie 的统一字段映射（面板、导出、会话数据模态共用一份）
 function mapCookie(c) {
   return {
@@ -365,7 +400,14 @@ function registerIpc() {
   });
   ipcMain.handle('cap:back', () => { const wc = state.view.webContents; if (wc.canGoBack()) wc.goBack(); return true; });
   ipcMain.handle('cap:forward', () => { const wc = state.view.webContents; if (wc.canGoForward()) wc.goForward(); return true; });
-  ipcMain.handle('cap:reload', () => { state.view.webContents.reload(); return true; });
+  ipcMain.handle('cap:reload', (_e, hard) => {
+    const wc = state.view.webContents;
+    if (hard) wc.reloadIgnoringCache(); else wc.reload();
+    return true;
+  });
+  // 菜单栏已移除：Ctrl+Shift+I / F11 的入口改从这里走（快捷键在面板 onKey 里绑定）
+  ipcMain.handle('cap:devtools', () => toggleViewDevTools(state.view && state.view.webContents));
+  ipcMain.handle('cap:fullscreen', () => toggleFullScreen());
   ipcMain.handle('cap:setEnabled', (_e, v) => {
     state.enabled = !!v;
     for (const t of state.tabs) t.enabled = state.enabled;   // 暂停/继续是全局的，所有标签一起生效
@@ -373,6 +415,7 @@ function registerIpc() {
     return state.enabled;
   });
   ipcMain.handle('cap:clear', () => {
+    capture.flushBatch(true);     // 记录即将清空，在途批次一并丢弃
     resetActive();
     return true;
   });
@@ -557,6 +600,25 @@ function registerIpc() {
     return { ok: true, applied: applied.length, skipped, failed };
   });
   ipcMain.handle('cap:cfgAllTabs', () => settings.applyToAllTabs());
+  ipcMain.handle('cap:mark', (_e, id, patch) => {
+    const rec = state.records.find((x) => x.id === id);
+    if (!rec) return { ok: false, error: '记录不存在' };
+    const p = patch || {};
+    if (p.star !== undefined) rec.star = !!p.star;
+    if (p.comment !== undefined) rec.comment = String(p.comment).slice(0, 500);
+    return { ok: true, record: capture.summarize(rec) };
+  });
+  ipcMain.handle('cap:stats', () => format.buildStats(state.records));
+  ipcMain.handle('cap:searchBody', (_e, query) => {
+    const q = String(query == null ? '' : query);
+    if (!q) return { ok: false, error: '请输入搜索内容' };
+    const ids = [];
+    for (const r of state.records) {
+      if (r.body == null || r.bodyBase64) continue;      // 只搜已保存的文本响应体
+      if (r.body.includes(q)) ids.push(r.id);
+    }
+    return { ok: true, ids, count: ids.length };
+  });
   ipcMain.handle('cap:auto', (_e, opts) => automation.autoRun(opts));
   ipcMain.handle('cap:autoStop', () => automation.autoStop());
   ipcMain.handle('cap:extract', (_e, payload) => {
@@ -577,6 +639,18 @@ function registerIpc() {
           .filter((h) => !['content-length', 'host'].includes(h.name.toLowerCase()))
           .map((h) => `${h.name}: ${h.value}`);
         return { ok: true, text: lines.join('\n') };
+      }
+      if (kind === 'python' || kind === 'nodeFetch' || kind === 'nodeAxios') {
+        const rec = state.records.find((x) => x.id === data);
+        if (!rec) return { ok: false, error: '记录不存在' };
+        const text = kind === 'python' ? format.buildPythonRequests(rec)
+          : kind === 'nodeFetch' ? format.buildNodeFetch(rec) : format.buildNodeAxios(rec);
+        return { ok: true, text };
+      }
+      if (kind === 'markdown') {
+        const ids = Array.isArray(data) && data.length ? new Set(data) : null;
+        const list = ids ? state.records.filter((r) => ids.has(r.id)) : state.records;
+        return { ok: true, text: format.buildMarkdownTable(list) };
       }
       if (kind === 'rowsCsv') return { ok: true, text: format.rowsToCsv(data) };
       if (kind === 'tablesCsv') return { ok: true, text: format.tablesToCsv(data) };
@@ -627,6 +701,16 @@ function registerIpc() {
     } catch (e) { logger.log('ipc', `cap:exportHar: ${e.message}`); return { ok: false, error: e.message }; }
   });
   ipcMain.handle('cap:replay', (_e, id, overrides) => capture.replay(id, overrides));
+  ipcMain.handle('cap:exportPostman', async (_e, payload) => {
+    try {
+      const { file, ids } = payload || {};
+      const set = Array.isArray(ids) && ids.length ? new Set(ids) : null;
+      const list = set ? state.records.filter((r) => set.has(r.id)) : state.records;
+      const col = format.buildPostmanCollection(list, currentPageTitle());
+      const name = `${files.exportBaseName('postman', currentPageUrl())}.json`;
+      return await files.saveTextFile({ defaultName: name, content: JSON.stringify(col, null, 2), file });
+    } catch (e) { logger.log('ipc', `cap:exportPostman: ${e.message}`); return { ok: false, error: e.message }; }
+  });
 
   /* ------------------------------------------------------------ 页面工具 */
 
@@ -702,11 +786,83 @@ function registerIpc() {
     return { ok: true };
   });
 
+  /* ------------------------------------------------ 元素拾取 / 执行 JS / 清理 */
+
+  ipcMain.handle('cap:pickStart', () => picker.start());
+  ipcMain.handle('cap:pickCancel', () => picker.stop());
+  ipcMain.handle('cap:eval', async (_e, expr) => {
+    const code = String(expr == null ? '' : expr);
+    if (!code.trim()) return { ok: false, error: '请输入要执行的 JS' };
+    try {
+      const v = await extract.evalPage(code);
+      if (v === undefined) return { ok: true, value: '[undefined]' };
+      if (typeof v === 'string') return { ok: true, value: v };
+      try { return { ok: true, value: JSON.stringify(v, null, 2) }; } catch (e) { return { ok: true, value: String(v) }; }
+    } catch (e) { return { ok: false, error: e.message }; }
+  });
+
+  // 清理运行时数据：Cookie / Storage / 缓存 / 日志 / 会话文件，逐项独立失败
+  ipcMain.handle('cap:wipe', async (_e, payload) => {
+    const targets = Array.isArray(payload && payload.targets) ? payload.targets : [];
+    if (!targets.length) return { ok: false, error: '没有选择任何清理目标' };
+    const ses = session.fromPartition(PARTITION);
+    const done = [];
+    const failed = [];
+    for (const t of targets) {
+      try {
+        if (t === 'cookies') {
+          await ses.clearStorageData({ storages: ['cookies'] });
+          done.push(t);
+        } else if (t === 'storage') {
+          await ses.clearStorageData({ storages: ['localstorage', 'indexdb', 'websql', 'cachestorage', 'serviceworkers'] });
+          for (const tab of state.tabs) {                       // sessionStorage 只能逐标签在页面里清
+            const wc = tab.wc;
+            if (!wc || wc.isDestroyed()) continue;
+            try {
+              if (wc.debugger.isAttached()) await wc.debugger.sendCommand('Runtime.evaluate', { expression: 'sessionStorage.clear()', returnByValue: true });
+              else await wc.executeJavaScript('sessionStorage.clear()', true);
+            } catch (e) { /* 单标签失败忽略 */ }
+          }
+          done.push(t);
+        } else if (t === 'cache') {
+          await ses.clearCache();
+          done.push(t);
+        } else if (t === 'logs') {
+          const r = logger.clear();
+          if (!r.ok) throw new Error(r.error);
+          done.push(t);
+        } else if (t === 'session') {
+          const r = sessionStore.discard();
+          if (!r.ok) throw new Error(r.error);
+          done.push(t);
+        } else {
+          failed.push(`${t}: 未知目标`);
+        }
+      } catch (e) {
+        failed.push(`${t}: ${e.message}`);
+        logger.log('ipc', `cap:wipe ${t}: ${e.message}`);
+      }
+    }
+    return { ok: failed.length === 0, done, failed };
+  });
+
   /* ------------------------------------------------------------ 会话录制 */
 
   ipcMain.handle('cap:recStart', (_e, opts) => recorder.start(opts || {}));
-  ipcMain.handle('cap:recStop', () => recorder.stop('manual'));
+  ipcMain.handle('cap:recStop', () => recorder.stopWhenIdle('manual'));
   ipcMain.handle('cap:recStatus', () => recorder.status());
+  ipcMain.handle('cap:recList', () => recorder.listRecordings());
+  ipcMain.handle('cap:recRead', (_e, payload) => recorder.readRecording((payload || {}).file));
+  ipcMain.handle('cap:recScript', async (_e, payload) => {
+    const { file, outFile } = payload || {};
+    const rd = recorder.readRecording(file);
+    if (!rd.ok) return rd;
+    const first = rd.actions.find((a) => a.url);
+    const content = recorder.buildScript(rd.actions, { url: first ? first.url : '' });
+    return files.saveTextFile({ defaultName: `replay-${rd.base}.js`, content, file: outFile });
+  });
+  ipcMain.handle('cap:recReplay', (_e, payload) => recorder.replayRecording((payload || {}).file, payload || {}));
+  ipcMain.handle('cap:recReplayStop', () => recorder.stopReplay());
   ipcMain.handle('cap:recInfo', () => Object.assign({ ok: true, dir: recorder.dirPath() }, recorder.lastInfo()));
   ipcMain.handle('cap:recOpen', () => {
     const f = recorder.lastFile();
@@ -806,6 +962,10 @@ function registerIpc() {
 /* ---------------------------------------------------------------- 启动 */
 
 app.whenReady().then(() => {
+  // 去掉 Electron 默认菜单栏（File/Edit/View/Window/Help）：本项目全部功能都在面板里，
+  // 省下窗口顶部一整行；对应快捷键改由面板 onKey + cap:reload/cap:devtools/cap:fullscreen 提供
+  // （文本框的 Ctrl+C/V/X/A/Z 是 Chromium 原生编辑命令，与菜单无关，仍然可用）。
+  Menu.setApplicationMenu(null);
   session.fromPartition(PARTITION).setPermissionRequestHandler((_wc, _perm, cb) => cb(true));
   settings.registerBlocker();          // 必须在任何导航之前注册（同一 session 只能注册一个监听器）
   settings.hydrate();                  // 磁盘设置灌进内存，控件与拦截器都读同一份
@@ -841,7 +1001,7 @@ app.whenReady().then(() => {
   if (state.selftest) {
     require('./selftest.js').run({
       state, store, gpu, capture, extract, settings, automation, format, files, logger,
-      session: sessionStore, recorder, resetActive, PARTITION,
+      session: sessionStore, recorder, picker, resetActive, PARTITION,
     });
   }
   app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });

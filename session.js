@@ -105,6 +105,7 @@ function toInternal(f) {
     body: f.body === undefined ? null : f.body, bodyBase64: !!f.bodyBase64,
     bodyError: f.bodyError || null, failed: f.failed || null,
     remoteIP: f.remoteIP || '', protocol: f.protocol || '', redirects: f.redirects || [], note: f.note || '',
+    star: !!f.star, comment: f.comment || '',
     restored: true,
   };
 }

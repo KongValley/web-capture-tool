@@ -7,6 +7,7 @@ const { state, send, setStatus, normalizeUrl, PARTITION, MAX_RECORDS, MAX_BODY, 
 const settings = require('./settings');
 const format = require('./format');
 const recorder = require('./recorder');
+const picker = require('./picker');
 
 function summarize(r) {
   return {
@@ -15,6 +16,7 @@ function summarize(r) {
     size: r.encodedDataLength || 0, duration: r.duration,
     failed: r.failed, hasBody: r.body !== null, note: r.note,
     redirects: r.redirects.length,
+    star: !!r.star,
     restored: !!r.restored,
   };
 }
@@ -29,6 +31,7 @@ function fullRecord(r) {
     redirects: r.redirects, failed: r.failed,
     encodedDataLength: r.encodedDataLength, durationMs: r.duration,
     bodyBase64: r.bodyBase64, bodyError: r.bodyError, body: r.body,
+    star: !!r.star, comment: r.comment || '',
     restored: !!r.restored,
   };
 }
@@ -53,7 +56,7 @@ function onRequestWillBeSent(tab, ev) {
     prev.body = null;
     prev.bodyBase64 = false;
     prev.bodyError = null;
-    sendTab(tab, 'cap:update', summarize(prev));
+    queueBatch(tab, 'update', summarize(prev));
     recorder.onRequest(tab, prev, true);
     return;
   }
@@ -69,15 +72,16 @@ function onRequestWillBeSent(tab, ev) {
     mime: '', encodedDataLength: 0, duration: null,
     body: null, bodyBase64: false, bodyError: null, failed: null,
     remoteIP: '', protocol: '', redirects: [], note: '',
+    star: false, comment: '',
   };
   tab.byId.set(requestId, rec);
   tab.records.push(rec);
   if (tab.records.length > MAX_RECORDS) {
     const gone = tab.records.shift();
     tab.byId.delete(gone.cdpId);
-    sendTab(tab, 'cap:drop', gone.id);
+    queueBatch(tab, 'drop', gone.id);
   }
-  sendTab(tab, 'cap:record', summarize(rec));
+  queueBatch(tab, 'record', summarize(rec));
   recorder.onRequest(tab, rec);
 }
 
@@ -91,7 +95,7 @@ function onResponseReceived(tab, ev) {
   rec.remoteIP = ev.response.remoteIPAddress || '';
   rec.protocol = ev.response.protocol || '';
   if (!rec.type && ev.type) rec.type = ev.type;
-  sendTab(tab, 'cap:update', summarize(rec));
+  queueBatch(tab, 'update', summarize(rec));
   recorder.onResponse(tab, rec);
 }
 
@@ -100,12 +104,38 @@ function onResponseExtraInfo(tab, ev) {
   if (!rec) return;
   if (ev.headers) rec.responseHeadersRaw = ev.headers;   // 原始头，含 Set-Cookie
   if (ev.statusCode) rec.status = ev.statusCode;
-  sendTab(tab, 'cap:update', summarize(rec));
+  queueBatch(tab, 'update', summarize(rec));
 }
 
+/* ---------------------------------------------------------- 面板推送批处理 */
+
+// 面板推送合并成 100ms 一批：繁忙页面每秒上千条事件时，IPC 消息与 DOM 重画都不再随事件数抖动。
+// 顺序：records → updates → drops → ws（渲染端按同样顺序应用，已 drop 的更新不会复活行）。
+const BATCH_MS = 100;
+let batchTimer = null;
+let batch = null;              // { records: [], updates: Map, drops: [], ws: [] }
+
 // 后台标签的抓包事件不推给面板（切回标签时由 cap:list 全量同步）
-function sendTab(tab, channel, payload) {
-  if (tab === state.activeTab) send(channel, payload);
+function queueBatch(tab, kind, payload) {
+  if (tab !== state.activeTab) return;
+  if (!batch) {
+    batch = { records: [], updates: new Map(), drops: [], ws: [] };
+    batchTimer = setTimeout(flushBatch, BATCH_MS);
+  }
+  if (kind === 'record') batch.records.push(payload);
+  else if (kind === 'update') batch.updates.set(payload.id, payload);   // 同一 id 只留最后一条
+  else if (kind === 'drop') batch.drops.push(payload);
+  else if (kind === 'ws') batch.ws.push(payload);
+}
+
+// 立即冲刷；discard=true 时只丢不送（清空 / 切标签：在途批次与新状态无关）
+function flushBatch(discard = false) {
+  if (batchTimer) { clearTimeout(batchTimer); batchTimer = null; }
+  const b = batch;
+  batch = null;
+  if (!b || discard) return;
+  const payload = { records: b.records, updates: [...b.updates.values()], drops: b.drops, ws: b.ws };
+  if (payload.records.length || payload.updates.length || payload.drops.length || payload.ws.length) send('cap:batch', payload);
 }
 
 async function onLoadingFinished(tab, ev) {
@@ -130,7 +160,7 @@ async function onLoadingFinished(tab, ev) {
       rec.bodyError = e.message;
     }
   }
-  sendTab(tab, 'cap:update', summarize(rec));
+  queueBatch(tab, 'update', summarize(rec));
   recorder.onBody(tab, rec);
 }
 
@@ -139,14 +169,14 @@ function onLoadingFailed(tab, ev) {
   if (!rec) return;
   rec.failed = { errorText: ev.errorText, blockedReason: ev.blockedReason || '', canceled: !!ev.canceled };
   if (typeof rec.startedAt === 'number') rec.duration = Math.round((ev.timestamp - rec.startedAt) * 1000);
-  sendTab(tab, 'cap:update', summarize(rec));
+  queueBatch(tab, 'update', summarize(rec));
   recorder.onFail(tab, rec);
 }
 
 function pushWs(tab, frame) {
   tab.wsFrames.push(frame);
   if (tab.wsFrames.length > MAX_WS_FRAMES) tab.wsFrames.shift();
-  sendTab(tab, 'cap:ws', frame);
+  queueBatch(tab, 'ws', frame);
   recorder.onWs(tab, frame);
 }
 
@@ -165,7 +195,7 @@ async function attachCapture(tab) {
       case 'Network.requestWillBeSentExtraInfo':
         if (params.headers) {
           const rec = tab.byId.get(params.requestId);
-          if (rec) { rec.requestHeadersRaw = params.headers; sendTab(tab, 'cap:update', summarize(rec)); }
+          if (rec) { rec.requestHeadersRaw = params.headers; queueBatch(tab, 'update', summarize(rec)); }
           else tab.pendingExtra.set(params.requestId, { headers: params.headers });
         }
         break;
@@ -180,6 +210,7 @@ async function attachCapture(tab) {
       case 'Network.webSocketFrameError': pushWs(tab, { kind: 'error', requestId: params.requestId, error: params.errorMessage, time: Date.now() }); break;
       case 'Runtime.bindingCalled':
         if (params.name === recorder.BINDING) recorder.onBinding(tab, params);
+        else if (params.name === picker.BINDING) picker.onBinding(params);
         break;
       default: break;
     }
@@ -273,4 +304,4 @@ function replay(id, overrides = {}) {
   });
 }
 
-module.exports = { summarize, fullRecord, attachCapture, replay };
+module.exports = { summarize, fullRecord, attachCapture, replay, flushBatch };

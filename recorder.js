@@ -80,8 +80,31 @@ function status() {
 
 /* -------------------------------------------------------------- 写盘 */
 
+let writing = false;      // 是否已有一次 appendFile 在飞（全局只允许一个，保证写入顺序）
+let writingFile = '';     // 在飞写入的目标文件（跨文件的同步写不会破坏顺序）
+
+// 缓冲刷盘：交给 fs.promises.appendFile 串行写，主线程不再被同步 IO 阻塞。
+// 代价：崩溃最多丢最后 FLUSH_MS 里的事件；stop/flushSync 走 drainSync 同步兜底。
 function flush() {
   if (!rec || !rec.pending.length) return true;
+  if (writing) return false;                                  // 有写在飞：留在 pending 里，等它回来一起写
+  const text = rec.pending.join('\n') + '\n';
+  rec.pending.length = 0;
+  rec.pendingBytes = 0;
+  writing = true;
+  writingFile = rec.file;
+  fs.promises.appendFile(writingFile, text)
+    .catch((e) => logger.log('rec', `写入失败：${e.message}`))
+    .finally(() => { writing = false; writingFile = ''; flush(); });   // 写完立刻把剩下的排空（顺序不乱）
+  return true;
+}
+
+// 同步把残留写完（stop / 退出 / 生成摘要前）；
+// 只有「在飞的那次写的就是同一个文件」时才让路，否则同步写不会插队。
+// force=true 忽略让路规则——只给「新建录制」用：那时文件是新的，不可能有在飞写。
+function drainSync(force = false) {
+  if (!rec || !rec.pending.length) return true;
+  if (!force && writing && writingFile === rec.file) return false;
   try {
     fs.appendFileSync(rec.file, rec.pending.join('\n') + '\n');
     rec.pending.length = 0;
@@ -91,6 +114,15 @@ function flush() {
     logger.log('rec', `写入失败：${e.message}`);
     return false;
   }
+}
+
+// 面板「停止录制」用：等异步写入排空再返回，调用方拿到的一定是完整文件
+async function stopWhenIdle(reason = 'manual') {
+  const r = stop(reason);
+  const t0 = Date.now();
+  while (writing && Date.now() - t0 < 1000) await new Promise((res) => setTimeout(res, 20));
+  drainSync();
+  return r;
 }
 
 // 每条记录的唯一入口：编号 → 计数 → 入缓冲 → 必要时刷盘
@@ -220,7 +252,8 @@ async function start(opts = {}) {
   ]).catch(() => false);
   await Promise.all(state.tabs.map((t) => armOne(t.wc)));
   rec.timer = setInterval(flush, FLUSH_MS);
-  flush();                                   // manifest 立刻落盘
+  // 清单同步落盘：此刻 pending 里只有 manifest，面板/自检会立刻读文件（force 绕过同文件让路）
+  drainSync(true);
   return { ok: true, file: rec.file, mdFile: rec.mdFile, startedAt: now };
 }
 
@@ -232,11 +265,13 @@ function stop(reason = 'manual') {
   const now = Date.now();
   const durationMs = now - r.startedAt;
   flush();
+  drainSync();                                  // 摘要前把已有缓冲落盘（有写在飞时由它自己排空，顺序不乱）
   push({
     k: 'summary', stoppedAt: new Date(now).toISOString(), reason,
     entries: r.n + 1, durationMs, counts: Object.assign({}, r.counts),
   });
   flush();
+  drainSync();
   r.active = false;
   r.stopping = false;
   clearPanelQueue();
@@ -266,8 +301,10 @@ function flushSync() {
     r.reason = 'quit';
     const now = Date.now();
     flush();
+    drainSync();
     push({ k: 'summary', stoppedAt: new Date(now).toISOString(), reason: 'quit', entries: r.n + 1, durationMs: now - r.startedAt, counts: Object.assign({}, r.counts) });
     flush();
+    drainSync();
     r.active = false;
     r.stopping = false;
     try {
@@ -367,12 +404,8 @@ function buildMarkdown(r) {
 
 /* -------------------------------------------------------------- 注入与摘挂 */
 
-const RECORD_SCRIPT = `(() => {
-  if (window.__wctRecArmed) return;
-  window.__wctRecArmed = true;
-  const send = (o) => { try { if (window.__wctRecord) window.__wctRecord(JSON.stringify(o)); } catch (e) {} };
-  const esc = (s) => (window.CSS && CSS.escape ? CSS.escape(String(s)) : String(s));
-  const txt = (s, n) => String(s == null ? '' : s).trim().slice(0, n);
+// 选择器算法：录制注入与元素拾取共用一份（改这里两边都生效）；esc 是它的依赖，一起带出来
+const SELECTOR_SRC = `const esc = (s) => (window.CSS && CSS.escape ? CSS.escape(String(s)) : String(s));
   const selOf = (el) => {
     try {
       if (!el || el.nodeType !== 1 || !el.tagName) return '';
@@ -394,7 +427,14 @@ const RECORD_SCRIPT = `(() => {
       }
       return parts.join(' > ');
     } catch (e) { return ''; }
-  };
+  };`;
+
+const RECORD_SCRIPT = `(() => {
+  if (window.__wctRecArmed) return;
+  window.__wctRecArmed = true;
+  const send = (o) => { try { if (window.__wctRecord) window.__wctRecord(JSON.stringify(o)); } catch (e) {} };
+  ${SELECTOR_SRC}
+  const txt = (s, n) => String(s == null ? '' : s).trim().slice(0, n);
   const valOf = (el) => (el && el.type === 'password' ? '[password]' : txt(el && el.value, 200));
   const tagOf = (el) => (el && el.tagName ? el.tagName.toLowerCase() : '');
   document.addEventListener('click', (e) => {
@@ -591,10 +631,232 @@ function onPage(tab, info) {
   push({ k: 'page', tab: tab.id, url: (info && info.url) || '', title: (info && info.title) || '' });
 }
 
+/* -------------------------------------------------- 录制历史 / 重放 */
+
+// 从文件尾读最多 4KB（列表只要最后一行 summary，不读整个文件）
+function readTailText(file, maxBytes = 4096) {
+  let fd = null;
+  try {
+    fd = fs.openSync(file, 'r');
+    const size = fs.fstatSync(fd).size;
+    const len = Math.min(size, maxBytes);
+    const buf = Buffer.alloc(len);
+    fs.readSync(fd, buf, 0, len, size - len);
+    return buf.toString('utf8');
+  } catch (e) {
+    return '';
+  } finally {
+    if (fd != null) { try { fs.closeSync(fd); } catch (e) { /* 已关闭 */ } }
+  }
+}
+
+// 录制目录里的 .jsonl 列表（按 mtime 倒序）；entries/reason 取自最后一行 summary
+function listRecordings() {
+  const dir = dirPath();
+  let names = [];
+  try { names = fs.readdirSync(dir); } catch (e) { return []; }
+  const out = [];
+  for (const name of names) {
+    if (!name.endsWith('.jsonl')) continue;
+    const file = path.join(dir, name);
+    let st;
+    try { st = fs.statSync(file); } catch (e) { continue; }
+    const lines = readTailText(file).split('\n').filter((l) => l.trim());
+    let last = null;
+    for (let i = lines.length - 1; i >= 0 && !last; i--) {       // 尾部可能被截断，往前找第一条能解析的
+      try { last = JSON.parse(lines[i]); } catch (e) { last = null; }
+    }
+    const summary = last && last.k === 'summary' ? last : null;
+    out.push({
+      file, base: name.replace(/\.jsonl$/, ''), size: st.size, mtime: st.mtimeMs,
+      entries: summary ? (summary.entries || 0) : 0,
+      reason: summary ? (summary.reason || '') : '',
+      md: fs.existsSync(file.replace(/\.jsonl$/, '.md')),
+    });
+  }
+  out.sort((a, b) => b.mtime - a.mtime);
+  return out;
+}
+
+// 读单个录制：md 摘要 + 可重放的动作（只允许录制目录内的文件）
+function readRecording(file) {
+  const p = path.resolve(String(file == null ? '' : file));
+  if (path.dirname(p) !== path.resolve(dirPath())) return { ok: false, error: '只能读取录制目录里的文件' };
+  let text;
+  try { text = fs.readFileSync(p, 'utf8'); } catch (e) { return { ok: false, error: `读取失败：${e.message}` }; }
+  const lines = text.split('\n').filter((l) => l.trim());
+  const actions = [];
+  for (const line of lines) {
+    if (actions.length >= 5000) break;                            // ponytail: 单次重放动作上限 5000，超出请分段录制
+    let e;
+    try { e = JSON.parse(line); } catch (err) { continue; }
+    if (e && e.k === 'action') {
+      actions.push({
+        n: e.n, t: e.t, a: e.a, sel: e.sel, text: e.text, value: e.value,
+        key: e.key, checked: e.checked, x: e.x, y: e.y, url: e.url,
+      });
+    }
+  }
+  let md = '';
+  try { md = fs.readFileSync(p.replace(/\.jsonl$/, '.md'), 'utf8'); } catch (e) { md = ''; }
+  return { ok: true, file: p, base: path.basename(p).replace(/\.jsonl$/, ''), entries: lines.length, md, actions };
+}
+
+// 生成独立的 Playwright 回放脚本（零依赖：只用字符串拼接）
+function buildScript(actions, opts = {}) {
+  const list = Array.isArray(actions) ? actions : [];
+  const q1 = (s) => "'" + String(s == null ? '' : s).replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/\r?\n/g, '\\n') + "'";
+  const first = list.find((a) => a && a.url);
+  const start = String(opts.url || (first ? first.url : '') || 'about:blank');
+  const out = [];
+  out.push('// 由 web-capture-tool 录制生成');
+  out.push('// 用法：npm i -D playwright && npx playwright install chromium && node replay.js');
+  out.push("const { chromium } = require('playwright');");
+  out.push('');
+  out.push('(async () => {');
+  out.push('  const browser = await chromium.launch({ headless: false });');
+  out.push('  const page = await browser.newPage();');
+  out.push(`  await page.goto(${q1(start)});`);
+  let prev = list.length && list[0].t ? list[0].t : Date.now();
+  for (const a of list) {
+    if (!a) continue;
+    const wait = Math.min(5000, Math.max(0, (a.t || prev) - prev));
+    prev = a.t || prev;
+    if (wait > 50) out.push(`  await page.waitForTimeout(${Math.round(wait)});   // 与上一条的实际间隔`);
+    if (a.a === 'click') {
+      if (!a.sel) out.push('  // 跳过一条点击：录制里没有选择器');
+      else out.push(`  await page.click(${q1(a.sel)});`);
+    } else if (a.a === 'input') {
+      if (a.value === '[password]') {
+        out.push('  // 密码已在录制中掩码，请手动填写');
+        out.push(`  await page.fill(${q1(a.sel)}, '');`);
+      } else {
+        out.push(`  await page.fill(${q1(a.sel)}, ${q1(a.value)});`);
+      }
+    } else if (a.a === 'change') {
+      const type = String(a.type || '');
+      if (!a.sel) out.push('  // 跳过一条值变更：录制里没有选择器');
+      else if (type === 'checkbox' || type === 'radio') out.push(`  await page.${a.checked ? 'check' : 'uncheck'}(${q1(a.sel)});`);
+      else out.push(`  await page.selectOption(${q1(a.sel)}, ${q1(a.value)});`);
+    } else if (a.a === 'submit') {
+      out.push(`  await page.evaluate((sel) => { const f = document.querySelector(sel); if (f) { if (f.requestSubmit) f.requestSubmit(); else f.submit(); } }, ${q1(a.sel)});`);
+    } else if (a.a === 'keydown') {
+      out.push(`  await page.keyboard.press(${q1(a.key)});`);
+    } else if (a.a === 'scroll') {
+      out.push(`  await page.evaluate(() => window.scrollTo(0, ${Number(a.y) || 0}));`);
+    } else {
+      out.push(`  // 跳过未支持的动作：${String(a.a || '')}`);
+    }
+  }
+  out.push('  await browser.close();');
+  out.push('})();');
+  return out.join('\n') + '\n';
+}
+
+let replayState = null;
+
+// 单个动作的执行；选择器与值一律用 JSON.stringify 内插，避免引号注入
+async function runAction(dbg, a) {
+  const evalIn = async (expression) => {
+    const r = await dbg.sendCommand('Runtime.evaluate', { expression, returnByValue: true });
+    if (r.exceptionDetails) return { ok: false, error: r.exceptionDetails.text || '页面脚本异常' };
+    return { ok: true, value: r.result ? r.result.value : undefined };
+  };
+  const sel = JSON.stringify(String(a.sel || ''));
+  if (a.a === 'click') {
+    const r = await evalIn(`(() => { const el = document.querySelector(${sel}); if (!el) return false; el.scrollIntoView({ block: 'center' }); el.click(); return true; })()`);
+    if (!r.ok) return r;
+    if (r.value) return { ok: true };
+    if (typeof a.x === 'number' && typeof a.y === 'number') {          // 选择器失配时退化为坐标点击
+      try {
+        await dbg.sendCommand('Input.dispatchMouseEvent', { type: 'mousePressed', x: a.x, y: a.y, button: 'left', clickCount: 1 });
+        await dbg.sendCommand('Input.dispatchMouseEvent', { type: 'mouseReleased', x: a.x, y: a.y, button: 'left', clickCount: 1 });
+        return { ok: true };
+      } catch (e) { return { ok: false, error: e.message }; }
+    }
+    return { ok: false, error: `未找到元素：${a.sel || '(无选择器)'}` };
+  }
+  if (a.a === 'input' || a.a === 'change') {
+    if (!a.sel) return { ok: false, error: '录制里没有选择器' };
+    if (a.a === 'input' && a.value === '[password]') return { ok: false, error: '密码字段已掩码，无法重放' };
+    const setChecked = Object.prototype.hasOwnProperty.call(a, 'checked') ? `if ('checked' in el) el.checked = ${a.checked ? 'true' : 'false'};` : '';
+    const setValue = a.a === 'input' ? `el.value = ${JSON.stringify(String(a.value == null ? '' : a.value))};` : '';
+    const r = await evalIn(`(() => { const el = document.querySelector(${sel}); if (!el) return false; el.focus(); ${setChecked} ${setValue} el.dispatchEvent(new Event('input', { bubbles: true })); el.dispatchEvent(new Event('change', { bubbles: true })); return true; })()`);
+    if (!r.ok) return r;
+    return r.value ? { ok: true } : { ok: false, error: `未找到元素：${a.sel}` };
+  }
+  if (a.a === 'submit') {
+    if (!a.sel) return { ok: false, error: '录制里没有选择器' };
+    const r = await evalIn(`(() => { const f = document.querySelector(${sel}); if (!f) return false; if (f.requestSubmit) f.requestSubmit(); else f.submit(); return true; })()`);
+    if (!r.ok) return r;
+    return r.value ? { ok: true } : { ok: false, error: `未找到表单：${a.sel}` };
+  }
+  if (a.a === 'keydown') {
+    if (!a.key) return { ok: false, error: '录制里没有按键' };
+    const mods = (a.alt ? 1 : 0) | (a.ctrl ? 2 : 0) | (a.meta ? 4 : 0) | (a.shift ? 8 : 0);
+    const base = mods ? { modifiers: mods } : {};
+    try {
+      await dbg.sendCommand('Input.dispatchKeyEvent', Object.assign({ type: 'keyDown', key: a.key }, base));
+      await dbg.sendCommand('Input.dispatchKeyEvent', Object.assign({ type: 'keyUp', key: a.key }, base));
+      return { ok: true };
+    } catch (e) { return { ok: false, error: e.message }; }
+  }
+  if (a.a === 'scroll') {
+    const r = await evalIn(`(() => { window.scrollTo(0, ${Number(a.y) || 0}); return true; })()`);
+    return r.ok ? { ok: true } : r;
+  }
+  return { ok: false, error: `不支持的动作用类型：${a.a}` };
+}
+
+// 按录制重放（异步长跑）：speed 0 = 不等间隔，1/2/4 = 倍速；stopOnError 默认 true
+async function replayRecording(file, opts = {}) {
+  if (replayState) return { ok: false, error: '已有重放任务在进行中' };
+  const rd = readRecording(file);
+  if (!rd.ok) return rd;
+  if (!rd.actions.length) return { ok: false, error: '这个录制里没有可重放的交互动作' };
+  const wc = state.view && !state.view.webContents.isDestroyed() ? state.view.webContents : null;
+  if (!wc) return { ok: false, error: '视图未就绪' };
+  const dbg = wc.debugger;
+  if (!dbg.isAttached()) return { ok: false, error: 'CDP 未就绪' };
+  const speed = [0, 1, 2, 4].includes(opts.speed) ? opts.speed : 1;
+  const stopOnError = opts.stopOnError !== false;
+  const actions = rd.actions.slice(0, 2000);                 // ponytail: 单次最多 2000 个动作，长录制请分段
+  replayState = { stop: false, done: 0, total: actions.length, failed: [] };
+  const t0 = Date.now();
+  const origin = actions[0].t || Date.now();
+  try {
+    for (const a of actions) {
+      if (replayState.stop) break;
+      if (speed && a.t) {
+        const wait = Math.min(60000, Math.max(0, (a.t - origin) / speed - (Date.now() - t0)));
+        if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+      }
+      let r;
+      try { r = await runAction(dbg, a); } catch (e) { r = { ok: false, error: e.message }; }   // 导航/关标签会让目标短暂失效
+      if (r.ok) replayState.done++;
+      else {
+        replayState.failed.push({ n: a.n, a: a.a, sel: a.sel, reason: r.error });
+        if (stopOnError) { replayState.stop = true; break; }
+      }
+      send('cap:replayProgress', { done: replayState.done, total: replayState.total, failed: replayState.failed.length, last: a.sel || a.a });
+    }
+    return { ok: true, done: replayState.done, total: replayState.total, failed: replayState.failed, stopped: replayState.stop };
+  } finally {
+    replayState = null;
+  }
+}
+
+function stopReplay() {
+  if (!replayState) return { ok: false, error: '当前没有重放任务' };
+  replayState.stop = true;
+  return { ok: true };
+}
+
 module.exports = {
   VERSION, DIRNAME, BINDING, MAX_ENTRIES, MAX_BODY_WRITE, MAX_TOTAL_BODY_WRITE, MAX_POST_WRITE,
   MAX_WS_WRITE, MAX_SHOTS, FLUSH_MS, FLUSH_BYTES, MD_MAX_LINES,
-  dirPath, useDir, isRecording, lastFile, lastInfo: () => Object.assign({}, lastInfo), status, start, stop, flushSync,
-  arm, disarm, RECORD_SCRIPT,
+  dirPath, useDir, isRecording, lastFile, lastInfo: () => Object.assign({}, lastInfo), status, start, stop, stopWhenIdle, flushSync,
+  arm, disarm, RECORD_SCRIPT, SELECTOR_SRC,
   onBinding, onRequest, onResponse, onBody, onFail, onWs, onNav, onPage, onNote: note,
+  listRecordings, readRecording, buildScript, replayRecording, stopReplay,
 };
