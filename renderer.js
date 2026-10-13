@@ -3,7 +3,7 @@
 const { ipcRenderer, clipboard } = require('electron');
 
 const $ = (id) => document.getElementById(id);
-const el = { list: $('list'), ws: $('ws'), wsView: $('wsView'), detail: $('detail'), filter: $('filter'), type: $('typeFilter') };
+const el = { list: $('list'), ws: $('ws'), wsView: $('wsView'), detail: $('detail'), filter: $('filter'), type: $('typeFilter'), sort: $('sortBy') };
 
 const rows = new Map();     // id -> {rec, node, visible}（node 可能为 null：超出渲染上限后仅保留数据）
 const LIST_MAX_ROWS = 3000; // 列表最多渲染的行数（超出后移除最早的 DOM，数据仍在内存与导出里）
@@ -249,19 +249,21 @@ function appendRecord(rec) {
   if (listAtBottom()) el.list.scrollTop = el.list.scrollHeight;
   else { listNew++; updateListNew(); }
   while (domRows > LIST_MAX_ROWS) {
-    const first = el.list.querySelector('.row');
-    if (!first) break;
-    const item = rows.get(Number(first.dataset.id));
-    if (item) {                                   // 只丢 DOM，数据留在内存（导出/过滤仍可用）
-      if (item.visible) visibleCount--;
-      item.node = null;
-      item.visible = false;
+    let victim = null;
+    for (const [id2, r2] of rows) {          // rows 保持插入顺序 = 最旧优先（排序只动 DOM，不动内存顺序）
+      if (r2.node) { victim = [id2, r2]; break; }
     }
-    first.remove();
+    if (!victim) break;
+    const vrow = victim[1];
+    if (vrow.visible) visibleCount--;
+    vrow.node.remove();
+    vrow.node = null;                        // 只丢 DOM，数据留在内存（导出/过滤仍可用）
+    vrow.visible = false;
     domRows--;
   }
   updateCounts();
   updateListNote();
+  scheduleSort();
   if (view === 'wf') scheduleWaterfall();
 }
 
@@ -275,6 +277,7 @@ function updateRecord(rec) {
   }
   if (selected === rec.id) scheduleDetailRender(rec.id);
   updateCounts();
+  scheduleSort();
   if (view === 'wf') scheduleWaterfall();
 }
 
@@ -291,7 +294,56 @@ function refilter() {
     setRowVisible(id, matches(r.rec));
   }
   updateCounts();
+  scheduleSort();                            // 分组标题条数 / 隐藏行要跟着筛选刷新
   if (view === 'wf') scheduleWaterfall();      // 瀑布图跟随筛选
+}
+
+
+/* ---------------------------------------------------------------- 排序与分组 */
+
+let sortTimer = null;
+
+// 非「时间」排序才需要重排 DOM；流式追加时按 500ms 合并，避免每批都重排
+function scheduleSort() {
+  if (el.sort.value === 'time') return;
+  if (sortTimer) return;
+  sortTimer = setTimeout(() => { sortTimer = null; applySort(); }, 500);
+}
+
+// 排序/分组：按内存记录决定顺序，再按顺序把已有的 DOM 节点 appendChild 回去（节点被移动而不是重建）
+// 分组标题（.grp）每次重建，不计入 domRows
+function applySort() {
+  const mode = el.sort.value;
+  for (const g of el.list.querySelectorAll('.grp')) g.remove();
+  const items = [...rows.values()].filter((r) => r.node);
+  if (mode === 'time') {                     // 回到时间序：按插入顺序（= 时间序）摆回来
+    for (const r of items) el.list.appendChild(r.node);
+    return;
+  }
+  const hostOf = (rec) => { try { return new URL(rec.url).host; } catch (e) { return '(无法解析)'; } };
+  const cmp = {
+    size: (a, b) => (b.rec.size || 0) - (a.rec.size || 0),
+    duration: (a, b) => (b.rec.duration || 0) - (a.rec.duration || 0),
+    status: (a, b) => (b.rec.status || 0) - (a.rec.status || 0),
+  }[mode];
+  if (mode === 'domain') {
+    const groups = new Map();
+    for (const r of items) {
+      if (!r.visible) continue;              // 只给看得见的行分组，标题条数才与筛选一致
+      const h = hostOf(r.rec);
+      if (!groups.has(h)) groups.set(h, []);
+      groups.get(h).push(r);
+    }
+    for (const host of [...groups.keys()].sort()) {
+      const head = document.createElement('div');
+      head.className = 'grp lbl';
+      head.textContent = `${host} · ${groups.get(host).length} 条`;
+      el.list.appendChild(head);
+      for (const r of groups.get(host)) el.list.appendChild(r.node);
+    }
+    return;
+  }
+  for (const r of items.slice().sort(cmp)) el.list.appendChild(r.node);
 }
 
 // 过滤结果的唯一来源：按内存记录算 id（DOM 只渲染最近 3000 行，不能作为导出依据）
@@ -885,6 +937,46 @@ async function openSessionData() {
   box.appendChild(ct.table);
 
   box.appendChild(sectionTitle(`localStorage（${Object.keys(pd.page.localStorage || {}).length} 项）`));
+  const lsBar = document.createElement('div');
+  lsBar.className = 'dbar';
+  const lsBtn = document.createElement('button');
+  lsBtn.textContent = '导入 Storage';
+  lsBtn.title = '批量导入键值对到 localStorage';
+  lsBtn.onclick = () => {
+    const ta = textarea('JSON 对象 {"k":"v"} 或每行 k=v（导入到 localStorage）', '');
+    openModal('导入 Storage', [labelled('内容', ta)], [
+      { label: '导入', primary: true, onClick: async () => {
+        const raw = String(ta.value || '').trim();
+        if (!raw) return toast('没有可导入的内容', 'warn');
+        let entries = [];
+        try {
+          if (raw.startsWith('{')) {
+            const obj = JSON.parse(raw);
+            entries = Object.entries(obj).map(([k, v]) => [k, String(v == null ? '' : v)]);
+          } else {
+            entries = raw.split('\n').map((l) => l.trim()).filter(Boolean).map((l) => {
+              const i = l.indexOf('=');
+              return i > 0 ? [l.slice(0, i).trim(), l.slice(i + 1)] : null;
+            }).filter(Boolean);
+          }
+        } catch (e) { return toast('解析失败：' + e.message, 'err'); }
+        if (!entries.length) return toast('没有可导入的键值对', 'warn');
+        let okN = 0;
+        const bad = [];
+        for (const [k, v] of entries) {
+          const r = await ipcRenderer.invoke('cap:storageSet', { area: 'local', key: k, value: v });
+          if (r && r.ok) okN++;
+          else bad.push(k);
+        }
+        toast(`已导入 ${okN} 项${bad.length ? `，失败 ${bad.length} 项` : ''}`, bad.length ? 'warn' : 'ok');
+        openSessionData();
+        return undefined;
+      } },
+      { label: '取消', onClick: () => openSessionData() },
+    ]);
+  };
+  lsBar.appendChild(lsBtn);
+  box.appendChild(lsBar);
   box.appendChild(storageTable('local', pd.page.localStorage));
   box.appendChild(sectionTitle(`sessionStorage（${Object.keys(pd.page.sessionStorage || {}).length} 项）`));
   box.appendChild(storageTable('session', pd.page.sessionStorage));
@@ -1228,7 +1320,13 @@ ipcRenderer.on('cap:picked', (_e, p) => {
   } else {
     clipboard.writeText(p.sel);
   }
-  toast('选择器：' + p.sel, 'ok', 4000);
+  toast('选择器：' + p.sel, 'ok', 5000, {
+    label: '复制 XPath',
+    onClick: () => {
+      clipboard.writeText(p.xpath || '');
+      return p.xpath ? toast('已复制 XPath', 'ok', 2000) : toast('该元素没有生成 XPath', 'warn', 2000);
+    },
+  });
   pickTarget = '';
 });
 
@@ -1265,7 +1363,92 @@ $('proxyTest').onclick = async () => {
   return undefined;
 };
 $('colSet').addEventListener('change', () => { refilter(); cfg('colSet', $('colSet').value); });
+$('sortBy').addEventListener('change', () => { applySort(); cfg('sortBy', $('sortBy').value); });
 $('reqDelay').addEventListener('change', () => cfg('reqDelay', +$('reqDelay').value));
+
+/* ---- 响应体落盘规则 ---- */
+let saveRulePaint = null;      // 模态打开时的状态行绘制函数（模态关闭后只写状态栏）
+
+function saveRuleText(s) {
+  const mb = ((s && s.bytes) || 0) / 1048576;
+  if (s && s.blocked) return s.blocked;
+  return `已落盘 ${(s && s.n) || 0} 个 · ${mb.toFixed(1)}MB`;
+}
+
+async function openSaveRule() {
+  const got = await ipcRenderer.invoke('cap:saveRuleGet');
+  if (!got || !got.ok) return toast('读取落盘规则失败', 'err');
+  const rule = got.rule || {};
+  const on = document.createElement('input');
+  on.type = 'checkbox';
+  on.checked = !!rule.on;
+  const onWrap = document.createElement('label');
+  onWrap.className = 'lbl';
+  onWrap.appendChild(on);
+  onWrap.appendChild(document.createTextNode(' 命中规则时把响应体直接写进目录'));
+  const urlRe = document.createElement('input');
+  urlRe.placeholder = '/api/ 或 \\.json$（留空 = 全部）';
+  urlRe.value = rule.urlRe || '';
+  const types = document.createElement('select');
+  for (const [v, t] of [['all', '全部类型'], ['xhr', '仅 XHR / Fetch'], ['doc', '仅 Document']]) {
+    const o = document.createElement('option');
+    o.value = v;
+    o.textContent = t;
+    types.appendChild(o);
+  }
+  types.value = rule.types || 'all';
+  const mimes = document.createElement('input');
+  mimes.placeholder = 'json,csv,zip（逗号分隔，留空 = 全部）';
+  mimes.value = rule.mimes || '';
+  const dir = document.createElement('input');
+  dir.placeholder = '落盘目录';
+  dir.value = rule.dir || '';
+  dir.style.flex = '1';
+  const dirRow = document.createElement('div');
+  dirRow.style.display = 'flex';
+  dirRow.style.gap = '6px';
+  const pick = document.createElement('button');
+  pick.textContent = '选择…';
+  pick.onclick = async () => {
+    const r = await ipcRenderer.invoke('cap:pickDir');
+    if (r && r.ok) dir.value = r.dir;
+  };
+  dirRow.appendChild(dir);
+  dirRow.appendChild(pick);
+  const stateLine = document.createElement('div');
+  stateLine.className = 'lbl';
+  const paint = (s) => { stateLine.textContent = saveRuleText(s); };
+  paint(got);
+  saveRulePaint = paint;
+  openModal('响应体落盘规则（单次运行最多 2000 个 / 512MB）', [
+    onWrap,
+    labelled('URL 正则（留空 = 全部）', urlRe),
+    labelled('类型', types),
+    labelled('MIME 关键字', mimes),
+    labelled('目录', dirRow),
+    stateLine,
+  ], [
+    { id: 'saveRuleSave', label: '保存', primary: true, onClick: async () => {
+      const dirVal = dir.value.trim();
+      if (on.checked && !dirVal) return toast('开启落盘前请先选择目录', 'warn');
+      const r = await ipcRenderer.invoke('cap:saveRuleSet', {
+        on: on.checked, urlRe: urlRe.value, types: types.value, mimes: mimes.value, dir: dirVal,
+      });
+      if (!r || !r.ok) return toast('保存失败：' + ((r && r.error) || '未知错误'), 'err');
+      paint(r);
+      toast('落盘规则已保存', 'ok');
+      return undefined;
+    } },
+    { label: '关闭', onClick: closeModal },
+  ]);
+  return undefined;
+}
+$('saveRule').onclick = openSaveRule;
+ipcRenderer.on('cap:saveRule', (_e, s) => {
+  if (saveRulePaint && !$('modal').hidden) return saveRulePaint(s);
+  $('status').textContent = saveRuleText(s);
+  return undefined;
+});
 $('cfgAllTabs').onclick = async () => {
   const r = await ipcRenderer.invoke('cap:cfgAllTabs');
   if (!r || !r.ok) return toast(`部分标签应用失败：${((r && r.failed) || []).join('；')}`, 'err');
@@ -1282,7 +1465,7 @@ $('uaSel').addEventListener('change', () => {
 $('uaCustom').addEventListener('change', () => cfg('ua', $('uaCustom').value));
 
 /* ---- 自动化 ---- */
-const REASON = { done: '完成', 'no-next': '未找到「下一页」', stopped: '已停止', timeout: '超时' };
+const REASON = { done: '完成', 'no-next': '未找到「下一页」', stopped: '已停止', timeout: '超时', 'extract-failed': '提取失败' };
 
 function setAutoBusy(busy) {
   $('autoScroll').disabled = busy;
@@ -1306,28 +1489,139 @@ $('autoScroll').onclick = () => runAuto({ mode: 'scroll', rounds: +$('scrollRoun
 $('autoPage').onclick = () => runAuto({ mode: 'page', pages: +$('pageCount').value, delay: +$('pageDelay').value });
 $('autoStop').onclick = () => ipcRenderer.invoke('cap:autoStop');
 
-/* ---- CSS 选择器提取 ---- */
-let lastExtract = null;
+/* ---- CSS / XPath 选择器提取 + 翻页合并任务 ---- */
+let lastExtract = null;      // 最近一次提取/合并的行（导出用）
+let taskPresets = [];        // 任务预设（settings.tasks 的本地副本）
+
+// 预览一张行表（提取 / 合并任务共用）
+function paintRowPreview(out, rows, tipText) {
+  out.innerHTML = '';
+  const cols = [];
+  for (const row of rows) for (const k of Object.keys(row)) if (!cols.includes(k)) cols.push(k);
+  out.appendChild(dataTable(cols, rows.slice(0, 20)));
+  const tip = document.createElement('div');
+  tip.className = 'lbl';
+  tip.textContent = tipText;
+  out.appendChild(tip);
+}
 
 $('extract').onclick = () => {
-  const selRows = textarea('行选择器，例如 .item', '');
-  const selFields = textarea('每行 名称=选择器[@属性]，例如\n标题=.title\n链接=a@href\n正文=@html', '');
+  const selRows = textarea('行选择器，例如 .item（XPath 用 xpath: 前缀）', '');
+  const selFields = textarea('每行 名称=选择器[@属性]，例如\n标题=.title\n链接=a@href\n正文=@html\nXPath 用 xpath: 前缀', '');
   const out = document.createElement('div');
 
   const run = async () => {
     const r = await ipcRenderer.invoke('cap:extract', { rows: selRows.value, fields: selFields.value });
-    out.innerHTML = '';
     if (!r || !r.ok) { toast('提取失败：' + ((r && r.error) || '未知错误'), 'err'); return; }
     lastExtract = r.rows;
-    const cols = [];
-    for (const row of r.rows) for (const k of Object.keys(row)) if (!cols.includes(k)) cols.push(k);
-    out.appendChild(dataTable(cols, r.rows.slice(0, 20)));
-    const tip = document.createElement('div');
-    tip.className = 'lbl';
-    tip.textContent = `共 ${r.count} 行${r.truncated ? '（已截断到 5000）' : ''}${r.count > 20 ? '，预览前 20 行' : ''}`;
-    out.appendChild(tip);
+    paintRowPreview(out, r.rows, `共 ${r.count} 行${r.truncated ? '（已截断到 5000）' : ''}${r.count > 20 ? '，预览前 20 行' : ''}`);
     $('status').textContent = `提取 ${r.count} 行`;
   };
+
+  const pageN = document.createElement('input');
+  pageN.type = 'number'; pageN.className = 'num'; pageN.min = 1; pageN.max = 100; pageN.value = 3;
+  pageN.title = '总页数';
+  const pageD = document.createElement('input');
+  pageD.type = 'number'; pageD.className = 'num'; pageD.min = 200; pageD.max = 60000; pageD.step = 100;
+  pageD.value = 2000; pageD.title = '每页间隔 ms'; pageD.style.width = '72px';
+  const taskUrl = document.createElement('input');
+  taskUrl.placeholder = '任务起始 URL（留空 = 当前页）';
+  taskUrl.style.flex = '1';
+
+  // 翻页 + 提取合并：每页跑一遍当前选择器，最后按行合并（行带 _page 标记）
+  const runTask = async () => {
+    setAutoBusy(true);
+    try {
+      const r = await ipcRenderer.invoke('cap:taskRun', {
+        url: taskUrl.value.trim(), rows: selRows.value, fields: selFields.value,
+        pages: +pageN.value, delay: +pageD.value,
+      });
+      if (!r || !r.ok) return toast('任务失败：' + ((r && r.error) || '未知错误'), 'err');
+      lastExtract = r.rows;
+      paintRowPreview(out, r.rows,
+        `${REASON[r.reason] || r.reason}：合并 ${r.rows.length} 行 · ${r.pages} 页${r.dup ? ` · 重复 ${r.dup} 行` : ''}${r.rows.length > 20 ? '，预览前 20 行' : ''}`);
+      $('status').textContent = `翻页提取 ${r.rows.length} 行 / ${r.pages} 页`;
+      return undefined;
+    } finally {
+      setAutoBusy(false);
+    }
+  };
+
+  const taskBar = document.createElement('div');
+  taskBar.className = 'dbar';
+  for (const [lbl, node] of [['页数', pageN], ['间隔', pageD]]) {
+    const s = document.createElement('span');
+    s.className = 'lbl';
+    s.textContent = lbl;
+    taskBar.appendChild(s);
+    taskBar.appendChild(node);
+  }
+  taskBar.appendChild(taskUrl);
+
+  // 任务预设：名称 + 保存/删除（落在 settings.tasks，最多 20 条）
+  const presetSel = document.createElement('select');
+  presetSel.style.flex = '1';
+  const presetName = document.createElement('input');
+  presetName.placeholder = '预设名称';
+  const paintPresets = () => {
+    presetSel.innerHTML = '';
+    const none = document.createElement('option');
+    none.value = '';
+    none.textContent = taskPresets.length ? '预设…' : '（暂无预设）';
+    presetSel.appendChild(none);
+    for (const t of taskPresets) {
+      const o = document.createElement('option');
+      o.value = t.name;
+      o.textContent = t.name;
+      presetSel.appendChild(o);
+    }
+  };
+  paintPresets();
+  presetSel.onchange = () => {
+    const t = taskPresets.find((x) => x.name === presetSel.value);
+    if (!t) return;
+    selRows.value = t.rows;
+    selFields.value = t.fields;
+    pageN.value = t.pages;
+    pageD.value = t.delay;
+    taskUrl.value = t.url || '';
+    presetName.value = t.name;
+  };
+  const savePreset = async () => {
+    const name = presetName.value.trim();
+    if (!name) return toast('请填写预设名称', 'warn');
+    const next = taskPresets.filter((t) => t.name !== name);
+    next.push({ name, url: taskUrl.value.trim(), rows: selRows.value, fields: selFields.value, pages: +pageN.value, delay: +pageD.value });
+    const r = await ipcRenderer.invoke('cap:cfg', { key: 'tasks', value: next });
+    if (!r || !r.ok) return toast('保存预设失败：' + ((r && r.error) || '未知错误'), 'err');
+    const back = await ipcRenderer.invoke('cap:cfgAll');
+    taskPresets = Array.isArray(back && back.tasks) ? back.tasks : [];
+    paintPresets();
+    presetSel.value = name;
+    return toast('已保存预设：' + name, 'ok');
+  };
+  const delPreset = async () => {
+    const name = presetSel.value;
+    if (!name) return toast('请先选择预设', 'warn');
+    const r = await ipcRenderer.invoke('cap:cfg', { key: 'tasks', value: taskPresets.filter((t) => t.name !== name) });
+    if (!r || !r.ok) return toast('删除预设失败：' + ((r && r.error) || '未知错误'), 'err');
+    const back = await ipcRenderer.invoke('cap:cfgAll');
+    taskPresets = Array.isArray(back && back.tasks) ? back.tasks : [];
+    paintPresets();
+    presetSel.value = '';
+    return toast('已删除预设：' + name, 'ok');
+  };
+
+  const presetBar = document.createElement('div');
+  presetBar.className = 'dbar';
+  presetBar.appendChild(presetSel);
+  presetBar.appendChild(presetName);
+  for (const [label, fn] of [['保存预设', savePreset], ['删除预设', delPreset]]) {
+    const b = document.createElement('button');
+    b.textContent = label;
+    b.onclick = fn;
+    presetBar.appendChild(b);
+  }
 
   const pickBar = document.createElement('div');
   pickBar.className = 'dbar';
@@ -1338,13 +1632,16 @@ $('extract').onclick = () => {
   pickBar.appendChild(bRow);
   pickBar.appendChild(bField);
 
-  openModal('CSS 选择器提取', [
+  openModal('CSS / XPath 选择器提取', [
     pickBar,
     labelled('行选择器（每条记录的容器）', selRows),
-    labelled('字段（每行 名称=选择器[@属性]）', selFields),
+    labelled('字段（每行 名称=选择器[@属性]，XPath 加 xpath: 前缀）', selFields),
+    taskBar,
+    presetBar,
     out,
   ], [
     { id: 'extractRun', label: '提取', primary: true, onClick: run },
+    { id: 'extractTask', label: '翻页+提取', onClick: runTask },
     { label: '导出 CSV', onClick: async () => {
       if (!lastExtract) return toast('请先提取', 'warn');
       const f = await ipcRenderer.invoke('cap:format', 'rowsCsv', lastExtract);
@@ -1355,6 +1652,11 @@ $('extract').onclick = () => {
       saveText(JSON.stringify(lastExtract, null, 2), 'data.json');
     } },
   ]);
+  // 预设列表异步补齐：模态必须同步打开（快捷键 / 自检依赖 openModal 立即生效）
+  ipcRenderer.invoke('cap:cfgAll').then((c) => {
+    taskPresets = Array.isArray(c && c.tasks) ? c.tasks : [];
+    paintPresets();
+  });
 };
 
 /* ---- 页面清单 / 表格 CSV ---- */
@@ -1399,6 +1701,52 @@ async function openStats() {
   return undefined;
 }
 $('statsBtn').onclick = openStats;
+
+/* ---- 抓包快照对比（两次快照的差异：新增 / 消失 / 变化）---- */
+async function openSnaps() {
+  const first = await ipcRenderer.invoke('cap:snapList');
+  const head = document.createElement('div');
+  head.className = 'lbl';
+  const paintHead = (snaps) => {
+    head.textContent = snaps && snaps.length
+      ? snaps.map((s, i) => `#${i + 1} ${new Date(s.at).toLocaleTimeString()} · ${s.count} 条 · ${s.url || ''}`).join('\n')
+      : '还没有快照（最多留最近 2 个，只在本次运行内存里）';
+  };
+  paintHead(first && first.snaps);
+  const out = document.createElement('div');
+  openModal('抓包快照对比', [head, out], [
+    { id: 'snapSave', label: '保存当前', primary: true, onClick: async () => {
+      const r = await ipcRenderer.invoke('cap:snapSave');
+      if (!r || !r.ok) return toast('保存快照失败', 'err');
+      toast(`已保存快照（${r.count} 条）`, 'ok');
+      const l = await ipcRenderer.invoke('cap:snapList');
+      paintHead(l && l.snaps);
+      return undefined;
+    } },
+    { id: 'snapDiff', label: '与上一个对比', onClick: async () => {
+      const d = await ipcRenderer.invoke('cap:snapDiff');
+      out.innerHTML = '';
+      if (!d || !d.ok) { toast('对比失败：' + ((d && d.error) || '未知错误'), 'warn'); return undefined; }
+      const sum = document.createElement('div');
+      sum.className = 'lbl';
+      sum.textContent = `新增 ${d.addedN} · 消失 ${d.removedN} · 变化 ${d.changedN}（${new Date(d.from).toLocaleTimeString()} → ${new Date(d.to).toLocaleTimeString()}）`;
+      out.appendChild(sum);
+      const common = (x) => ({ 键: x.k, 状态: x.status, 大小: humanSize(x.size), 耗时: x.ms == null ? '-' : `${x.ms}ms`, 条数: x.n > 1 ? `${x.n}` : '' });
+      out.appendChild(sectionTitle(`新增（列 ${d.added.length} / 共 ${d.addedN}）`));
+      out.appendChild(dataTable(['键', '状态', '大小', '耗时', '条数'], d.added.map(common)));
+      out.appendChild(sectionTitle(`消失（列 ${d.removed.length} / 共 ${d.removedN}）`));
+      out.appendChild(dataTable(['键', '状态', '大小', '耗时', '条数'], d.removed.map(common)));
+      out.appendChild(sectionTitle(`变化（列 ${d.changed.length} / 共 ${d.changedN}）`));
+      out.appendChild(dataTable(['键', '原 → 新'], d.changed.map((x) => ({
+        键: x.k,
+        '原 → 新': `状态 ${x.from.status}→${x.to.status} · 耗时 ${x.from.ms}→${x.to.ms}ms · 大小 ${x.from.size}→${x.to.size}`,
+      }))));
+      return undefined;
+    } },
+    { label: '关闭', onClick: closeModal },
+  ]);
+}
+$('snapBtn').onclick = openSnaps;
 
 /* ---- 页面内查找 ---- */
 async function doFind(forward) {
@@ -1530,7 +1878,7 @@ ipcRenderer.on('cap:recItems', (_e, batch) => {
     const div = document.createElement('div');
     div.textContent = recItemLine(it);
     if (it.sel) {                                  // 写爬虫主路径：点一下就把该元素的选择器拿走
-      div.title = `点击复制选择器：${it.sel}`;
+      div.title = [it.label || it.sel, it.xpath ? `XPath: ${it.xpath}` : '', `点击复制选择器：${it.sel}`].filter(Boolean).join('\n');
       div.style.cursor = 'pointer';
       div.onclick = () => { clipboard.writeText(it.sel); toast('已复制选择器：' + it.sel, 'ok', 3000); };
     }
@@ -2060,6 +2408,7 @@ let toggleState = true;
   $('headers').value = cfgAll.headers;
   $('proxy').value = cfgAll.proxy;
   $('colSet').value = cfgAll.colSet || 'd';
+  $('sortBy').value = cfgAll.sortBy || 'time';
   refilter();
   $('reqDelay').value = Number.isFinite(Number(cfgAll.reqDelay)) ? Number(cfgAll.reqDelay) : 0;
   $('recShots').checked = !!cfgAll.recShots;

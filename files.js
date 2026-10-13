@@ -73,12 +73,19 @@ async function saveBinaryFile({ defaultName, buffer, file } = {}) {
   return saveWithDialog(defaultName || 'export.bin', data);
 }
 
+// 选一个目录（批量存盘 / 落盘规则共用）
+async function pickDirectory() {
+  const r = await dialog.showOpenDialog(state.win, { properties: ['openDirectory', 'createDirectory'] });
+  if (r.canceled || !r.filePaths || !r.filePaths.length) return { ok: false, canceled: true };
+  return { ok: true, dir: r.filePaths[0] };
+}
+
 async function saveBodies(dir) {
   let target = dir;
   if (!target) {
-    const r = await dialog.showOpenDialog(state.win, { properties: ['openDirectory', 'createDirectory'] });
-    if (r.canceled || !r.filePaths || !r.filePaths.length) return { ok: false, canceled: true };
-    target = r.filePaths[0];
+    const picked = await pickDirectory();
+    if (!picked.ok) return picked;
+    target = picked.dir;
   }
   await fs.mkdir(target, { recursive: true });
   let written = 0;
@@ -99,6 +106,18 @@ async function saveBodies(dir) {
     written++;
   }
   return { ok: true, dir: target, written, skipped };
+}
+
+// 落盘规则命中时写一条响应体：平铺到目标目录，文件名 = 序号_方法_主机+路径，重名加 -1/-2 后缀
+async function saveAutoBody(rec, dir) {
+  let hostPath = rec.url;
+  try { const u = new URL(rec.url); hostPath = u.host + u.pathname; } catch (e) { /* 非标准 URL 用原串 */ }
+  const base = `${String(rec.id).padStart(4, '0')}_${rec.method}_${sanitizeName(hostPath, 80)}`;
+  const file = await uniquePath(dir, base, mimeExt(rec.mime));
+  const data = rec.bodyBase64 ? Buffer.from(rec.body, 'base64') : Buffer.from(String(rec.body), 'utf8');
+  await fs.mkdir(path.dirname(file), { recursive: true });
+  await fs.writeFile(file, data);
+  return path.basename(file);
 }
 
 // 站点前缀：只取主机名，非法字符换成 _，解析失败返回空串
@@ -124,5 +143,6 @@ async function pickJsonFile() {
 
 module.exports = {
   sanitizeName, uniquePath, mimeExt, saveWithDialog, saveTextFile, saveBinaryFile, saveBodies,
+  pickDirectory, saveAutoBody,
   siteHost, exportBaseName, pickJsonFile,
 };

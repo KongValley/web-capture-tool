@@ -178,6 +178,7 @@ function reduceEntry(entry) {
     copy.a = entry.a; copy.sel = entry.sel; copy.text = entry.text;
     copy.value = entry.value; copy.key = entry.key; copy.x = entry.x; copy.y = entry.y;
     copy.tag = entry.tag || ''; copy.type = entry.type || ''; copy.chain = entry.chain || '';
+    copy.xpath = entry.xpath || '';
     copy.label = chainLabel(entry);
   } else if (k === 'req') {
     copy.id = entry.id; copy.method = entry.method; copy.url = entry.url;
@@ -449,11 +450,32 @@ const SELECTOR_SRC = `const esc = (s) => (window.CSS && CSS.escape ? CSS.escape(
     } catch (e) { return ''; }
   };`;
 
+// XPath 生成：有唯一 id 直接 //*[@id="…"]，否则从目标 /tag[n] 逐级到 /html（最多 12 级）。
+// 与 CSS 选择器是两套东西，注入源码分两段拼；esc 来自 SELECTOR_SRC，必须排在它后面。
+const XPATH_SRC = `const xpathOf = (el) => {
+    try {
+      if (!el || el.nodeType !== 1) return '';
+      const id = el.id == null ? '' : String(el.id);
+      if (id && id.indexOf('"') < 0 && document.querySelectorAll('#' + esc(id)).length === 1) return '//*[@id="' + id + '"]';
+      const parts = [];
+      let node = el;
+      for (let d = 0; node && node.nodeType === 1 && d < 12; d++) {
+        const parent = node.parentElement;
+        if (!parent) { parts.unshift(node.tagName.toLowerCase()); break; }
+        const same = Array.prototype.filter.call(parent.children, (c) => c.tagName === node.tagName);
+        parts.unshift(node.tagName.toLowerCase() + '[' + (same.indexOf(node) + 1) + ']');
+        node = parent;
+      }
+      return '/' + parts.join('/');
+    } catch (e) { return ''; }
+  };`;
+
 const RECORD_SCRIPT = `(() => {
   if (window.__wctRecArmed) return;
   window.__wctRecArmed = true;
   const send = (o) => { try { if (window.__wctRecord) window.__wctRecord(JSON.stringify(o)); } catch (e) {} };
   ${SELECTOR_SRC}
+  ${XPATH_SRC}
   const txt = (s, n) => String(s == null ? '' : s).trim().slice(0, n);
   const valOf = (el) => (el && el.type === 'password' ? '[password]' : txt(el && el.value, 200));
   const tagOf = (el) => (el && el.tagName ? el.tagName.toLowerCase() : '');
@@ -478,7 +500,7 @@ const RECORD_SCRIPT = `(() => {
     const t = e.target;
     let href = '';
     try { const a = t && t.closest ? t.closest('a') : null; if (a) href = a.href; } catch (err) {}
-    send({ t: Date.now(), a: 'click', sel: selOf(t), tag: tagOf(t), chain: chainOf(t), text: txt(t && t.textContent, 80), href, x: e.clientX, y: e.clientY, url: location.href });
+    send({ t: Date.now(), a: 'click', sel: selOf(t), xpath: xpathOf(t), tag: tagOf(t), chain: chainOf(t), text: txt(t && t.textContent, 80), href, x: e.clientX, y: e.clientY, url: location.href });
   }, true);
   let lastInputSel = '';
   let lastInputAt = 0;
@@ -488,10 +510,10 @@ const RECORD_SCRIPT = `(() => {
     if (sel === lastInputSel && now - lastInputAt < 300) return;
     lastInputSel = sel;
     lastInputAt = now;
-    send({ t: now, a: 'input', sel, tag: tagOf(e.target), chain: chainOf(e.target), type: (e.target && e.target.type) || '', value: valOf(e.target), url: location.href });
+    send({ t: now, a: 'input', sel, xpath: xpathOf(e.target), tag: tagOf(e.target), chain: chainOf(e.target), type: (e.target && e.target.type) || '', value: valOf(e.target), url: location.href });
   }, true);
   document.addEventListener('change', (e) => {
-    send({ t: Date.now(), a: 'change', sel: selOf(e.target), tag: tagOf(e.target), chain: chainOf(e.target), type: (e.target && e.target.type) || '', value: valOf(e.target), checked: !!(e.target && e.target.checked), url: location.href });
+    send({ t: Date.now(), a: 'change', sel: selOf(e.target), xpath: xpathOf(e.target), tag: tagOf(e.target), chain: chainOf(e.target), type: (e.target && e.target.type) || '', value: valOf(e.target), checked: !!(e.target && e.target.checked), url: location.href });
   }, true);
   document.addEventListener('submit', (e) => {
     const f = e.target;
@@ -499,11 +521,11 @@ const RECORD_SCRIPT = `(() => {
     try {
       fields = Array.prototype.slice.call(f.elements, 0, 20).map((x) => ({ name: x.name || '', value: x.type === 'password' ? '[password]' : txt(x.value, 120) }));
     } catch (err) {}
-    send({ t: Date.now(), a: 'submit', sel: selOf(f), tag: tagOf(f), chain: chainOf(f), action: f.action || '', method: String(f.method || 'get').toUpperCase(), fields, url: location.href });
+    send({ t: Date.now(), a: 'submit', sel: selOf(f), xpath: xpathOf(f), tag: tagOf(f), chain: chainOf(f), action: f.action || '', method: String(f.method || 'get').toUpperCase(), fields, url: location.href });
   }, true);
   document.addEventListener('keydown', (e) => {
     if (e.key.length === 1 && !e.ctrlKey && !e.altKey && !e.metaKey) return;
-    send({ t: Date.now(), a: 'keydown', sel: selOf(document.activeElement), tag: tagOf(document.activeElement), chain: chainOf(document.activeElement), key: e.key, ctrl: e.ctrlKey, alt: e.altKey, shift: e.shiftKey, meta: e.metaKey, url: location.href });
+    send({ t: Date.now(), a: 'keydown', sel: selOf(document.activeElement), xpath: xpathOf(document.activeElement), tag: tagOf(document.activeElement), chain: chainOf(document.activeElement), key: e.key, ctrl: e.ctrlKey, alt: e.altKey, shift: e.shiftKey, meta: e.metaKey, url: location.href });
   }, true);
   let lastScrollAt = 0;
   document.addEventListener('scroll', () => {
@@ -781,7 +803,7 @@ function readRecording(file) {
     try { e = JSON.parse(line); } catch (err) { continue; }
     if (e && e.k === 'action') {
       actions.push({
-        n: e.n, t: e.t, a: e.a, sel: e.sel, tag: e.tag, chain: e.chain, type: e.type,
+        n: e.n, t: e.t, a: e.a, sel: e.sel, xpath: e.xpath || '', tag: e.tag, chain: e.chain, type: e.type,
         text: e.text, value: e.value, key: e.key, checked: e.checked, x: e.x, y: e.y, url: e.url,
       });
     } else if (e && e.k === 'nav') {
@@ -962,7 +984,7 @@ module.exports = {
   MAX_WS_WRITE, MAX_SHOTS, FLUSH_MS, FLUSH_BYTES, MD_MAX_LINES,
   dirPath, useDir, isRecording, lastFile, lastInfo: () => Object.assign({}, lastInfo), status, start, stop, stopWhenIdle, flushSync,
   chainLabel,
-  arm, disarm, RECORD_SCRIPT, SELECTOR_SRC,
+  arm, disarm, RECORD_SCRIPT, SELECTOR_SRC, XPATH_SRC,
   onBinding, onRequest, onResponse, onBody, onFail, onWs, onNav, onPage, onNote: note,
   listRecordings, readRecording, buildScript, replayRecording, stopReplay, deleteRecording, purgeRecordings,
 };

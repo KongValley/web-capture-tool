@@ -8,6 +8,31 @@ const settings = require('./settings');
 const format = require('./format');
 const recorder = require('./recorder');
 const picker = require('./picker');
+const files = require('./files');
+const logger = require('./logger');
+
+/* ------------------------------------------------------------ 规则落盘 */
+
+// 单次运行最多落盘这么多文件 / 字节（切换规则即重置）
+const MAX_AUTO_SAVE_FILES = 2000;
+const MAX_AUTO_SAVE_BYTES = 512 * 1024 * 1024;
+const autoSave = { n: 0, bytes: 0, blocked: '' };
+
+function resetAutoSave() { autoSave.n = 0; autoSave.bytes = 0; autoSave.blocked = ''; return { ok: true }; }
+function autoSaveState() { return { n: autoSave.n, bytes: autoSave.bytes, blocked: autoSave.blocked }; }
+
+// 规则匹配：URL 正则 × 类型 × MIME 关键字
+function matchSaveRule(rec, rule) {
+  if (!rule || !rule.on || !rule.dir) return false;
+  if (rule.urlRe) {
+    try { if (!new RegExp(rule.urlRe).test(rec.url)) return false; } catch (e) { return false; }
+  }
+  if (rule.types === 'xhr' && !['XHR', 'Fetch'].includes(rec.type)) return false;
+  if (rule.types === 'doc' && rec.type !== 'Document') return false;
+  const mimes = String(rule.mimes || '').split(/[,，\s]+/).filter(Boolean);
+  if (mimes.length && !mimes.some((m) => String(rec.mime || '').toLowerCase().includes(m.toLowerCase()))) return false;
+  return true;
+}
 
 function summarize(r) {
   return {
@@ -158,6 +183,25 @@ async function onLoadingFinished(tab, ev) {
       tab.storedBytes += r.body.length;
     } catch (e) {
       rec.bodyError = e.message;
+    }
+  }
+  const rule = settings.values.saveRule;
+  if (rec.body != null && matchSaveRule(rec, rule)) {
+    if (autoSave.n >= MAX_AUTO_SAVE_FILES || autoSave.bytes >= MAX_AUTO_SAVE_BYTES) {
+      if (!autoSave.blocked) {
+        autoSave.blocked = `已达落盘上限（${MAX_AUTO_SAVE_FILES} 个 / ${MAX_AUTO_SAVE_BYTES / 1048576}MB）`;
+        rec.note = autoSave.blocked;
+      }
+    } else {
+      files.saveAutoBody(rec, rule.dir)
+        .then((name) => {
+          autoSave.n++;
+          autoSave.bytes += rec.bodyBase64 ? Math.round(rec.body.length * 3 / 4) : Buffer.byteLength(rec.body);
+          rec.note = `已落盘：${name}`;
+          send('cap:saveRule', autoSaveState());
+        })
+        .catch((e) => { logger.log('save', `落盘失败：${e.message}`); })
+        .finally(() => queueBatch(tab, 'update', summarize(rec)));
     }
   }
   queueBatch(tab, 'update', summarize(rec));
@@ -315,4 +359,4 @@ function markNote(url, note) {
   return true;
 }
 
-module.exports = { summarize, fullRecord, attachCapture, replay, flushBatch, markNote };
+module.exports = { summarize, fullRecord, attachCapture, replay, flushBatch, markNote, resetAutoSave, autoSaveState, matchSaveRule };

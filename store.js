@@ -19,6 +19,9 @@ const DEFAULTS = {
     throttle: 'off', ua: '', headers: '', proxy: '',
     colSet: 'd', reqDelay: 0, ignoreCertErrors: false, authUser: '', authPass: '',
     recShots: false,
+    sortBy: 'time',                                   // 列表排序 / 分组：time | domain | size | duration | status
+    tasks: [],                                        // 提取任务预设（最多 20 条，见 settings.applyInner）
+    saveRule: { on: false, urlRe: '', mimes: '', types: 'all', dir: '' },   // 响应体落盘规则
   },
   app: { softwareRendering: false, panelWidth: 520, window: { width: 1440, height: 900, x: null, y: null } },
 };
@@ -66,6 +69,9 @@ function normalize(raw) {
     if (!['none', 'assets', 'keywords'].includes(out.settings.blockMode)) out.settings.blockMode = 'none';
     if (!['off', '3g', 'slow'].includes(out.settings.throttle)) out.settings.throttle = 'off';
     if (!['d', 'dt', 't'].includes(out.settings.colSet)) out.settings.colSet = 'd';
+    if (!['time', 'domain', 'size', 'duration', 'status'].includes(out.settings.sortBy)) out.settings.sortBy = 'time';
+    if (!Array.isArray(out.settings.tasks)) out.settings.tasks = [];
+    if (!out.settings.saveRule || typeof out.settings.saveRule !== 'object') out.settings.saveRule = defaults().settings.saveRule;
   }
 
   const a = raw.app;

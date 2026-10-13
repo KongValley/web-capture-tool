@@ -1892,6 +1892,195 @@ async function run({ state, store, gpu, extract, settings, automation, format, f
         p147.ok && p147.status === 200 && typeof p147.proxy === 'string' && p147b.ok && String(p147b.proxy).includes('127.0.0.1:1'),
         `直连=${p147.status}（${p147.tookMs}ms，解析 ${p147.proxy}） 死代理解析=${p147b.proxy}`);
     } catch (e) { check('代理连通性测试', false, e.message); }
+
+    /* ======================================== 148-156 第四轮：翻页提取 / 规则落盘 / XPath / 排序 / 快照 */
+
+    // 148 任务预设增删与持久化（空名丢弃 → 落盘 → 清空）
+    try {
+      const r148 = await pinvoke('cap:cfg', {
+        key: 'tasks',
+        value: [
+          { name: 't1', url: base + '/', rows: '.item', fields: '标题=.t', pages: 2, delay: 500 },
+          { name: '', rows: 'x' },
+        ],
+      });
+      const cfg148 = await pinvoke('cap:cfgAll');
+      const t148 = (cfg148.tasks || [])[0];
+      store.flush();
+      const disk148 = JSON.parse(fs.readFileSync(store.filePath(), 'utf8'));
+      const diskTask = disk148.settings.tasks && disk148.settings.tasks[0];
+      check('任务预设增删与持久化',
+        r148.ok && (cfg148.tasks || []).length === 1 && !!t148 && t148.rows === '.item' && t148.pages === 2
+          && !!diskTask && diskTask.fields === '标题=.t',
+        `内存=${(cfg148.tasks || []).length} 条 rows=${t148 && t148.rows} pages=${t148 && t148.pages} 落盘字段=${diskTask && diskTask.fields}`);
+      await pinvoke('cap:cfg', { key: 'tasks', value: [] });
+    } catch (e) { check('任务预设增删与持久化', false, e.message); }
+
+    // 149 翻页 + 提取合并（每页提取，翻到底合并，行带 _page）
+    try {
+      const r149 = await pinvoke('cap:taskRun', { url: base + '/', rows: '.item', fields: '标题=.t', pages: 3, delay: 600 });
+      const endUrl149 = state.view.webContents.getURL();
+      const titles149 = r149.ok ? r149.rows.map((r) => r.标题).join('') : '';
+      check('翻页 + 提取合并',
+        r149.ok && r149.rows.length === 9 && r149.pages === 3 && r149.reason === 'done'
+          && r149.rows[0]._page === 1 && r149.rows[8]._page === 3
+          && (titles149.match(/ABC/g) || []).length === 3 && /\/page\/3$/.test(endUrl149),
+        r149.ok
+          ? `合并=${r149.rows.length} 行 页=${r149.pages} reason=${r149.reason} 标题=${titles149} 末页=${endUrl149.replace(base, '')} 重复=${r149.dup}`
+          : r149.error);
+    } catch (e) { check('翻页 + 提取合并', false, e.message); }
+
+    // 150 规则落盘（命中写文件、CSS 不落、计数与 note）
+    try {
+      const dir150 = path.join(outDir, 'auto');
+      const set150 = await pinvoke('cap:saveRuleSet', { on: true, urlRe: '/api/data', mimes: 'json', types: 'all', dir: dir150 });
+      await reloadAndWait(state.view.webContents);
+      let files150 = [];
+      try {
+        await waitFor(() => {
+          files150 = fs.readdirSync(dir150);
+          return files150.length > 0;
+        }, 8000, '落盘文件');
+      } catch (e) { /* 下面按实际情况判定 */ }
+      const json150 = files150.find((n) => n.endsWith('.json'));
+      const body150 = json150 ? fs.readFileSync(path.join(dir150, json150), 'utf8') : '';
+      const got150 = await pinvoke('cap:saveRuleGet');
+      const list150 = (await pinvoke('cap:list')).records;
+      const rec150 = list150.find((r) => String(r.url).endsWith('/api/data') && String(r.note || '').includes('已落盘'));
+      const noCss150 = !files150.some((n) => n.endsWith('.css'));
+      check('规则落盘（命中 / 未命中 / 计数）',
+        set150.ok && files150.length >= 1 && !!json150 && body150.includes('"ok":true') && noCss150
+          && got150.ok && got150.n >= 1 && got150.rule.on === true && !!rec150,
+        `文件=${files150.join(',')} 计数=${got150.n} 大小=${got150.bytes}B 无 css=${noCss150} note=${rec150 ? rec150.note : '无'}`);
+      await pinvoke('cap:saveRuleSet', { on: false, urlRe: '', mimes: '', types: 'all', dir: '' });
+    } catch (e) { check('规则落盘（命中 / 未命中 / 计数）', false, e.message); }
+
+    // 151 录制动作带 XPath（jsonl 与 cap:recRead 投影）
+    try {
+      await state.view.webContents.loadURL(base + '/');
+      await sleep(900);
+      const st151 = await pinvoke('cap:recStart', { shots: false });
+      await sleep(300);
+      await extract.evalPage(`(() => { document.querySelector('a[href="/b"]').dispatchEvent(new MouseEvent('click', { bubbles: true })); return true; })()`);
+      await sleep(800);
+      const st151b = await pinvoke('cap:recStop');
+      const click151 = st151b.ok ? readRec(st151b.file).find((l) => l.k === 'action' && l.a === 'click') : null;
+      const rd151 = st151b.ok ? await pinvoke('cap:recRead', { file: st151b.file }) : { actions: [] };
+      const a151 = (rd151.actions || []).find((x) => x.a === 'click');
+      const xp151 = click151 ? click151.xpath : '';
+      check('录制动作带 XPath',
+        st151.ok && !!xp151 && (/^\/html\//.test(xp151) || /^\/\/\*\[@id=/.test(xp151)) && !!a151 && a151.xpath === xp151,
+        `xpath=${xp151} 投影=${a151 && a151.xpath}`);
+    } catch (e) { check('录制动作带 XPath', false, e.message); }
+
+    // 152 提取支持 XPath（行选择器 + 行内相对字段）
+    try {
+      await state.view.webContents.loadURL(base + '/');
+      await sleep(800);
+      const ex152 = await extract.extractRows('xpath://div[@class="item"]', '标题=.t\n文本=xpath://span[1]');
+      check('提取支持 XPath',
+        ex152.ok && ex152.count === 3 && ex152.rows[0].标题 === 'A' && ex152.rows[0].文本 === 'A',
+        ex152.ok ? `${ex152.count} 行 首行=${JSON.stringify(ex152.rows[0])}` : ex152.error);
+    } catch (e) { check('提取支持 XPath', false, e.message); }
+
+    // 153 Storage 批量导入（会话数据模态 → 导入 Storage）
+    try {
+      await peval(`document.getElementById('pageData').click()`);
+      await waitFor(async () => await peval(`(() => { const b = [...document.querySelectorAll('#modalBody button')].find((x) => x.textContent === '导入 Storage'); return !!b; })()`), 8000, '会话数据模态').catch(() => {});
+      const clicked153 = await peval(`(() => {
+        const b = [...document.querySelectorAll('#modalBody button')].find((x) => x.textContent === '导入 Storage');
+        if (!b) return false;
+        b.click();
+        return true;
+      })()`);
+      await sleep(400);
+      const set153 = await peval(`(() => {
+        const ta = document.querySelector('#modalBody textarea');
+        if (!ta) return false;
+        ta.value = '{"imp_k":"imp_v"}';
+        const b = [...document.querySelectorAll('#modalFoot button')].find((x) => x.textContent === '导入');
+        if (!b) return false;
+        b.click();
+        return true;
+      })()`);
+      await waitFor(async () => {
+        const pd153 = await extract.collectPageData();
+        return pd153.page.localStorage && pd153.page.localStorage.imp_k === 'imp_v';
+      }, 8000, 'localStorage 导入').catch(() => {});
+      const ls153 = (await extract.collectPageData()).page.localStorage || {};
+      check('Storage 批量导入', clicked153 === true && set153 === true && ls153.imp_k === 'imp_v', `imp_k=${ls153.imp_k}`);
+      await peval(`document.getElementById('modalClose').click()`);
+      await pinvoke('cap:storageRemove', { area: 'local', key: 'imp_k' });
+    } catch (e) { check('Storage 批量导入', false, e.message); }
+
+    // 154 列表排序（大小↓，内存顺序不受影响）
+    try {
+      const s154 = await peval(`(() => {
+        const oldest = [...rows.keys()][0];
+        const sel = document.getElementById('sortBy');
+        sel.value = 'size';
+        sel.dispatchEvent(new Event('change', { bubbles: true }));
+        const maxSize = Math.max(...[...rows.values()].map((r) => r.rec.size || 0));
+        const top = document.querySelector('#list .row');
+        const topSize = top ? ((rows.get(Number(top.dataset.id)) || {}).rec || {}).size || 0 : -1;
+        const stillOldest = [...rows.keys()][0] === oldest;
+        sel.value = 'time';
+        sel.dispatchEvent(new Event('change', { bubbles: true }));
+        return { topSize, maxSize, stillOldest, groups: document.querySelectorAll('#list .grp').length };
+      })()`);
+      check('列表排序（大小↓）',
+        s154.topSize === s154.maxSize && s154.maxSize > 0 && s154.stillOldest && s154.groups === 0,
+        `首行=${s154.topSize}B 最大=${s154.maxSize}B 内存顺序未变=${s154.stillOldest} 复位后分组=${s154.groups}`);
+    } catch (e) { check('列表排序（大小↓）', false, e.message); }
+
+    // 155 域名分组（新增一条异主机记录 → 分组数 = 可见主机数）
+    try {
+      const g155 = await peval(`(() => {
+        appendRecord({ id: 991554, method: 'GET', url: 'http://other.example/x', type: 'XHR', status: 200, size: 3, duration: 1, time: new Date().toISOString() });
+        const sel = document.getElementById('sortBy');
+        sel.value = 'domain';
+        sel.dispatchEvent(new Event('change', { bubbles: true }));
+        const hosts = new Set();
+        for (const r of rows.values()) {
+          if (!r.node || !r.visible) continue;
+          try { hosts.add(new URL(r.rec.url).host); } catch (e) { hosts.add('(无法解析)'); }
+        }
+        const grps = [...document.querySelectorAll('#list .grp')].map((g) => g.textContent);
+        const ok = grps.length === hosts.size && [...hosts].every((h) => grps.some((t) => t.includes(h)));
+        sel.value = 'time';
+        sel.dispatchEvent(new Event('change', { bubbles: true }));
+        const after = document.querySelectorAll('#list .grp').length;
+        dropRow(991554);
+        return { n: grps.length, hosts: hosts.size, ok, after, sample: grps.slice(0, 2).join(' | ') };
+      })()`);
+      check('域名分组',
+        g155.ok && g155.n >= 1 && g155.hosts >= 2 && g155.after === 0,
+        `分组=${g155.n} 主机=${g155.hosts} 标题匹配=${g155.ok} 复位后=${g155.after} 例=${g155.sample}`);
+    } catch (e) { check('域名分组', false, e.message); }
+
+    // 156 抓包快照保存与对比（先清空列表再制造一次真正的新请求：快照按 `METHOD url` 归组，历史同名键会抵消差异）
+    try {
+      await peval(`(() => { document.getElementById('clear').click(); return true; })()`);
+      await sleep(500);
+      await state.view.webContents.loadURL(base + '/');
+      await sleep(900);
+      const s156a = await pinvoke('cap:snapSave');
+      await state.view.webContents.loadURL(base + '/page/2?fresh=1');
+      await sleep(900);
+      const s156b = await pinvoke('cap:snapSave');
+      const list156 = await pinvoke('cap:snapList');
+      const d156 = await pinvoke('cap:snapDiff');
+      await peval(`(() => { document.getElementById('snapBtn').click(); return true; })()`);
+      await waitFor(async () => await peval(`!!document.getElementById('snapDiff')`), 8000, '快照模态').catch(() => {});
+      const clicked156 = await peval(`(() => { const b = document.getElementById('snapDiff'); if (!b) return false; b.click(); return true; })()`);
+      await waitFor(async () => (await peval(`document.querySelectorAll('#modalBody table').length`)) >= 3, 8000, '差异表').catch(() => {});
+      const tables156 = await peval(`document.querySelectorAll('#modalBody table').length`);
+      check('快照保存与对比',
+        s156a.ok && s156b.ok && list156.snaps.length === 2 && d156.ok && d156.addedN >= 1
+          && Array.isArray(d156.removed) && Array.isArray(d156.changed) && clicked156 === true && tables156 >= 3,
+        `快照=${list156.snaps.length} 条数=${list156.snaps.map((s) => s.count).join('/')} 新增=${d156.addedN} 消失=${d156.removedN} 变化=${d156.changedN} 表格=${tables156}`);
+      await peval(`document.getElementById('modalClose').click()`);
+    } catch (e) { check('快照保存与对比', false, e.message); }
   } catch (e) {
     check('自检执行', false, `${e.message} | status=${state.status} attached=${wc.debugger.isAttached()}`);
   }

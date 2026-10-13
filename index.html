@@ -291,6 +291,7 @@
     <span class="lbl">代理</span>
     <input id="proxy" type="text" placeholder="socks5://127.0.0.1:1080" style="width:170px">
     <button id="proxyTest" class="ghost" title="用当前代理设置访问当前站点，验证连通性与出口">测代理</button>
+    <button id="saveRule" class="ghost" title="按规则把命中的响应体直接写进目录">落盘</button>
     <span class="sep"></span>
     <span class="lbl">间隔</span>
     <input id="reqDelay" class="num" type="number" min="0" max="10000" step="100" value="0" title="请求最小间隔 ms（礼貌抓取）">
@@ -321,6 +322,7 @@
     <button id="statsBtn" title="按域名/类型/状态统计当前标签的抓包">统计概览</button>
     <button id="expPostman" title="把当前记录导出为 Postman Collection">导出 Postman</button>
     <button id="copyMd" title="把当前筛选结果复制为 Markdown 表格">复制表格</button>
+    <button id="snapBtn" title="保存抓包快照并对比两次差异">快照</button>
     <span class="sep"></span>
     <button id="recToggle" title="记录点击/输入/提交/滚动/按键 + 请求 + 跳转，落盘为 JSONL">● 开始录制</button>
     <label class="lbl" title="每次点击额外存一张视口截图（默认关，单次录制上限 300 张）"><input id="recShots" type="checkbox"> 点击截图</label>
@@ -359,6 +361,13 @@
           <option value="d">方法·状态·URL·耗时</option>
           <option value="dt">附加类型·大小</option>
           <option value="t">时间戳</option>
+        </select>
+        <select id="sortBy" title="列表排序 / 分组">
+          <option value="time">时间</option>
+          <option value="domain">域名分组</option>
+          <option value="size">大小↓</option>
+          <option value="duration">耗时↓</option>
+          <option value="status">状态</option>
         </select>
       </div>
       <div id="listNote" class="lbl" hidden></div>

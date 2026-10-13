@@ -28,6 +28,7 @@ const state = {
   softwareMode: false,         // 是否运行在软件渲染（无显卡/强制）模式
   gpuCrashes: 0,               // GPU 进程异常退出次数
   auto: { running: false, stop: false },
+  snaps: [],                   // 抓包快照（本次运行内存，最多 2 个；不落盘，不与会话恢复抢语义）
   selftest: process.argv.includes('--selftest'),
 };
 

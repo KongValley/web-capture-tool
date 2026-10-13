@@ -176,6 +176,42 @@ function buildStats(records) {
   };
 }
 
+/* ------------------------------------------------- 抓包快照对比 */
+
+// 两次抓包快照对比：按 `METHOD url` 归组（同键多条取第一条代表 + 记条数）。
+// 耗时差超过 max(20ms, 20%) 才算「变化」，避免噪声；每个分组最多列 100 条。
+function diffSnapshots(a, b) {
+  const group = (items) => {
+    const m = new Map();
+    for (const it of items || []) {
+      const k = it.k;
+      const g = m.get(k) || { k, n: 0, first: it };
+      g.n++;
+      m.set(k, g);
+    }
+    return m;
+  };
+  const A = group(a && a.items);
+  const B = group(b && b.items);
+  const added = [];
+  const removed = [];
+  const changed = [];
+  for (const [k, gb] of B) {
+    const ga = A.get(k);
+    if (!ga) { added.push({ k, status: gb.first.status, size: gb.first.size, ms: gb.first.duration, n: gb.n }); continue; }
+    const dur = (x, y) => (x == null || y == null ? x !== y : Math.abs(y - x) > Math.max(20, x * 0.2));
+    if (ga.first.status !== gb.first.status || dur(ga.first.duration, gb.first.duration) || ga.first.size !== gb.first.size) {
+      changed.push({ k, from: { status: ga.first.status, ms: ga.first.duration, size: ga.first.size }, to: { status: gb.first.status, ms: gb.first.duration, size: gb.first.size } });
+    }
+  }
+  for (const [k, ga] of A) if (!B.has(k)) removed.push({ k, status: ga.first.status, size: ga.first.size, ms: ga.first.duration, n: ga.n });
+  const cap = (arr) => arr.slice(0, 100);
+  return {
+    added: cap(added), removed: cap(removed), changed: cap(changed),
+    addedN: added.length, removedN: removed.length, changedN: changed.length,
+  };
+}
+
 /* ------------------------------------------------- 抓包转代码 / 表格导出 */
 
 const SNIPPET_SKIP = new Set(['content-length', 'host']);   // 由各语言的 HTTP 客户端自己算
@@ -273,6 +309,6 @@ function buildMarkdownTable(records) {
 
 module.exports = {
   mergedHeaders, requestHeaderList, responseHeaderList, headerValue, parseHeaderLines,
-  buildCurl, csvEscape, rowsToCsv, tablesToCsv, buildHar, buildStats,
+  buildCurl, csvEscape, rowsToCsv, tablesToCsv, buildHar, buildStats, diffSnapshots,
   buildPythonRequests, buildNodeFetch, buildNodeAxios, buildPostmanCollection, buildMarkdownTable,
 };

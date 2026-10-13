@@ -624,6 +624,16 @@ function registerIpc() {
   });
   ipcMain.handle('cap:auto', (_e, opts) => automation.autoRun(opts));
   ipcMain.handle('cap:autoStop', () => automation.autoStop());
+  // 翻页 + 提取联动：给了 url 先导航（任务预设里的 URL 靠它），随后每页提取并合并
+  ipcMain.handle('cap:taskRun', async (_e, opts) => {
+    const o = opts || {};
+    if (o.url) {
+      const url = normalizeUrl(o.url);
+      if (!url) return { ok: false, error: '任务里的 URL 无效' };
+      try { await state.view.webContents.loadURL(url); } catch (e) { return { ok: false, error: e.message }; }
+    }
+    return automation.runTask(o);
+  });
   ipcMain.handle('cap:extract', (_e, payload) => {
     const { rows, fields } = payload || {};
     return extract.extractRows(rows, fields);
@@ -662,6 +672,32 @@ function registerIpc() {
   });
   ipcMain.handle('cap:saveText', (_e, payload) => files.saveTextFile(payload));
   ipcMain.handle('cap:saveBodies', (_e, dir) => files.saveBodies(dir));
+  // 规则落盘：设置变更后重置本次运行的计数与上限提示
+  ipcMain.handle('cap:saveRuleSet', async (_e, rule) => {
+    const r = await settings.applySetting('saveRule', rule);
+    if (!r.ok) return r;
+    capture.resetAutoSave();
+    return Object.assign({ ok: true }, capture.autoSaveState());
+  });
+  ipcMain.handle('cap:saveRuleGet', () => Object.assign({ ok: true, rule: settings.values.saveRule }, capture.autoSaveState()));
+  ipcMain.handle('cap:pickDir', () => files.pickDirectory());
+  // 抓包快照：只存本次运行内存（≤2 个），对比键为 `METHOD url`
+  ipcMain.handle('cap:snapSave', () => {
+    const d = new Date().toISOString();
+    const snap = {
+      at: d, url: currentPageUrl(),
+      items: state.records.map((r) => ({ k: `${r.method} ${r.url}`, status: r.status, duration: r.duration, size: r.encodedDataLength, type: r.type })),
+    };
+    state.snaps.push(snap);
+    while (state.snaps.length > 2) state.snaps.shift();
+    return { ok: true, at: d, count: snap.items.length, saved: state.snaps.length };
+  });
+  ipcMain.handle('cap:snapList', () => ({ ok: true, snaps: state.snaps.map((s) => ({ at: s.at, url: s.url, count: s.items.length })) }));
+  ipcMain.handle('cap:snapDiff', () => {
+    if (state.snaps.length < 2) return { ok: false, error: '至少需要两个快照（当前 ' + state.snaps.length + ' 个）' };
+    const [a, b] = state.snaps.slice(-2);
+    return Object.assign({ ok: true, from: a.at, to: b.at }, format.diffSnapshots(a, b));
+  });
   ipcMain.handle('cap:saveBody', async (_e, id, kind, file) => {
     try {
       const rec = state.records.find((x) => x.id === id);

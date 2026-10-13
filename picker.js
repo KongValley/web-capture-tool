@@ -14,6 +14,7 @@ const PICK_SCRIPT = `(() => {
   if (window.__wctPickArmed) return;
   window.__wctPickArmed = true;
   ${recorder.SELECTOR_SRC}
+  ${recorder.XPATH_SRC}
   let last = null;
   const hl = document.createElement('div');
   hl.style.cssText = 'position:fixed;z-index:2147483647;pointer-events:none;border:2px solid #4c8dff;background:#4c8dff22;display:none';
@@ -40,7 +41,7 @@ const PICK_SCRIPT = `(() => {
   function click(e) {
     e.preventDefault(); e.stopPropagation();
     const el = last || e.target;
-    post({ sel: selOf(el), tag: ((el && el.tagName) || '').toLowerCase(), text: String((el && el.textContent) || '').trim().slice(0, 80) });
+    post({ sel: selOf(el), xpath: xpathOf(el), tag: ((el && el.tagName) || '').toLowerCase(), text: String((el && el.textContent) || '').trim().slice(0, 80) });
     cleanup();
   }
   function onKey(e) {

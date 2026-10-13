@@ -21,6 +21,9 @@ const values = {
   authUser: '',           // Basic 认证用户名（空 = 不自动应答）
   authPass: '',           // Basic 认证密码（明文存盘，仅本地使用）
   recShots: false,        // 录制时是否给每次点击存一张视口截图
+  sortBy: 'time',         // 列表排序：time | domain | size | duration | status
+  tasks: [],              // 提取任务预设（最多 20 条），见 applyInner('tasks')
+  saveRule: { on: false, urlRe: '', mimes: '', types: 'all', dir: '' },   // 响应体落盘规则
 };
 
 const MAX_REQ_DELAY = 10000;
@@ -147,6 +150,44 @@ async function applyInner(key, value, target) {
     case 'recShots':
       values.recShots = !!value;
       return { ok: true };
+
+    case 'sortBy':
+      if (!['time', 'domain', 'size', 'duration', 'status'].includes(value)) return { ok: false, error: '未知排序方式' };
+      values.sortBy = value;
+      return { ok: true };
+
+    case 'tasks': {
+      const list = Array.isArray(value) ? value : [];
+      const clean = [];
+      for (const t of list.slice(0, 20)) {
+        if (!t || typeof t !== 'object') continue;
+        const name = String(t.name == null ? '' : t.name).trim().slice(0, 40);
+        if (!name) continue;
+        clean.push({
+          name, url: String(t.url == null ? '' : t.url).slice(0, 500),
+          rows: String(t.rows == null ? '' : t.rows).slice(0, 200),
+          fields: String(t.fields == null ? '' : t.fields).slice(0, 2000),
+          pages: clampInt(t.pages, 1, 100, 3), delay: clampInt(t.delay, 200, 60000, 2000),
+        });
+      }
+      values.tasks = clean;
+      return { ok: true };
+    }
+
+    case 'saveRule': {
+      const r = (value && typeof value === 'object') ? value : {};
+      const urlRe = String(r.urlRe == null ? '' : r.urlRe).slice(0, 300);
+      if (urlRe) {
+        try { new RegExp(urlRe); } catch (e) { return { ok: false, error: 'URL 正则无法解析：' + e.message }; }
+      }
+      const types = ['all', 'xhr', 'doc'].includes(r.types) ? r.types : 'all';
+      values.saveRule = {
+        on: !!r.on, urlRe,
+        mimes: String(r.mimes == null ? '' : r.mimes).slice(0, 200),
+        types, dir: String(r.dir == null ? '' : r.dir).slice(0, 500),
+      };
+      return { ok: true };
+    }
 
     case 'throttle': {
       if (!Object.prototype.hasOwnProperty.call(THROTTLE, value)) return { ok: false, error: '未知限速档位' };

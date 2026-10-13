@@ -56,21 +56,69 @@ async function runScroll(rounds, t0) {
   return { rounds: done, reason };
 }
 
-async function runPages(pages, delay) {
+// 点「下一页」并等新页加载；返回是否翻成功（runPages 与 runTask 共用一份实现）
+async function flipNext(delay) {
   const wc = state.view.webContents;
+  const loaded = new Promise((res) => wc.once('did-finish-load', () => res(true)));   // 先挂监听再点击，避免竞态
+  const hit = await extract.evalPage(NEXT_EXPR);
+  if (!hit) return false;
+  await Promise.race([loaded, sleep(Math.max(delay, 1000)).then(() => false)]);
+  await sleep(200);
+  return true;
+}
+
+async function runPages(pages, delay) {
   let done = 1;
   let reason = 'done';
   for (let i = 1; i < pages; i++) {
     if (state.auto.stop) { reason = 'stopped'; break; }
-    const loaded = new Promise((res) => wc.once('did-finish-load', () => res(true)));   // 先挂监听再点击，避免竞态
-    const hit = await extract.evalPage(NEXT_EXPR);
-    if (!hit) { reason = 'no-next'; break; }
-    await Promise.race([loaded, sleep(Math.max(delay, 1000)).then(() => false)]);
-    await sleep(200);
+    if (!(await flipNext(delay))) { reason = 'no-next'; break; }
     done = i + 1;
     setStatus(`自动翻页 ${done}/${pages}…`);
   }
   return { pages: done, reason };
+}
+
+// 每页跑一遍提取，翻页后继续，最后按行合并（行带 _page 标记，重复行只统计不删除）
+async function runTask(opts) {
+  const o = opts || {};
+  const rows = String(o.rows == null ? '' : o.rows).trim();
+  const fields = String(o.fields == null ? '' : o.fields).trim();
+  if (!rows) return { ok: false, error: '请填写行选择器' };
+  if (!fields) return { ok: false, error: '请填写字段' };
+  const pages = clampInt(o.pages, 1, 100, 3);
+  const delay = clampInt(o.delay, 200, 60000, 2000);
+  if (state.auto.running) return { ok: false, error: '已有自动化任务在运行' };
+  state.auto.running = true;
+  state.auto.stop = false;
+  const out = [];
+  const perPage = [];
+  let reason = 'done';
+  try {
+    for (let i = 1; i <= pages; i++) {
+      if (state.auto.stop) { reason = 'stopped'; break; }
+      const r = await extract.extractRows(rows, fields);
+      if (!r.ok) { reason = 'extract-failed'; perPage.push({ page: i, error: r.error }); break; }
+      perPage.push({ page: i, count: r.count, url: state.view.webContents.getURL() });
+      for (const row of r.rows) out.push(Object.assign({ _page: i }, row));
+      setStatus(`提取合并 ${i}/${pages}（已 ${out.length} 行）…`);
+      if (i === pages) break;
+      if (!(await flipNext(delay))) { reason = 'no-next'; break; }
+    }
+    const seen = new Set();
+    let dup = 0;
+    for (const row of out) {
+      const k = JSON.stringify(row);
+      if (seen.has(k)) dup++;
+      else seen.add(k);
+    }
+    return { ok: true, rows: out, perPage, pages: perPage.length, dup, reason };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  } finally {
+    state.auto.running = false;
+    state.auto.stop = false;
+  }
 }
 
 async function autoRun(opts) {
@@ -100,4 +148,4 @@ function autoStop() {
   return { ok: true };
 }
 
-module.exports = { autoRun, autoStop };
+module.exports = { autoRun, autoStop, runTask };
