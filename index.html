@@ -12,6 +12,7 @@
     --ok: #3fb950; --warn: #d29922; --err: #f85149;
     --radius-sm: 4px; --radius: 6px; --radius-lg: 10px; --ctl-h: 28px;
     --shadow: 0 10px 30px #0007;
+    --scroll: #ffffff1f; --scroll-hover: #ffffff42; --scroll-active: #4c8dffa0;
   }
   * { box-sizing: border-box; }
   html { color-scheme: dark; }
@@ -23,14 +24,21 @@
   [hidden] { display: none !important; }
   ::selection { background: var(--accent-dim); }
 
-  /* 滚动条 */
+  /* 滚动条：细身半透明胶囊，悬停变亮、拖动用主题色 */
   ::-webkit-scrollbar { width: 10px; height: 10px; }
   ::-webkit-scrollbar-track { background: transparent; }
   ::-webkit-scrollbar-thumb {
-    background: var(--line-2); border-radius: 6px;
-    border: 2px solid transparent; background-clip: content-box;
+    background-color: var(--scroll);
+    border: 2px solid transparent;
+    border-radius: 999px;
+    background-clip: content-box;
+    transition: background-color .15s;
   }
-  ::-webkit-scrollbar-thumb:hover { background: var(--muted); background-clip: content-box; }
+  ::-webkit-scrollbar-thumb:hover { background-color: var(--scroll-hover); }
+  ::-webkit-scrollbar-thumb:active { background-color: var(--scroll-active); }
+  ::-webkit-scrollbar-corner { background: transparent; }
+  /* 工具栏的横向滚动条更扁，避免吃掉 40px 行高 */
+  #toolbar2::-webkit-scrollbar, #toolbar3::-webkit-scrollbar { height: 8px; }
 
   /* 控件统一 */
   button, input, select, textarea {
@@ -94,7 +102,7 @@
   #tabs { display: flex; gap: 2px; padding: 0 6px; border-bottom: 1px solid var(--line); }
   .tab { border-radius: var(--radius-sm) var(--radius-sm) 0 0; border-bottom: none; }
   .tab.on { background: var(--bg); border-color: var(--accent); }
-  #list { flex: 1; overflow: auto; }
+  #list { flex: 1; overflow: auto; scrollbar-gutter: stable; }
   .row {
     display: flex; align-items: center; gap: 6px; height: 26px; padding: 0 8px;
     border-bottom: 1px solid var(--line); cursor: pointer; white-space: nowrap;
@@ -118,7 +126,7 @@
   .s2 { color: var(--ok); } .s3 { color: var(--warn); } .s4, .s5 { color: var(--err); }
   .muted { color: var(--muted); }
 
-  #detail { flex: 1.15; overflow: auto; border-top: 1px solid var(--line); padding: 10px; display: none; }
+  #detail { flex: 1.15; overflow: auto; scrollbar-gutter: stable; border-top: 1px solid var(--line); padding: 10px; display: none; }
   #detail.on { display: block; }
   #detail h3 {
     margin: 12px 0 4px; font-size: 12px; color: var(--accent);
@@ -132,7 +140,7 @@
   #detail .kv { color: var(--muted); }
   .dbar { display: flex; gap: 6px; margin-bottom: 8px; }
 
-  #ws { flex: 1; overflow: auto; padding: 8px; display: none; font: 12px/1.45 Consolas, monospace; }
+  #ws { flex: 1; overflow: auto; scrollbar-gutter: stable; padding: 8px; display: none; font: 12px/1.45 Consolas, monospace; }
   #ws.on { display: block; }
   #ws div { white-space: pre-wrap; word-break: break-all; border-bottom: 1px solid var(--line); padding: 2px 0; }
   .empty { color: var(--muted); padding: 16px; text-align: center; }
@@ -152,7 +160,7 @@
     display: flex; align-items: center; justify-content: space-between; gap: 8px;
     padding: 8px 10px; border-bottom: 1px solid var(--line); font-weight: 600;
   }
-  #modalBody { flex: 1; overflow: auto; padding: 10px; }
+  #modalBody { flex: 1; overflow: auto; scrollbar-gutter: stable; padding: 10px; }
   #modalFoot { display: flex; gap: 8px; justify-content: flex-end; padding: 8px; border-top: 1px solid var(--line); }
   #modal textarea { width: 100%; min-height: 64px; font: 12px/1.45 Consolas, monospace; }
   #modal table { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 8px; }
