@@ -118,6 +118,16 @@ function startServer() {
         res.end();
         return;
       }
+      if (u.pathname === '/api/needle') {                      // 断言 138：新记录命中 body 搜索
+        res.writeHead(200, Object.assign({ 'Content-Type': 'application/json' }, noStore));
+        res.end(JSON.stringify({ 'needle-refresh': true }));
+        return;
+      }
+      if (u.pathname === '/dl.bin') {                          // 断言 145：带 Content-Disposition 的下载
+        res.writeHead(200, Object.assign({ 'Content-Type': 'application/octet-stream', 'Content-Disposition': 'attachment; filename="probe.bin"' }, noStore));
+        res.end(Buffer.from('probe-download'));
+        return;
+      }
       if (u.pathname === '/img.png') {
         res.writeHead(200, Object.assign({ 'Content-Type': 'image/png' }, noStore));
         res.end(PNG_1PX);
@@ -258,8 +268,9 @@ async function run({ state, store, gpu, extract, settings, automation, format, f
   const base = `http://127.0.0.1:${port}`;
   const wc = state.view.webContents;
 
-  // 窗口被其它窗口遮挡时 Chromium 会推迟滚动事件与合成帧，自检必须让窗口在最前
-  try { state.win.moveTop(); state.win.focus(); } catch (e) { /* 无窗口环境忽略 */ }
+  // 窗口被其它窗口遮挡时 Chromium 会推迟滚动事件与合成帧（截图空白、计时器节流），自检期间强制置顶
+  try { state.win.setAlwaysOnTop(true); state.win.moveTop(); state.win.focus(); } catch (e) { /* 无窗口环境忽略 */ }
+  const raiseWin = () => { try { state.win.moveTop(); state.win.focus(); } catch (e) { /* 无窗口环境忽略 */ } };
 
   // 看门狗：卡死时也要退出并留下最后一条断言，避免整个自检无声挂起
   const watchdog = setTimeout(() => {
@@ -411,8 +422,15 @@ async function run({ state, store, gpu, extract, settings, automation, format, f
     check('表格转 CSV', csv.includes('名称') && csv.includes('苹果'), `${csv.length} 字符`);
 
     // ---------------- 31 自动滚动 ----------------
-    const sc = await automation.autoRun({ mode: 'scroll', rounds: 5 });
-    const extraCount = await extract.evalPage('document.querySelectorAll(".extra").length');
+    raiseWin();
+    let sc = await automation.autoRun({ mode: 'scroll', rounds: 5 });
+    let extraCount = await extract.evalPage('document.querySelectorAll(".extra").length');
+    if (!extraCount) {                                   // 窗口被遮挡时第一轮可能没派发滚动事件，置顶后重试一次
+      raiseWin();
+      await sleep(400);
+      sc = await automation.autoRun({ mode: 'scroll', rounds: 5 });
+      extraCount = await extract.evalPage('document.querySelectorAll(".extra").length');
+    }
     const scrollDiag = await extract.evalPage('JSON.stringify({h: document.documentElement.scrollHeight, ih: window.innerHeight, y: Math.round(window.scrollY)})');
     check('自动滚动触发无限加载', sc.ok && extraCount >= 1,
       sc.ok ? `轮次=${sc.rounds} reason=${sc.reason} .extra=${extraCount} 视口=${scrollDiag} view=${JSON.stringify(state.view.getBounds())} win=${JSON.stringify(state.win.getContentBounds())} visible=${state.win.isVisible()}` : sc.error);
@@ -733,8 +751,14 @@ async function run({ state, store, gpu, extract, settings, automation, format, f
     // 85 可见区域截图
     try {
       const f85 = path.join(outDir, 'visible.png');
-      const r85 = await pinvoke('cap:screenshot', { mode: 'visible', file: f85 });
-      const buf = fs.readFileSync(f85);
+      let r85 = await pinvoke('cap:screenshot', { mode: 'visible', file: f85 });
+      let buf = fs.existsSync(f85) ? fs.readFileSync(f85) : Buffer.alloc(0);
+      if (!buf.length) {                                   // 窗口被遮挡时 capturePage 会给出空图，置顶后重试一次
+        raiseWin();
+        await sleep(500);
+        r85 = await pinvoke('cap:screenshot', { mode: 'visible', file: f85 });
+        buf = fs.existsSync(f85) ? fs.readFileSync(f85) : Buffer.alloc(0);
+      }
       check('可见区域截图', r85.ok && buf.slice(0, 4).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47])),
         `${buf.length} 字节 ${r85.error || ''}`);
     } catch (e) { check('可见区域截图', false, e.message); }
@@ -1356,7 +1380,7 @@ async function run({ state, store, gpu, extract, settings, automation, format, f
       const w120 = await peval(`(() => {
         view = 'wf';
         syncTabs();
-        const expect = [...rows.values()].filter((v) => v.rec.time && v.rec.duration != null).length;
+        const expect = [...rows.values()].filter((v) => matches(v.rec) && v.rec.time && v.rec.duration != null).length;
         const bars = [...document.querySelectorAll('#wf .wfrow')];
         const lefts = bars.map((b) => parseFloat(b.querySelector('.wfbar2').style.left));
         let mono = true;
@@ -1587,6 +1611,287 @@ async function run({ state, store, gpu, extract, settings, automation, format, f
         sync132.same && sync132.n === sync132.scan && sync132.total === sync132.size && sync132.scan >= 1,
         `首行节点保持=${sync132.same} nReq=${sync132.n}（扫描 ${sync132.scan}）count=${sync132.total}=${sync132.size}`);
     } catch (e) { check('计数与差量同步', false, e.message); }
+
+    // 133 录制动作带元素标签链与类型（jsonl / .md 时间线 / 面板实时条目 / cap:recRead 投影 四条通路）
+    try {
+      const st133 = await pinvoke('cap:recStart', { shots: false });
+      await sleep(300);
+      await extract.evalPage(`(() => {                                  // 在 <form> 里的 <input name=q> 输入
+        const inp = document.querySelector('form input[name=q]');
+        inp.value = 'tag-probe';
+        inp.dispatchEvent(new Event('input', { bubbles: true }));
+        return true;
+      })()`);
+      await sleep(300);
+      await extract.evalPage(`(() => {                                  // 合成 submit（不触发导航）
+        document.querySelector('form').dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+        return true;
+      })()`);
+      await sleep(300);
+      await extract.evalPage(`(() => {                                  // 点击 <a href="/b">linkB</a>（最后做：会导航）
+        document.querySelector('a[href="/b"]').dispatchEvent(new MouseEvent('click', { bubbles: true }));
+        return true;
+      })()`);
+      await sleep(700);
+      const items133 = await peval(`document.getElementById('recItems').textContent`);   // 录制中面板实时条目
+      const st133b = await pinvoke('cap:recStop');
+      const acts133 = readRec(st133b.file).filter((l) => l.k === 'action');
+      const click133 = acts133.find((x) => x.a === 'click' && x.tag === 'a');
+      const input133 = acts133.find((x) => x.a === 'input');
+      const submit133 = acts133.find((x) => x.a === 'submit');
+      const md133 = st133b.ok && fs.existsSync(st133b.mdFile) ? fs.readFileSync(st133b.mdFile, 'utf8') : '';
+      const rd133 = await pinvoke('cap:recRead', { file: st133b.file });
+      const a133 = (rd133.actions || []).find((x) => x.a === 'input');
+      check('录制动作带元素标签链与类型',
+        st133.ok && !!click133 && click133.chain.includes('div.item') && click133.chain.includes('html')
+          && !!input133 && input133.type === 'text' && input133.chain.startsWith('input')
+          && !!submit133 && submit133.tag === 'form'
+          && md133.includes('点击 a ← div.item') && md133.includes('输入 input ← form')
+          && md133.includes(click133.sel)
+          && items133.includes('点击 a ← div.item')
+          && !!a133 && a133.tag === 'input' && typeof a133.type === 'string' && a133.chain.startsWith('input'),
+        `click=${click133 && click133.chain} · sel=${click133 && click133.sel} input=${input133 && input133.chain} type=${input133 && input133.type} submit=${submit133 && submit133.tag} md=${md133.includes('点击 a ← div.item')}/${md133.includes('输入 input ← form')}/${md133.includes(click133.sel)} 面板=${items133.includes('点击 a ← div.item')} 投影 type=${a133 && typeof a133.type}`);
+    } catch (e) { check('录制动作带元素标签链与类型', false, e.message); }
+
+    // 134 回放脚本按元素类型分派（readRecording 投影补 type 后，checkbox → check、select → selectOption）
+    try {
+      const sc134 = recorder.buildScript([
+        { n: 1, t: 0, a: 'change', sel: '#cb', tag: 'input', type: 'checkbox', checked: true },
+        { n: 2, t: 100, a: 'change', sel: '#sel', tag: 'select', type: 'select-one', value: 'v' },
+      ], { url: 'http://x/' });
+      check('转脚本按类型分派',
+        sc134.includes("await page.check('#cb')") && sc134.includes("await page.selectOption('#sel', 'v')"),
+        sc134.split('\n').filter((l) => l.includes('page.')).join(' | '));
+    } catch (e) { check('转脚本按类型分派', false, e.message); }
+
+    // 135 录制条目点击即复制 CSS 选择器（写爬虫直接拿去用）
+    try {
+      const st135 = await pinvoke('cap:recStart', { shots: false });
+      await sleep(300);
+      await state.view.webContents.loadURL(base + '/');   // 133 的点击把页面导航到了 /b，这里先回起始页
+      await sleep(900);
+      await extract.evalPage(`(() => { document.querySelector('a[href="/a"]').dispatchEvent(new MouseEvent('click', { bubbles: true })); return true; })()`);
+      await sleep(800);
+      const title135 = await peval(`(() => {
+        const items = [...document.querySelectorAll('#recItems > div')];
+        const hit = items.reverse().find((d) => d.onclick);
+        if (!hit) return '';
+        hit.click();
+        return hit.title;
+      })()`);
+      await sleep(300);
+      const clip135 = electronClipboard.readText();
+      const st135b = await pinvoke('cap:recStop');
+      const sels135 = st135b.ok ? readRec(st135b.file).filter((l) => l.k === 'action' && l.a === 'click').map((l) => l.sel) : [];
+      check('录制条目复制选择器',
+        st135.ok && !!title135 && !!clip135 && sels135.includes(clip135) && String(title135).includes(clip135),
+        `剪贴板=${JSON.stringify(clip135)} 条目 title=${JSON.stringify(title135)} 录制里的点击选择器=${JSON.stringify(sels135)}`);
+    } catch (e) { check('录制条目复制选择器', false, e.message); }
+
+    // 136 导出/复制按内存过滤（不再受 3000 行渲染上限影响）
+    try {
+      const cap136 = await peval(`(() => {
+        for (let i = 0; i < 3006; i++) appendRecord({ id: 993000 + i, method: 'GET', url: 'http://cap136/' + i, type: 'XHR', status: 200, size: 1, duration: 1, time: new Date().toISOString() });
+        const f = document.getElementById('filter');
+        f.value = 'cap136';
+        const hit = filteredIds().length;
+        const dom = document.querySelectorAll('#list .row').length;
+        const mem = rows.size;
+        f.value = '';
+        f.dispatchEvent(new Event('input', { bubbles: true }));
+        for (let i = 0; i < 3006; i++) dropRow(993000 + i);
+        return { hit, dom, mem, after: rows.size };
+      })()`);
+      check('导出/复制按内存过滤',
+        cap136.hit === 3006 && cap136.dom <= 3000 && cap136.mem >= 3006,
+        `命中=${cap136.hit} DOM 行=${cap136.dom} 内存=${cap136.mem} 清理后内存=${cap136.after}`);
+    } catch (e) { check('导出/复制按内存过滤', false, e.message); }
+
+    // 137 瀑布图跟随筛选
+    try {
+      const wf137 = await peval(`(() => {
+        const f = document.getElementById('filter');
+        f.value = 'api/data';
+        f.dispatchEvent(new Event('input', { bubbles: true }));
+        view = 'wf';
+        syncTabs();
+        const bars = document.querySelectorAll('#wf .wfrow').length;
+        const expect = [...rows.values()].filter((v) => matches(v.rec) && v.rec.time && v.rec.duration != null).length;
+        const info = document.getElementById('wfInfo').textContent;
+        view = 'list';
+        syncTabs();
+        f.value = '';
+        f.dispatchEvent(new Event('input', { bubbles: true }));
+        return { bars, expect, info };
+      })()`);
+      check('瀑布图跟随筛选', wf137.bars === wf137.expect && wf137.expect >= 1 && wf137.info.includes('命中'),
+        `条形=${wf137.bars}/${wf137.expect} 信息=${JSON.stringify(wf137.info)}`);
+    } catch (e) { check('瀑布图跟随筛选', false, e.message); }
+
+    // 138 响应体命中随新记录刷新
+    try {
+      await state.view.webContents.loadURL(base + '/');
+      await sleep(900);
+      await peval(`(() => { const f = document.getElementById('filter'); f.value = 'body:"needle-refresh"'; f.dispatchEvent(new Event('input', { bubbles: true })); return true; })()`);
+      await sleep(700);
+      const n0 = await peval(`document.getElementById('nReq').textContent`);
+      await extract.evalPage(`fetch('/api/needle').then((r) => r.text())`);
+      await waitFor(async () => Number(await peval(`document.getElementById('nReq').textContent`)) >= 1, 8000, 'body 命中刷新').catch(() => {});
+      const n1 = await peval(`document.getElementById('nReq').textContent`);
+      const note1 = await peval(`document.getElementById('listNote').textContent`);
+      await peval(`(() => { const f = document.getElementById('filter'); f.value = ''; f.dispatchEvent(new Event('input', { bubbles: true })); return true; })()`);
+      check('响应体命中随新记录刷新', Number(n0) === 0 && Number(n1) >= 1 && note1.includes('响应体命中'),
+        `刷新前=${n0} 刷新后=${n1} 提示=${JSON.stringify(note1)}`);
+    } catch (e) { check('响应体命中随新记录刷新', false, e.message); }
+
+    // 139 录制删除单条
+    try {
+      const r139 = await pinvoke('cap:recStart', { shots: false });
+      await sleep(300);
+      const r139b = await pinvoke('cap:recStop');
+      const d139 = await pinvoke('cap:recDelete', { file: r139b.file });
+      const list139 = await pinvoke('cap:recList');
+      const outside139 = await pinvoke('cap:recDelete', { file: path.join(outDir, 'x.jsonl') });
+      check('录制删除单条',
+        r139.ok && d139.ok && d139.removed >= 2 && !fs.existsSync(r139b.file) && !fs.existsSync(r139b.mdFile)
+          && !list139.some((x) => x.file === r139b.file) && outside139.ok === false,
+        `删除 ${d139.removed} 个文件，列表剩余 ${list139.length} 条，越界=${outside139.error}`);
+    } catch (e) { check('录制删除单条', false, e.message); }
+
+    // 140 录制占用统计（含点击截图）
+    try {
+      const fakeJsonl = path.join(recDir, 'rec-probe.jsonl');
+      const fakeShot = path.join(recDir, 'rec-probe-click-001.png');
+      fs.writeFileSync(fakeJsonl, JSON.stringify({ k: 'note', n: 1, t: Date.now(), text: 'probe' }) + '\n', 'utf8');
+      fs.writeFileSync(fakeShot, Buffer.alloc(10, 1));
+      const list140 = await pinvoke('cap:recList');
+      const item140 = list140.find((x) => x.base === 'rec-probe');
+      const jsonlSize = fs.statSync(fakeJsonl).size;
+      check('录制占用统计（含截图）',
+        !!item140 && item140.shots === 1 && item140.bytes >= jsonlSize + 10,
+        item140 ? `shots=${item140.shots} bytes=${item140.bytes}（jsonl ${jsonlSize} + png 10）` : '未列出 rec-probe');
+      fs.rmSync(fakeJsonl, { force: true });
+      fs.rmSync(fakeShot, { force: true });
+    } catch (e) { check('录制占用统计（含截图）', false, e.message); }
+
+    // 141 清理数据含录制记录
+    try {
+      await pinvoke('cap:recStart', { shots: false });
+      await sleep(250);
+      await pinvoke('cap:recStop');
+      const w141 = await pinvoke('cap:wipe', { targets: ['recordings'] });
+      const left141 = fs.readdirSync(recDir).filter((n) => /^rec-.*\.(jsonl|md|png)$/.test(n));
+      check('清理数据含录制记录', w141.ok && w141.done.includes('recordings') && left141.length === 0,
+        `done=${w141.done.join('/')} 残留=${left141.length} 个`);
+    } catch (e) { check('清理数据含录制记录', false, e.message); }
+
+    // 142 拾取面板侧取消（接上 cap:pickCancel，页面侧也要摘干净）
+    try {
+      await state.view.webContents.loadURL(base + '/');
+      await sleep(900);
+      await peval(`(() => { document.getElementById('extract').click(); return true; })()`);
+      await sleep(300);
+      await peval(`(() => { const b = [...document.querySelectorAll('#modalBody button')].find((x) => x.textContent === '拾取（行选择器）'); b.click(); return true; })()`);
+      await sleep(500);
+      const armed142 = await extract.evalPage('!!window.__wctPickArmed');
+      await peval(`(() => { const t = [...document.querySelectorAll('#toasts .toast button')].find((x) => x.textContent === '取消'); t.click(); return true; })()`);
+      await sleep(500);
+      const off142 = await extract.evalPage('!!window.__wctPickArmed');
+      check('拾取面板侧取消', armed142 === true && off142 === false, `注入=${armed142} 取消后=${off142}`);
+    } catch (e) { check('拾取面板侧取消', false, e.message); }
+
+    // 143 拾取到字段（选择器追加为字段行）
+    try {
+      await peval(`(() => { const b = [...document.querySelectorAll('#modalBody button')].find((x) => x.textContent === '拾取到字段'); b.click(); return true; })()`);
+      await sleep(500);
+      await extract.evalPage(`(() => {
+        const el = document.querySelector('#pw');
+        el.dispatchEvent(new MouseEvent('mousemove', { bubbles: true }));
+        el.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+        return true;
+      })()`);
+      await sleep(700);
+      const fields143 = await peval(`document.querySelectorAll('#modalBody textarea')[1].value`);
+      await peval(`document.getElementById('modalClose').click()`);
+      check('拾取到字段', String(fields143).includes('#pw'), `字段框末尾=${JSON.stringify(String(fields143).slice(-40))}`);
+    } catch (e) { check('拾取到字段', false, e.message); }
+
+    // 144 响应体 JSON 美化（按内容挑记录，避免挑到不含 "ok" 的 JSON）
+    try {
+      const rec144 = [...state.records].reverse().find((r) => r.body && r.body.includes('"ok":true'));
+      const rawMark = '"ok":true';
+      const prettyMark = '"ok": true';
+      await peval(`(() => { const row = document.querySelector('#list .row[data-id="${rec144.id}"]'); if (row) row.click(); return true; })()`);
+      await waitFor(async () => await peval(`!!document.getElementById('bodyPretty')`), 8000, '美化按钮').catch(() => {});
+      const hasBtn144 = await peval(`!!document.getElementById('bodyPretty')`);
+      const before144 = await peval(`document.getElementById('detail').textContent.includes(${JSON.stringify(rawMark)})`);
+      await peval(`(() => { const b = document.getElementById('bodyPretty'); if (b) b.click(); return true; })()`);
+      await sleep(500);
+      const pretty144 = await peval(`document.getElementById('detail').textContent.includes(${JSON.stringify(prettyMark)})`);
+      await peval(`(() => { const b = document.getElementById('bodyPretty'); if (b) b.click(); return true; })()`);
+      await sleep(500);
+      const back144 = await peval(`document.getElementById('detail').textContent.includes(${JSON.stringify(rawMark)})`);
+      check('响应体 JSON 美化', !!rec144 && hasBtn144 && before144 === true && pretty144 === true && back144 === true,
+        `按钮=${hasBtn144} 原文命中=${before144} 美化后命中=${pretty144} 还原后命中=${back144}`);
+    } catch (e) { check('响应体 JSON 美化', false, e.message); }
+
+    // 145 下载提示（a[download] → will-download → toast + 日志）
+    try {
+      await extract.evalPage(`(() => {
+        const a = document.createElement('a');
+        a.href = '/dl.bin';
+        a.download = 'probe.bin';
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        return true;
+      })()`);
+      await waitFor(async () => String(await peval(`document.getElementById('toasts').textContent`)).includes('下载'), 8000, '下载 toast').catch(() => {});
+      await sleep(800);
+      const toast145 = await peval(`document.getElementById('toasts').textContent`);
+      const log145 = logger.tail(80);
+      const rec145 = (await pinvoke('cap:list')).records.find((r) => String(r.url).endsWith('/dl.bin'));
+      const noteOk = rec145 ? String(rec145.note || '').includes('下载') : null;
+      check('下载提示',
+        toast145.includes('下载') && log145.includes('[download]') && noteOk !== false,
+        `toast=${JSON.stringify(String(toast145).slice(0, 60))} 日志=${log145.includes('[download]')} 记录 note=${noteOk === null ? '(未抓到该请求)' : noteOk}`);
+    } catch (e) { check('下载提示', false, e.message); }
+
+    // 146 重放导航（withNav）
+    try {
+      await state.view.webContents.loadURL(base + '/');
+      await sleep(900);
+      const st146 = await pinvoke('cap:recStart', { shots: false });
+      await sleep(300);
+      await extract.evalPage(`(() => { document.querySelector('a[href="/b"]').dispatchEvent(new MouseEvent('click', { bubbles: true })); return true; })()`);
+      await sleep(800);
+      const st146b = await pinvoke('cap:recStop');
+      const rd146 = await pinvoke('cap:recRead', { file: st146b.file });
+      const navSteps = (rd146.actions || []).filter((a) => a.a === 'nav').length;
+      await state.view.webContents.loadURL(base + '/');
+      await sleep(900);
+      const before146 = hits['/b'] || 0;
+      const rp146 = await pinvoke('cap:recReplay', { file: st146b.file, speed: 0, withNav: true });
+      await sleep(400);
+      const after146 = hits['/b'] || 0;
+      check('重放导航（withNav）',
+        st146.ok && navSteps >= 1 && rp146.ok && rp146.done === rp146.total && (rp146.failed || []).length === 0
+          && rp146.skipped === 0 && after146 > before146,
+        `步骤=${rp146.done}/${rp146.total} 跳过=${rp146.skipped} nav 步=${navSteps} /b 命中 ${before146}→${after146}`);
+    } catch (e) { check('重放导航（withNav）', false, e.message); }
+
+    // 147 代理连通性测试（给 url 只解析、不联网；不给才真发请求）
+    try {
+      await state.view.webContents.loadURL(base + '/');
+      await sleep(800);
+      const p147 = await pinvoke('cap:proxyTest', {});
+      await settings.applySetting('proxy', 'socks5://127.0.0.1:1');
+      const p147b = await pinvoke('cap:proxyTest', { url: 'http://example.com/' });
+      await settings.applySetting('proxy', '');
+      check('代理连通性测试',
+        p147.ok && p147.status === 200 && typeof p147.proxy === 'string' && p147b.ok && String(p147b.proxy).includes('127.0.0.1:1'),
+        `直连=${p147.status}（${p147.tookMs}ms，解析 ${p147.proxy}） 死代理解析=${p147b.proxy}`);
+    } catch (e) { check('代理连通性测试', false, e.message); }
   } catch (e) {
     check('自检执行', false, `${e.message} | status=${state.status} attached=${wc.debugger.isAttached()}`);
   }
