@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'unsafe-inline'">
+<title>网页抓取工具</title>
+<style>
+  :root {
+    --bg: #15171b; --bg-2: #191b1f; --panel: #1f2329; --elev: #262b32; --elev-2: #2b3138;
+    --line: #2f353d; --line-2: #3a4149; --fg: #e8eaed; --muted: #9aa3ad;
+    --accent: #4c8dff; --accent-dim: #4c8dff33; --sel: #2b4a80;
+    --ok: #3fb950; --warn: #d29922; --err: #f85149;
+    --radius-sm: 4px; --radius: 6px; --radius-lg: 10px; --ctl-h: 28px;
+    --shadow: 0 10px 30px #0007;
+  }
+  * { box-sizing: border-box; }
+  html { color-scheme: dark; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg); color: var(--fg); overflow: hidden;
+    font: 13px/1.5 "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+  }
+  [hidden] { display: none !important; }
+  ::selection { background: var(--accent-dim); }
+
+  /* 滚动条 */
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb {
+    background: var(--line-2); border-radius: 6px;
+    border: 2px solid transparent; background-clip: content-box;
+  }
+  ::-webkit-scrollbar-thumb:hover { background: var(--muted); background-clip: content-box; }
+
+  /* 控件统一 */
+  button, input, select, textarea {
+    font: inherit; color: var(--fg); background: var(--elev);
+    border: 1px solid var(--line); border-radius: var(--radius-sm);
+    height: var(--ctl-h); padding: 0 8px;
+    transition: background .12s, border-color .12s;
+  }
+  textarea { height: auto; padding: 6px 8px; resize: vertical; }
+  label { display: inline-flex; align-items: center; gap: 4px; }
+  input[type=checkbox] { height: auto; width: auto; padding: 0; }
+  button { cursor: pointer; white-space: nowrap; }
+  button:hover:not(:disabled) { background: var(--elev-2); border-color: var(--line-2); }
+  button:disabled { opacity: .45; cursor: default; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.primary:hover:not(:disabled) { background: #5c98ff; border-color: #5c98ff; }
+  button.ghost { background: transparent; }
+  button.ghost:hover:not(:disabled) { background: var(--elev); }
+  :focus-visible { outline: none; box-shadow: 0 0 0 2px var(--accent-dim); }
+
+  /* 工具栏（三行高度必须与 state.js 的 TOOLBAR_H = 124 一致） */
+  #toolbar {
+    height: 44px; display: flex; align-items: center; gap: 6px; padding: 0 8px;
+    border-bottom: 1px solid var(--line); background: var(--panel);
+  }
+  #toolbar2, #toolbar3 {
+    height: 40px; display: flex; align-items: center; gap: 6px; padding: 0 8px;
+    border-bottom: 1px solid var(--line); background: var(--panel);
+    overflow-x: auto; overflow-y: hidden; white-space: nowrap;
+  }
+  .lbl { color: var(--muted); font-size: 12px; flex: none; }
+  .num { width: 58px; }
+  .sep { width: 1px; height: 20px; background: var(--line); margin: 0 2px; flex: none; }
+  .chip {
+    display: inline-flex; align-items: center; gap: 8px; height: var(--ctl-h);
+    padding: 0 10px; background: var(--elev); border: 1px solid var(--line); border-radius: 999px;
+    flex: none;
+  }
+  #url { flex: 1; min-width: 80px; }
+  #status { color: var(--muted); font-size: 12px; max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #count { color: var(--accent); font-variant-numeric: tabular-nums; font-weight: 600; }
+
+  #body { height: calc(100% - 124px); display: flex; }
+  #pageArea { flex: 1; min-width: 0; }
+  #panel {
+    width: 520px; flex: none; display: flex; flex-direction: column;
+    border-left: 1px solid var(--line); background: var(--panel);
+  }
+
+  /* GPU/软件渲染提示条 */
+  #banner {
+    display: flex; align-items: center; gap: 8px; padding: 6px 10px;
+    background: #d299221f; border-bottom: 1px solid var(--line);
+    color: var(--warn); font-size: 12px;
+  }
+  #bannerText { flex: 1; min-width: 0; }
+  #banner button { height: 22px; font-size: 12px; }
+
+  #panelHead { display: flex; gap: 6px; padding: 6px; border-bottom: 1px solid var(--line); }
+  #filter { flex: 1; min-width: 40px; }
+  #tabs { display: flex; gap: 2px; padding: 0 6px; border-bottom: 1px solid var(--line); }
+  .tab { border-radius: var(--radius-sm) var(--radius-sm) 0 0; border-bottom: none; }
+  .tab.on { background: var(--bg); border-color: var(--accent); }
+  #list { flex: 1; overflow: auto; }
+  .row {
+    display: flex; align-items: center; gap: 6px; height: 26px; padding: 0 8px;
+    border-bottom: 1px solid var(--line); cursor: pointer; white-space: nowrap;
+    font-size: 12px; font-variant-numeric: tabular-nums;
+  }
+  .row:nth-child(even) { background: #ffffff05; }
+  .row:hover { background: var(--elev); }
+  .row.sel { background: var(--sel); }
+  .row .m {
+    width: 46px; flex: none; font-weight: 600; font-size: 11px;
+    display: flex; align-items: center; justify-content: center;
+    border-radius: var(--radius-sm); background: var(--elev-2);
+  }
+  .row[data-m="GET"] .m { color: #7dd3fc; }
+  .row[data-m="POST"] .m { color: #4ade80; }
+  .row[data-m="PUT"] .m, .row[data-m="PATCH"] .m { color: #fbbf24; }
+  .row[data-m="DELETE"] .m { color: #f87171; }
+  .row .s { width: 34px; flex: none; text-align: right; }
+  .row .u { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; direction: rtl; text-align: left; }
+  .row .t { width: 62px; flex: none; color: var(--muted); text-align: right; }
+  .s2 { color: var(--ok); } .s3 { color: var(--warn); } .s4, .s5 { color: var(--err); }
+  .muted { color: var(--muted); }
+
+  #detail { flex: 1.15; overflow: auto; border-top: 1px solid var(--line); padding: 10px; display: none; }
+  #detail.on { display: block; }
+  #detail h3 {
+    margin: 12px 0 4px; font-size: 12px; color: var(--accent);
+    padding-left: 7px; border-left: 2px solid var(--accent);
+  }
+  #detail pre {
+    margin: 0; padding: 8px 10px; background: var(--bg-2); border: 1px solid var(--line);
+    border-radius: var(--radius); white-space: pre-wrap; word-break: break-all;
+    max-height: 260px; overflow: auto; font: 12px/1.45 Consolas, monospace;
+  }
+  #detail .kv { color: var(--muted); }
+  .dbar { display: flex; gap: 6px; margin-bottom: 8px; }
+
+  #ws { flex: 1; overflow: auto; padding: 8px; display: none; font: 12px/1.45 Consolas, monospace; }
+  #ws.on { display: block; }
+  #ws div { white-space: pre-wrap; word-break: break-all; border-bottom: 1px solid var(--line); padding: 2px 0; }
+  .empty { color: var(--muted); padding: 16px; text-align: center; }
+
+  /* 共用模态框 */
+  #modal {
+    position: fixed; inset: 0; background: #0009; z-index: 50;
+    display: flex; align-items: center; justify-content: center;
+    backdrop-filter: blur(2px);
+  }
+  #modalBox {
+    width: min(960px, 92vw); max-height: 86vh; background: var(--panel);
+    border: 1px solid var(--line); border-radius: var(--radius-lg);
+    box-shadow: var(--shadow); display: flex; flex-direction: column;
+  }
+  #modalHead {
+    display: flex; align-items: center; justify-content: space-between; gap: 8px;
+    padding: 8px 10px; border-bottom: 1px solid var(--line); font-weight: 600;
+  }
+  #modalBody { flex: 1; overflow: auto; padding: 10px; }
+  #modalFoot { display: flex; gap: 8px; justify-content: flex-end; padding: 8px; border-top: 1px solid var(--line); }
+  #modal textarea { width: 100%; min-height: 64px; font: 12px/1.45 Consolas, monospace; }
+  #modal table { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 8px; }
+  #modal th, #modal td { border: 1px solid var(--line); padding: 2px 6px; text-align: left; vertical-align: top; word-break: break-all; }
+  #modal pre { white-space: pre-wrap; word-break: break-all; font: 12px/1.45 Consolas, monospace; }
+
+  /* 轻提示 */
+  #toasts { position: fixed; right: 16px; bottom: 16px; display: flex; flex-direction: column; gap: 8px; z-index: 80; max-width: 440px; }
+  .toast {
+    background: var(--elev); border: 1px solid var(--line); border-left: 3px solid var(--accent);
+    border-radius: var(--radius); padding: 8px 12px; box-shadow: var(--shadow);
+    font-size: 12px; white-space: pre-line;
+  }
+  .toast.err { border-left-color: var(--err); }
+  .toast.warn { border-left-color: var(--warn); }
+  .toast.ok { border-left-color: var(--ok); }
+</style>
+</head>
+<body>
+  <div id="toolbar">
+    <button id="back" title="后退">←</button>
+    <button id="fwd" title="前进">→</button>
+    <button id="reload" title="刷新">⟳</button>
+    <span class="sep"></span>
+    <input id="url" placeholder="输入网址，例如 example.com（可在此页面登录）">
+    <button id="go" class="primary">打开</button>
+    <span class="sep"></span>
+    <button id="toggle" title="暂停/继续抓取">暂停</button>
+    <button id="clear" title="清空已抓取记录">清空</button>
+    <span class="sep"></span>
+    <button id="pageData" title="读取当前页 HTML / Cookie / Storage">页面数据</button>
+    <button id="expAll" title="导出全部：页面数据 + Cookie + 请求记录 + WebSocket 帧">导出全部</button>
+    <button id="expHtml" title="保存当前页 HTML">导出 HTML</button>
+    <button id="expCookie" title="保存 Cookie 为 JSON">导出 Cookie</button>
+    <span class="sep"></span>
+    <span class="chip"><span id="count">0</span><span id="status">启动中</span></span>
+  </div>
+
+  <div id="toolbar2">
+    <span class="lbl">拦截</span>
+    <select id="blockMode" title="资源拦截（刷新后生效）">
+      <option value="none">不拦截</option>
+      <option value="assets">屏蔽图片·媒体·字体</option>
+      <option value="keywords">关键字屏蔽</option>
+    </select>
+    <input id="blockKeywords" type="text" placeholder="关键字，逗号分隔" style="width:150px">
+    <label class="lbl" title="只记录 XHR/Fetch 请求"><input id="recordOnly" type="checkbox"> 仅记 XHR/Fetch</label>
+    <span class="sep"></span>
+    <span class="lbl">限速</span>
+    <select id="throttle" title="网络限速（CDP 模拟，立即生效）">
+      <option value="off">不限速</option>
+      <option value="3g">3G</option>
+      <option value="slow">慢速</option>
+    </select>
+    <span class="sep"></span>
+    <span class="lbl">UA</span>
+    <select id="uaSel" title="User-Agent（刷新后生效）">
+      <option value="">默认</option>
+      <option value="win10">Win10 Chrome108</option>
+      <option value="win7">Win7 Chrome108</option>
+      <option value="android">Android Chrome</option>
+      <option value="custom">自定义…</option>
+    </select>
+    <input id="uaCustom" type="text" placeholder="自定义 UA" style="width:200px" hidden>
+    <span class="sep"></span>
+    <span class="lbl">头</span>
+    <input id="headers" type="text" placeholder="Referer=https://x; X-Token=abc" style="flex:1;min-width:120px">
+    <span class="sep"></span>
+    <span class="lbl">代理</span>
+    <input id="proxy" type="text" placeholder="socks5://127.0.0.1:1080" style="width:170px">
+  </div>
+
+  <div id="toolbar3">
+    <span class="lbl">自动滚动</span>
+    <input id="scrollRounds" class="num" type="number" min="1" max="50" value="5" title="滚动轮数">
+    <button id="autoScroll">开始</button>
+    <span class="sep"></span>
+    <span class="lbl">自动翻页</span>
+    <input id="pageCount" class="num" type="number" min="1" max="100" value="3" title="总页数">
+    <input id="pageDelay" class="num" type="number" min="200" max="60000" step="100" value="2000" title="每页间隔 ms" style="width:72px">
+    <button id="autoPage">开始</button>
+    <button id="autoStop" disabled>停止</button>
+    <span class="sep"></span>
+    <button id="extract">CSS 提取</button>
+    <button id="harvest">页面清单</button>
+    <span class="sep"></span>
+    <button id="saveBodies">响应体存盘</button>
+    <button id="expHar">导出 HAR</button>
+    <span class="sep"></span>
+    <button id="appSettings" class="ghost" title="应用设置：软件渲染 / GPU 状态">设置</button>
+  </div>
+
+  <div id="body">
+    <div id="pageArea"><!-- 原生 BrowserView 覆盖在此区域之上 --></div>
+    <div id="panel">
+      <div id="banner" hidden>
+        <span id="bannerText"></span>
+        <button id="bannerAction" class="primary"></button>
+        <button id="bannerClose" class="ghost">忽略</button>
+      </div>
+      <div id="panelHead">
+        <input id="filter" placeholder="过滤 URL / 方法 / 类型">
+        <select id="typeFilter">
+          <option value="">全部类型</option>
+          <option>XHR</option><option>Fetch</option><option>Document</option>
+          <option>Script</option><option>Stylesheet</option><option>Image</option>
+          <option>Media</option><option>Font</option><option>WebSocket</option><option>Other</option>
+        </select>
+      </div>
+      <div id="tabs">
+        <button class="tab on" data-view="list">请求 <span id="nReq">0</span></button>
+        <button class="tab" data-view="ws">WebSocket <span id="nWs">0</span></button>
+      </div>
+      <div id="list"><div class="empty">等待抓取…</div></div>
+      <div id="ws"></div>
+      <div id="detail"></div>
+    </div>
+  </div>
+
+  <div id="modal" hidden>
+    <div id="modalBox">
+      <div id="modalHead"><span id="modalTitle"></span><button id="modalClose" class="ghost">✕</button></div>
+      <div id="modalBody"></div>
+      <div id="modalFoot"></div>
+    </div>
+  </div>
+
+  <div id="toasts"></div>
+
+  <script src="./renderer.js"></script>
+</body>
+</html>
