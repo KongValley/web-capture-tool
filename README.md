@@ -173,7 +173,13 @@ npm run pack            # 打包 → dist/web-capture-tool-win32-ia32/ 与同名
 
 自检会在本地起一个测试服务器并驱动真实窗口完成全链路验证；运行期间配置、日志与会话文件都会改道到系统临时目录（`wct-selftest-*`），不影响你的真实配置。脚本弹出的系统保存/目录对话框无法自动化，对应功能通过传入路径参数绕过验证。
 
-打包产出的 exe 内嵌自绘图标（`build/icon.ico`，7 个尺寸）；若某些环境对 256 尺寸解析异常，可把 `pack:dir` 的 `--icon` 换成 `build/icon-128.ico`。
+打包产出的 exe 内嵌自绘图标（`build/icon.ico`，7 个尺寸）；若某些环境对 256 尺寸解析异常，可把 `pack:dir` 的 `--icon` 换成 `build/icon-128.ico`。绿色的 zip 里除 Electron/Chromium 自带的许可文件外，还会带上本项目的 `LICENSE`（`resources/LICENSE`）。
+
+---
+
+## 许可证
+
+MIT License，见仓库根目录 [LICENSE](./LICENSE)（Copyright © 2026 KongValley）。打包产物同时包含 Electron 与 Chromium 的许可文件，详见发行包内的 `LICENSE`、`LICENSES.chromium.html` 与 `resources/LICENSE`。
 
 ---
 
