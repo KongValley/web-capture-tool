@@ -6,6 +6,7 @@ const $ = (id) => document.getElementById(id);
 const el = { list: $('list'), ws: $('ws'), wsView: $('wsView'), detail: $('detail'), filter: $('filter'), type: $('typeFilter'), sort: $('sortBy') };
 
 const rows = new Map();     // id -> {rec, node, visible}（node 可能为 null：超出渲染上限后仅保留数据）
+let colMode = 'd';          // 当前列预设（与 #colSet 同步；只在切换时更新，避免逐行读 DOM）
 const LIST_MAX_ROWS = 3000; // 列表最多渲染的行数（超出后移除最早的 DOM，数据仍在内存与导出里）
 let domRows = 0;            // 当前 DOM 里的行数
 let visibleCount = 0;       // 当前可见行数（过滤命中的行，增量维护；updateCounts 直接用它）
@@ -92,8 +93,11 @@ function matchStatus(status, v) {
 function matchToken(rec, token) {
   const i = token.indexOf(':');
   if (i <= 0) return String(rec.url || '').toLowerCase().includes(token);
-  const key = token.slice(0, i);
-  const v = token.slice(i + 1);
+  return matchKey(rec, token.slice(0, i), token.slice(i + 1), token);
+}
+
+// token 已经拆好时直接判定（过滤是热路径：列表里每一行都要过一遍，不能每行重新切字符串）
+function matchKey(rec, key, v, token) {
   switch (key) {
     case 'method': return String(rec.method || '').toLowerCase() === v;
     case 'status': return matchStatus(rec.status, v);
@@ -112,24 +116,46 @@ function matchToken(rec, token) {
   }
 }
 
-// 空白切分，全部命中才算匹配（AND）；以 ! 开头的 token 取反
-function matchQuery(rec, query) {
-  const q = String(query == null ? '' : query).trim().toLowerCase();
-  if (!q) return true;
-  for (const part of q.split(/\s+/)) {
-    if (!part) continue;
+// 过滤串的解析缓存：只有输入框内容变了才重新解析
+const filterCache = { raw: null, parts: [] };
+
+function parseQuery(raw) {
+  return String(raw == null ? '' : raw).trim().toLowerCase().split(/\s+/).map((part) => {
     const neg = part.startsWith('!');
     const token = neg ? part.slice(1) : part;
-    if (!token) continue;
-    const hit = matchToken(rec, token);
-    if (neg ? hit : !hit) return false;
+    if (!token) return null;
+    const i = token.indexOf(':');
+    return i > 0 ? { neg, token, key: token.slice(0, i), val: token.slice(i + 1) } : { neg, token, key: '', val: '' };
+  }).filter(Boolean);
+}
+
+function queryParts() {
+  const raw = el.filter.value;
+  if (filterCache.raw !== raw) {
+    filterCache.raw = raw;
+    filterCache.parts = parseQuery(raw);
+  }
+  return filterCache.parts;
+}
+
+function matchParsed(rec, parts) {
+  for (const p of parts) {
+    const hit = matchKey(rec, p.key, p.val, p.token);
+    if (p.neg ? hit : !hit) return false;
   }
   return true;
 }
 
+// 空白切分，全部命中才算匹配（AND）；以 ! 开头的 token 取反（纯函数，自检直接调它）
+function matchQuery(rec, query) {
+  const q = String(query == null ? '' : query).trim().toLowerCase();
+  if (!q) return true;
+  return matchParsed(rec, parseQuery(q));
+}
+
 function matches(rec) {
   if (el.type.value && rec.type !== el.type.value) return false;
-  return matchQuery(rec, el.filter.value);
+  return matchParsed(rec, queryParts());
 }
 
 // 行在 DOM 里且没被过滤隐藏
@@ -153,6 +179,7 @@ function dropRow(id) {
   if (r.node) { r.node.remove(); domRows--; }   // 已超出渲染上限的行没有 DOM，不能减 domRows
   if (r.visible) visibleCount--;
   rows.delete(id);
+  invalidateBottom();
 }
 
 // 清空列表与计数（「清空」按钮 / 会话恢复前调用）
@@ -162,6 +189,7 @@ function resetListDom() {
   domRows = 0;
   listNew = 0;
   el.list.innerHTML = '<div class="empty">等待抓取…</div>';
+  invalidateBottom();
   el.ws.innerHTML = '';
   $('nWs').textContent = '0';
   updateListNew();
@@ -169,11 +197,16 @@ function resetListDom() {
   updateCounts();
 }
 
+let rowTpl = null;      // 行骨架只解析一次，之后克隆（比重建 innerHTML 快）
+
 function makeRow(rec) {
-  const node = document.createElement('div');
-  node.className = 'row';
+  if (!rowTpl) {
+    rowTpl = document.createElement('div');
+    rowTpl.className = 'row';
+    rowTpl.innerHTML = '<span class="m"></span><span class="s"></span><span class="u"></span><span class="t"></span><span class="z"></span>';
+  }
+  const node = rowTpl.cloneNode(true);
   node.dataset.id = rec.id;
-  node.innerHTML = '<span class="m"></span><span class="s"></span><span class="u"></span><span class="t"></span><span class="z"></span>';
   node.onclick = () => select(rec.id);
   node.oncontextmenu = (e) => {
     e.preventDefault();
@@ -190,33 +223,32 @@ function humanSize(n) {
   return (n / 1048576).toFixed(1) + 'M';
 }
 
+// 行的上一次绘制值存在 node._p 上：值没变就不碰 DOM
+// （抓包更新每个请求 2~4 次，其中绝大多数字段是重复写入，同步写会白白触发样式/布局失效）
 function paintRow(node, rec) {
-  const mode = $('colSet').value;
-  el.list.dataset.cols = mode;
-  node.dataset.restored = rec.restored ? '1' : '';
-  node.dataset.star = rec.star ? '1' : '';
-  node.dataset.m = rec.method;
-  node.children[0].textContent = rec.method;
+  const mode = colMode;
+  if (el.list.dataset.cols !== mode) el.list.dataset.cols = mode;
+  const p = node._p || (node._p = {});
+  const m = rec.method || '';
+  if (p.m !== m) { p.m = m; node.dataset.m = m; node.children[0].textContent = m; }
+  const restored = rec.restored ? '1' : '';
+  if (p.restored !== restored) { p.restored = restored; node.dataset.restored = restored; }
+  const star = rec.star ? '1' : '';
+  if (p.star !== star) { p.star = star; node.dataset.star = star; }
   const s = node.children[1];
-  s.textContent = rec.status || (rec.failed ? '×' : '…');
-  s.className = 's ' + statusClass(rec.status);
-  node.children[2].textContent = rec.url;
-  node.title = rec.url;
+  const sText = rec.status || (rec.failed ? '×' : '…');
+  if (p.sText !== sText) { p.sText = sText; s.textContent = sText; }
+  const sCls = 's ' + statusClass(rec.status);
+  if (p.sCls !== sCls) { p.sCls = sCls; s.className = sCls; }
+  const url = rec.url || '';
+  if (p.url !== url) { p.url = url; node.children[2].textContent = url; node.title = url; }
   const t = node.children[3];
-  const z = node.children[4];
-  if (mode === 't') {
-    t.textContent = String(rec.time || '').slice(11, 19);
-    z.textContent = '';
-  } else {
-    t.textContent = rec.duration != null ? rec.duration + 'ms' : rec.type;
-    z.textContent = mode === 'dt' ? `${rec.type} ${humanSize(rec.size)}` : '';
-  }
-  t.className = 't' + (rec.failed ? ' s4' : '');
-  z.className = 'z';
-}
-
-function listAtBottom() {
-  return el.list.scrollHeight - el.list.scrollTop - el.list.clientHeight <= 40;
+  const tText = mode === 't' ? String(rec.time || '').slice(11, 19) : (rec.duration != null ? rec.duration + 'ms' : (rec.type || ''));
+  if (p.tText !== tText) { p.tText = tText; t.textContent = tText; }
+  const tCls = 't' + (rec.failed ? ' s4' : '');
+  if (p.tCls !== tCls) { p.tCls = tCls; t.className = tCls; }
+  const zText = mode === 'dt' ? `${rec.type || ''} ${humanSize(rec.size)}` : '';
+  if (p.zText !== zText) { p.zText = zText; node.children[4].textContent = zText; }
 }
 
 function updateListNew() {
@@ -235,6 +267,53 @@ function updateListNote() {
   $('listNote').textContent = hidden > 0 ? `已隐藏更早 ${hidden} 条（可导出）` : '';
 }
 
+/* 列表跟随滚动：「是否在底部」不再每行都去读 scrollHeight。
+ * 读 scrollHeight 强制同步布局，3000 行列表下每行一次 = 全表重排（实测这份代码 3000 行 ≈ 30s）；
+ * 写 scrollTop 同样要算滚动范围，也会强制布局。所以：
+ *   1) 结论缓存，只在真正滚动（滚动事件 / scrollTop 赋值 / 列表重建）时失效；
+ *   2) 跟随到底只在一轮任务里写一次 scrollTop（微任务合并，界面下一帧前生效）。 */
+let bottomCache = null;
+let pendingScroll = false;     // 本任务里已经安排了「滚到底」，只写一次 scrollTop
+
+function invalidateBottom() {
+  bottomCache = null;
+  pendingScroll = false;        // 用户自己滚动了：取消还没落地的「跟随到底」
+}
+
+function listAtBottom() {
+  if (bottomCache === null) {
+    bottomCache = el.list.scrollHeight - el.list.scrollTop - el.list.clientHeight <= 40;
+  }
+  return bottomCache;
+}
+
+// 立刻滚到底（用户点击「↓ N 条新记录」这类显式动作）
+function scrollListToBottom() {
+  pendingScroll = false;
+  el.list.scrollTop = 1e9;      // 1e9 由浏览器夹到最大滚动位置；赋值本身也会触发一次布局
+  bottomCache = true;
+}
+
+// 跟随到底：一轮任务里只写一次 scrollTop（写它同样要算滚动范围，会强制布局）
+function scheduleScrollToBottom() {
+  bottomCache = true;
+  if (pendingScroll) return;
+  pendingScroll = true;
+  Promise.resolve().then(() => {
+    if (!pendingScroll) return;
+    pendingScroll = false;
+    el.list.scrollTop = 1e9;
+  });
+}
+
+// 任何 scrollTop 赋值（面板自己、自检脚本、将来的代码）都算一次滚动
+const scrollTopDesc = Object.getOwnPropertyDescriptor(Element.prototype, 'scrollTop');
+Object.defineProperty(el.list, 'scrollTop', {
+  get() { return scrollTopDesc.get.call(el.list); },
+  set(v) { invalidateBottom(); scrollTopDesc.set.call(el.list, v); },
+});
+el.list.addEventListener('scroll', invalidateBottom, { passive: true });
+
 function appendRecord(rec) {
   if (rows.has(rec.id)) return;
   const node = makeRow(rec);
@@ -246,7 +325,7 @@ function appendRecord(rec) {
   domRows++;
   setRowVisible(rec.id, matches(rec));
   if (selected === rec.id) node.classList.add('sel');
-  if (listAtBottom()) el.list.scrollTop = el.list.scrollHeight;
+  if (listAtBottom()) scheduleScrollToBottom();
   else { listNew++; updateListNew(); }
   while (domRows > LIST_MAX_ROWS) {
     let victim = null;
@@ -287,6 +366,9 @@ function updateCounts() {
   $('count').textContent = rows.size;
 }
 
+/* 列预设 / 过滤两个入口：
+ * refilter     —— 列预设或类型筛选变化：行内文本要重算，逐行重画 + 重算可见性
+ * reapplyFilter —— 只有过滤串变化：只重算可见性，不碰行内文本（打字时走这条） */
 function refilter() {
   for (const [id, r] of rows) {
     if (!r.node) continue;                  // 已超出渲染上限的行只在内存里
@@ -295,9 +377,20 @@ function refilter() {
   }
   updateCounts();
   scheduleSort();                            // 分组标题条数 / 隐藏行要跟着筛选刷新
+  invalidateBottom();
   if (view === 'wf') scheduleWaterfall();      // 瀑布图跟随筛选
 }
 
+function reapplyFilter() {
+  for (const [id, r] of rows) {
+    if (!r.node) continue;
+    setRowVisible(id, matches(r.rec));
+  }
+  updateCounts();
+  scheduleSort();
+  invalidateBottom();
+  if (view === 'wf') scheduleWaterfall();
+}
 
 /* ---------------------------------------------------------------- 排序与分组 */
 
@@ -318,6 +411,7 @@ function applySort() {
   const items = [...rows.values()].filter((r) => r.node);
   if (mode === 'time') {                     // 回到时间序：按插入顺序（= 时间序）摆回来
     for (const r of items) el.list.appendChild(r.node);
+    invalidateBottom();
     return;
   }
   const hostOf = (rec) => { try { return new URL(rec.url).host; } catch (e) { return '(无法解析)'; } };
@@ -344,6 +438,7 @@ function applySort() {
     return;
   }
   for (const r of items.slice().sort(cmp)) el.list.appendChild(r.node);
+  invalidateBottom();                        // 重排/加分组标题都会改变滚动位置的含义
 }
 
 // 过滤结果的唯一来源：按内存记录算 id（DOM 只渲染最近 3000 行，不能作为导出依据）
@@ -575,6 +670,7 @@ function renderTabs(list, activeId) {
 // 边界：切标签时两个标签的记录 id 不重叠，差量退化为全量重建；收益在「同一批数据重刷」
 // （横幅恢复、重复的 cap:tabChanged）和不再丢滚动位置/悬浮状态。
 function refreshActiveList(d) {
+  invalidateBottom();                                   // 整表重建：滚动位置的含义变了
   const incoming = d.records || [];
   const keep = new Set(incoming.map((r) => r.id));
   for (const id of [...rows.keys()]) if (!keep.has(id)) dropRow(id);
@@ -1362,7 +1458,7 @@ $('proxyTest').onclick = async () => {
   toast(`代理测试失败：${(r && r.error) || '未知错误'}（解析：${(r && r.proxy) || '-'}）`, 'err', 7000);
   return undefined;
 };
-$('colSet').addEventListener('change', () => { refilter(); cfg('colSet', $('colSet').value); });
+$('colSet').addEventListener('change', () => { colMode = $('colSet').value; refilter(); cfg('colSet', $('colSet').value); });
 $('sortBy').addEventListener('change', () => { applySort(); cfg('sortBy', $('sortBy').value); });
 $('reqDelay').addEventListener('change', () => cfg('reqDelay', +$('reqDelay').value));
 
@@ -2329,7 +2425,7 @@ async function runBodySearch() {
   }
   bodyHits = new Set(r.ids);
   updateListNote();
-  refilter();
+  reapplyFilter();
 }
 
 let bodyRefreshTimer = null;
@@ -2338,8 +2434,8 @@ function scheduleBodyRefresh() {                            // 新记录到达�
   bodyRefreshTimer = setTimeout(() => { bodyRefreshTimer = null; runBodySearch(); }, 1000);
 }
 
-el.filter.addEventListener('input', () => { syncBodySearch(); refilter(); });
-el.type.addEventListener('change', refilter);
+el.filter.addEventListener('input', () => { syncBodySearch(); reapplyFilter(); });
+el.type.addEventListener('change', reapplyFilter);
 document.querySelectorAll('.tab').forEach((t) => { t.onclick = () => { view = t.dataset.view; syncTabs(); }; });
 
 // 主进程把抓包事件按 100ms 合并成一批；先 drop 再 record 再 update，已 drop 的更新不会复活行
@@ -2381,7 +2477,7 @@ ipcRenderer.on('cap:navigated', (_e, d) => {
 
 $('tabNew').onclick = () => ipcRenderer.invoke('cap:tabNew');
 $('listNew').onclick = () => {
-  el.list.scrollTop = el.list.scrollHeight;
+  scrollListToBottom();
   listNew = 0;
   updateListNew();
 };
@@ -2395,6 +2491,10 @@ ipcRenderer.on('cap:tabChanged', async () => refreshActiveList(await ipcRenderer
 let toggleState = true;
 (async () => {
   const d = await ipcRenderer.invoke('cap:list');
+  // 无显卡 / 软件渲染：关掉全屏模糊与阴影这类合成开销（老机器上最贵的一项）
+  ipcRenderer.invoke('cap:gpuStatus').then((g) => {
+    if (g && g.softwareMode) document.body.classList.add('soft');
+  }).catch(() => {});
   // 按持久化宽度摆放面板（主进程已按同一数值摆放原生视图；不要再回传，否则会反向覆盖）
   applyPanelWidth(Math.max(PANEL_MIN, Math.min(PANEL_MAX, d.panelWidth || 520)));
   refreshActiveList(d);
@@ -2408,6 +2508,7 @@ let toggleState = true;
   $('headers').value = cfgAll.headers;
   $('proxy').value = cfgAll.proxy;
   $('colSet').value = cfgAll.colSet || 'd';
+  colMode = $('colSet').value;
   $('sortBy').value = cfgAll.sortBy || 'time';
   refilter();
   $('reqDelay').value = Number.isFinite(Number(cfgAll.reqDelay)) ? Number(cfgAll.reqDelay) : 0;

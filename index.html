@@ -210,6 +210,9 @@
     display: flex; align-items: center; justify-content: center;
     backdrop-filter: blur(2px);
   }
+  /* 软件渲染（无显卡 / 老机器）：全屏模糊与多层阴影是合成阶段的大头，直接降级 */
+  body.soft #modal { backdrop-filter: none; background: #000b; }
+  body.soft #modalBox, body.soft #ctxMenu, body.soft .toast { box-shadow: none; }
   #modalBox {
     width: min(960px, 92vw); max-height: 86vh; background: var(--panel);
     border: 1px solid var(--line); border-radius: var(--radius-lg);

@@ -17,6 +17,7 @@ const MAX_BYTES = 64 * 1024 * 1024;       // 落盘响应体总量上限
 const MAX_WS = 500;
 const MAX_AGE_MS = 7 * 24 * 3600 * 1000;  // 超过 7 天的会话不可恢复
 const SAVE_INTERVAL_MS = 30000;
+const CHUNK = 200;                        // 分片序列化：每 200 条让出一次事件循环
 
 let overrideFile = null;
 let file = null;
@@ -62,12 +63,39 @@ function snapshot() {
   };
 }
 
+// 会话文件的 JSON 头（records 之外的部分）；两条写入路径共用，保证落盘结构一致
+function headOf(data) {
+  const base = {
+    version: data.version, savedAt: data.savedAt, url: data.url, title: data.title,
+    wsFrames: data.wsFrames, tabs: data.tabs,
+  };
+  return JSON.stringify(base).slice(0, -1);    // 去掉收尾的 '}'，后面接 "records":[…]} 
+}
+
+// 分片序列化：一次 JSON.stringify 处理几十 MB 会把主进程（连带面板 IPC）卡住一整段，
+// 老机器上能到秒级。这里按条分片、每 CHUNK 条用 setImmediate 让出事件循环。
+async function toJson(data) {
+  const parts = [];
+  let buf = [];
+  for (let i = 0; i < data.records.length; i++) {
+    buf.push(JSON.stringify(data.records[i]));
+    if (buf.length >= CHUNK) {
+      parts.push(buf.join(','));
+      buf = [];
+      await new Promise((r) => setImmediate(r));
+    }
+  }
+  if (buf.length) parts.push(buf.join(','));
+  return `${headOf(data)},"records":[${parts.join(',')}]}`;
+}
+
 async function save() {
   try {
     const data = snapshot();
+    const text = await toJson(data);
     const p = filePath();
     await fs.promises.mkdir(path.dirname(p), { recursive: true });
-    await fs.promises.writeFile(p, JSON.stringify(data));
+    await fs.promises.writeFile(p, text);
     lastCount = data.records.length;
     return { ok: true, file: p, count: data.records.length };
   } catch (e) {
@@ -76,13 +104,13 @@ async function save() {
   }
 }
 
-// 退出路径用：同步写，进程随时可能消失
+// 退出路径用：同步写，进程随时可能消失（这里不能分片让出事件循环）
 function saveSync() {
   try {
     const data = snapshot();
     const p = filePath();
     fs.mkdirSync(path.dirname(p), { recursive: true });
-    fs.writeFileSync(p, JSON.stringify(data));
+    fs.writeFileSync(p, `${headOf(data)},"records":[${data.records.map((r) => JSON.stringify(r)).join(',')}]}`);
     lastCount = data.records.length;
     return { ok: true, file: p, count: data.records.length };
   } catch (e) {

@@ -30,6 +30,7 @@ const state = {
   auto: { running: false, stop: false },
   snaps: [],                   // 抓包快照（本次运行内存，最多 2 个；不落盘，不与会话恢复抢语义）
   selftest: process.argv.includes('--selftest'),
+  bench: process.argv.includes('--bench'),   // 性能基准：同样的临时配置改道，测完打印数字退出
 };
 
 // 把活动标签的状态同步到镜像字段；传入 tab 时先把该标签设为活动

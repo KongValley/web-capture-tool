@@ -127,9 +127,12 @@ function onResponseReceived(tab, ev) {
 function onResponseExtraInfo(tab, ev) {
   const rec = tab.byId.get(ev.requestId);
   if (!rec) return;
-  if (ev.headers) rec.responseHeadersRaw = ev.headers;   // 原始头，含 Set-Cookie
-  if (ev.statusCode) rec.status = ev.statusCode;
-  queueBatch(tab, 'update', summarize(rec));
+  if (ev.headers) rec.responseHeadersRaw = ev.headers;   // 原始头，含 Set-Cookie（详情按需读，不必推给面板）
+  // 同一请求会来两条 extraInfo，只有状态真的变了才推：省一半 IPC 与面板绘制
+  if (ev.statusCode && rec.status !== ev.statusCode) {
+    rec.status = ev.statusCode;
+    queueBatch(tab, 'update', summarize(rec));
+  }
 }
 
 /* ---------------------------------------------------------- 面板推送批处理 */

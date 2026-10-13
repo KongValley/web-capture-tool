@@ -9,6 +9,8 @@
     "start": "electron .",
     "selftest": "electron . --selftest",
     "selftest:sw": "electron . --selftest --software-rendering",
+    "bench": "electron . --bench",
+    "bench:sw": "electron . --bench --software-rendering",
     "icon": "node make-icon.js",
     "pack:dir": "electron-packager . --platform=win32 --arch=ia32 --overwrite --prune --out=dist --ignore=\"^/(dist|tmp)\" --icon=build/icon.ico --extra-resource=LICENSE",
     "pack:zip": "powershell -NoProfile -Command \"Compress-Archive -Path 'dist/web-capture-tool-win32-ia32' -DestinationPath 'dist/web-capture-tool-win32-ia32.zip' -Force\"",

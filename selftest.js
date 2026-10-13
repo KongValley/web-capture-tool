@@ -273,10 +273,11 @@ async function run({ state, store, gpu, extract, settings, automation, format, f
   const raiseWin = () => { try { state.win.moveTop(); state.win.focus(); } catch (e) { /* 无窗口环境忽略 */ } };
 
   // 看门狗：卡死时也要退出并留下最后一条断言，避免整个自检无声挂起
+  // 上限放宽到 10 分钟：老机器（单核/机械盘/无显卡）整套跑完是这里的 3~5 倍时间
   const watchdog = setTimeout(() => {
-    console.log('FAIL  自检看门狗超时（180s），进程强制退出');
+    console.log('FAIL  自检看门狗超时（600s），进程强制退出');
     require('electron').app.exit(2);
-  }, 180000);
+  }, 600000);
 
   try {
     await waitFor(() => wc.debugger.isAttached() && state.status === '抓取中', 15000, 'CDP 就绪');
@@ -2091,6 +2092,11 @@ async function run({ state, store, gpu, extract, settings, automation, format, f
     const settled = gpu.statusLooksSoftware(gpu.currentStatus());
     check('GPU 判定不误触发', state.softwareMode === (forced || settled),
       `softwareMode=${state.softwareMode} 稳定状态=${gpu.describe().gpuCompositing || '(未知)'} 强制参数=${forced}`);
+
+    // 157 软件渲染下面板自动降级（关掉全屏模糊与阴影：老机器/无显卡时这几项最贵）
+    const soft = await state.win.webContents.executeJavaScript(`document.body.classList.contains('soft')`, true);
+    check('软件渲染面板降级', soft === state.softwareMode,
+      `面板 class=${soft ? 'soft' : '（无）'} softwareMode=${state.softwareMode}`);
   } catch (e) {
     check('GPU 判定不误触发', false, e.message);
   }

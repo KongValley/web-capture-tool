@@ -36,13 +36,14 @@ const picker = require('./picker');
 const ICON = path.join(__dirname, 'build', 'icon.ico');
 if (process.platform === 'win32') app.setAppUserModelId('com.kongvalley.web-capture-tool');
 
-// 自检改道到临时配置，绝不碰用户真实配置；随后同步读盘（后续默认值都从这里取）
-if (state.selftest) {
-  store.useFile(path.join(os.tmpdir(), 'wct-selftest-settings', 'settings.json'));
-  logger.useFile(path.join(os.tmpdir(), 'wct-selftest-logs', 'app.log'));
-  sessionStore.useFile(path.join(os.tmpdir(), 'wct-selftest-session', 'last.json'));
-  recorder.useDir(path.join(os.tmpdir(), 'wct-selftest-rec'));
-  const dlDir = path.join(os.tmpdir(), 'wct-selftest-dl');     // 自检触发的下载落这里，不碰真实下载目录
+// 自检 / 基准改道到临时配置，绝不碰用户真实配置；随后同步读盘（后续默认值都从这里取）
+const SANDBOX = state.selftest ? 'selftest' : state.bench ? 'bench' : '';
+if (SANDBOX) {
+  store.useFile(path.join(os.tmpdir(), `wct-${SANDBOX}-settings`, 'settings.json'));
+  logger.useFile(path.join(os.tmpdir(), `wct-${SANDBOX}-logs`, 'app.log'));
+  sessionStore.useFile(path.join(os.tmpdir(), `wct-${SANDBOX}-session`, 'last.json'));
+  recorder.useDir(path.join(os.tmpdir(), `wct-${SANDBOX}-rec`));
+  const dlDir = path.join(os.tmpdir(), `wct-${SANDBOX}-dl`);     // 触发的下载落这里，不碰真实下载目录
   fs.mkdirSync(dlDir, { recursive: true });
   app.setPath('downloads', dlDir);
 }
@@ -1075,7 +1076,7 @@ app.whenReady().then(() => {
   registerIpc();
   createWindow();
   watchGpu();
-  if (!state.selftest) sessionStore.start();    // 自检自己调 save/load，不受 30s 定时器干扰
+  if (!state.selftest && !state.bench) sessionStore.start();   // 自检/基准自己调 save/load，不受 30s 定时器干扰
   // GPU 状态需要一点时间上报，面板首帧之后再判定（首次采样后还会二次复核，见 checkGpuOnce）
   if (state.win) state.win.webContents.once('did-finish-load', () => setTimeout(checkGpuOnce, 3000));
   if (state.selftest) {
@@ -1083,6 +1084,9 @@ app.whenReady().then(() => {
       state, store, gpu, capture, extract, settings, automation, format, files, logger,
       session: sessionStore, recorder, picker, resetActive, PARTITION,
     });
+  }
+  if (state.bench) {
+    require('./bench.js').run({ state, capture, session: sessionStore, gpu });
   }
   app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
 });
@@ -1092,5 +1096,5 @@ app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(
 app.on('before-quit', () => {
   sessionStore.stop();
   recorder.flushSync();                            // 录制中的会话补一条 summary（reason:'quit'）
-  if (!state.selftest) sessionStore.saveSync();   // 自检退出时不写会话文件，避免污染断言数据
+  if (!state.selftest && !state.bench) sessionStore.saveSync();   // 自检/基准退出时不写会话文件
 });
