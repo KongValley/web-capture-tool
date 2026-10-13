@@ -93,10 +93,14 @@ function startServer() {
   return new Promise((resolve) => {
     const hits = {};          // pathname -> 命中次数
     const lastHeaders = {};   // pathname -> 最后一次请求头
+    const lastReq = {};       // pathname -> { method, headers }
+    const hitsAt = {};        // pathname -> [命中时间戳]
     const server = http.createServer((req, res) => {
       const u = new URL(req.url, 'http://127.0.0.1');
       hits[u.pathname] = (hits[u.pathname] || 0) + 1;
       lastHeaders[u.pathname] = req.headers;
+      lastReq[u.pathname] = { method: req.method, headers: req.headers };
+      (hitsAt[u.pathname] = hitsAt[u.pathname] || []).push(Date.now());
       const noStore = { 'Cache-Control': 'no-store' };
       const port = server.address().port;
       if (u.pathname === '/api/data') {
@@ -147,7 +151,7 @@ function startServer() {
       const payload = Buffer.from('hello-ws');
       socket.write(Buffer.concat([Buffer.from([0x81, payload.length]), payload]));
     });
-    server.listen(0, '127.0.0.1', () => resolve({ server, hits, lastHeaders }));
+    server.listen(0, '127.0.0.1', () => resolve({ server, hits, lastHeaders, lastReq, hitsAt }));
   });
 }
 
@@ -162,7 +166,7 @@ function reloadAndWait(wc, ms = 900) {
   });
 }
 
-async function run({ state, store, gpu, extract, settings, automation, format, files, capture, PARTITION }) {
+async function run({ state, store, gpu, extract, settings, automation, format, files, capture, logger, session, resetActive, PARTITION }) {
   const results = [];
   const check = (name, cond, extra = '') => {
     results.push({ name, pass: !!cond, extra });
@@ -248,10 +252,13 @@ async function run({ state, store, gpu, extract, settings, automation, format, f
     check('无显卡判定（纯函数）', false, e.message);
   }
 
-  const { server, hits, lastHeaders } = await startServer();
+  const { server, hits, lastHeaders, lastReq, hitsAt } = await startServer();
   const port = server.address().port;
   const base = `http://127.0.0.1:${port}`;
   const wc = state.view.webContents;
+
+  // 窗口被其它窗口遮挡时 Chromium 会推迟滚动事件与合成帧，自检必须让窗口在最前
+  try { state.win.moveTop(); state.win.focus(); } catch (e) { /* 无窗口环境忽略 */ }
 
   // 看门狗：卡死时也要退出并留下最后一条断言，避免整个自检无声挂起
   const watchdog = setTimeout(() => {
@@ -340,7 +347,7 @@ async function run({ state, store, gpu, extract, settings, automation, format, f
 
     // 23 仅记 XHR/Fetch
     await cfg('recordOnly', true);
-    state.records.length = 0; state.byId.clear(); state.seq = 0;   // 等价于面板「清空」
+    resetActive();                                                // 等价于面板「清空」
     await reloadAndWait(wc);
     check('仅记 XHR/Fetch', state.records.length > 0 && state.records.every((r) => r.type === 'XHR' || r.type === 'Fetch'),
       `${state.records.length} 条，类型=${[...new Set(state.records.map((r) => r.type))].join('/')}`);
@@ -407,7 +414,7 @@ async function run({ state, store, gpu, extract, settings, automation, format, f
     const extraCount = await extract.evalPage('document.querySelectorAll(".extra").length');
     const scrollDiag = await extract.evalPage('JSON.stringify({h: document.documentElement.scrollHeight, ih: window.innerHeight, y: Math.round(window.scrollY)})');
     check('自动滚动触发无限加载', sc.ok && extraCount >= 1,
-      sc.ok ? `轮次=${sc.rounds} reason=${sc.reason} .extra=${extraCount} 视口=${scrollDiag}` : sc.error);
+      sc.ok ? `轮次=${sc.rounds} reason=${sc.reason} .extra=${extraCount} 视口=${scrollDiag} view=${JSON.stringify(state.view.getBounds())} win=${JSON.stringify(state.win.getContentBounds())} visible=${state.win.isVisible()}` : sc.error);
 
     // ---------------- 32 自动翻页 ----------------
     const pg = await automation.autoRun({ mode: 'page', pages: 3, delay: 300 });
@@ -464,7 +471,7 @@ async function run({ state, store, gpu, extract, settings, automation, format, f
     check('模态框可关闭', modalClosed === true);
 
     // ---------------- 65-66 UI 精修元素与轻提示 ----------------
-    const missingEls = await peval(`['toasts','banner','bannerText','bannerAction','bannerClose','appSettings']
+    const missingEls = await peval(`['toasts','banner','bannerText','bannerActions','bannerClose','appSettings']
       .filter((id) => !document.getElementById(id))`);
     check('面板新元素齐备', missingEls.length === 0, missingEls.length ? `缺失 ${missingEls.join(',')}` : '全部存在');
 
@@ -490,6 +497,426 @@ async function run({ state, store, gpu, extract, settings, automation, format, f
       document.getElementById('modalClose').click();
       return true;
     })()`);
+
+    // ================================================== 68-97 打磨与新增功能
+
+    const pinvoke = (channel, ...args) => panel.executeJavaScript(
+      `require('electron').ipcRenderer.invoke(${JSON.stringify(channel)}, ...${JSON.stringify(args)})`, true);
+    const outDir = path.join(os.tmpdir(), `wct-selftest-out-${Date.now()}`);
+    fs.mkdirSync(outDir, { recursive: true });
+
+    // 68 响应体截断查看
+    try {
+      const html = await peval(`bodyBlock({ id: -1, body: 'x'.repeat(250000), bodyBase64: false })`);
+      check('响应体截断查看', html.includes('已截断显示前 200KB') && html.length < 250000, `HTML ${html.length} 字符`);
+    } catch (e) { check('响应体截断查看', false, e.message); }
+
+    // 69 响应体另存（文本）
+    try {
+      const rec = state.records.find((r) => r.url === base + '/api/data' && r.method === 'GET' && r.body);
+      const f69 = path.join(outDir, 'body.json');
+      const r69 = await pinvoke('cap:saveBody', rec.id, 'response', f69);
+      check('响应体另存为文件', r69.ok && fs.existsSync(f69) && fs.readFileSync(f69, 'utf8').includes('"ok":true'), r69.error || f69);
+    } catch (e) { check('响应体另存为文件', false, e.message); }
+
+    // 70 面板宽度拖拽
+    try {
+      const dragTo = (w) => `(() => {
+        const x = Math.max(8, window.innerWidth - ${w});
+        const sp = document.getElementById('splitter');
+        sp.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, clientX: x, clientY: 200 }));
+        window.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: x, clientY: 200 }));
+        window.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, clientX: x, clientY: 200 }));
+        return Math.round(document.getElementById('panel').getBoundingClientRect().width);
+      })()`;
+      const drag = await peval(dragTo(700));
+      await sleep(300);
+      const mid = await pinvoke('cap:list');
+      const restored = await peval(dragTo(520));
+      await sleep(300);
+      check('面板宽度拖拽', drag >= 690 && drag <= 710 && mid.panelWidth === drag && restored >= 510 && restored <= 530,
+        `拖到 ${drag}px，主进程 panelWidth=${mid.panelWidth}，恢复 ${restored}px`);
+    } catch (e) { check('面板宽度拖拽', false, e.message); }
+
+    // 71 详情渲染节流
+    try {
+      await pinvoke('cap:setEnabled', false);      // 暂停抓取，排除 cap:update 噪声
+      await peval(`(() => { const row = document.querySelector('#list .row'); if (row) row.click(); return true; })()`);
+      await sleep(300);
+      const t1 = await peval('window.__detailRenders || 0');
+      await peval(`(() => { for (let i = 0; i < 20; i++) scheduleDetailRender(detailId); return true; })()`);
+      await sleep(1800);   // 窗口被遮挡时 Chromium 会把计时器对齐到 1s，等足 1.8s 再判定
+      const t2 = await peval('window.__detailRenders || 0');
+      await pinvoke('cap:setEnabled', true);
+      check('详情渲染节流（200ms 合并）', t2 - t1 === 1, `渲染次数 ${t1} → ${t2}`);
+    } catch (e) { check('详情渲染节流（200ms 合并）', false, e.message); }
+
+    // 72 诊断日志
+    try {
+      logger.log('test', 'hello-selftest');
+      const seen = logger.tail(50).includes('hello-selftest');
+      fs.appendFileSync(logger.filePath(), 'x'.repeat(logger.MAX_BYTES + 2048));
+      logger.log('test', 'after-rotate');
+      const rotated = fs.existsSync(logger.filePath() + '.1');
+      check('诊断日志写入与滚动', seen && rotated, `尾部可见=${seen} 滚动文件=${rotated}`);
+    } catch (e) { check('诊断日志写入与滚动', false, e.message); }
+
+    // 73 快捷键（定位类）
+    try {
+      const loc = await peval(`(() => {
+        const kd = (key) => window.dispatchEvent(new KeyboardEvent('keydown', { key, ctrlKey: true, bubbles: true, cancelable: true }));
+        kd('l'); const l = document.activeElement.id;
+        kd('f'); const f = document.activeElement.id;
+        return { l, f };
+      })()`);
+      check('快捷键（Ctrl+L / Ctrl+F 定位）', loc.l === 'url' && loc.f === 'filter', `Ctrl+L → ${loc.l}，Ctrl+F → ${loc.f}`);
+    } catch (e) { check('快捷键（Ctrl+L / Ctrl+F 定位）', false, e.message); }
+
+    // 74 快捷键（动作类）
+    try {
+      const before = await peval(`document.getElementById('toggle').textContent`);
+      await peval(`(() => { window.dispatchEvent(new KeyboardEvent('keydown', { key: 'p', ctrlKey: true, bubbles: true, cancelable: true })); return true; })()`);
+      await sleep(300);
+      const toggleAfter = await peval(`document.getElementById('toggle').textContent`);
+      await pinvoke('cap:setEnabled', true);
+      const escState = await peval(`(() => {
+        document.getElementById('extract').click();
+        const opened = !document.getElementById('modal').hidden;
+        window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+        return { opened, closed: document.getElementById('modal').hidden };
+      })()`);
+      const arrow = await peval(`(() => {
+        if (document.activeElement && document.activeElement.blur) document.activeElement.blur();
+        const kd = (key) => window.dispatchEvent(new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true }));
+        kd('ArrowDown');
+        const one = document.querySelector('#list .row.sel');
+        kd('ArrowDown');
+        const two = document.querySelector('#list .row.sel');
+        return { rows: document.querySelectorAll('#list .row').length, one: one && one.dataset.id, two: two && two.dataset.id };
+      })()`);
+      check('快捷键（Ctrl+P / Esc / 方向键）',
+        toggleAfter !== before && escState.opened && escState.closed && arrow.rows > 1 && arrow.two && arrow.one !== arrow.two,
+        `切换=${before}→${toggleAfter} 模态=${escState.opened}/${escState.closed} 选中=${arrow.one}→${arrow.two}`);
+    } catch (e) { check('快捷键（Ctrl+P / Esc / 方向键）', false, e.message); }
+
+    // 75 过滤语法
+    try {
+      const f = await peval(`(() => {
+        const rec = { id: 1, method: 'GET', url: 'http://127.0.0.1/x/api/data?a=1', type: 'XHR', status: 404, mime: 'application/json', size: 204800, duration: 650 };
+        return {
+          method: matchQuery(rec, 'method:get'),
+          status4xx: matchQuery(rec, 'status:4xx'),
+          statusGe: matchQuery(rec, 'status:>=400'),
+          statusLt: matchQuery(rec, 'status:<500'),
+          statusLtNo: matchQuery(rec, 'status:<300'),
+          type: matchQuery(rec, 'type:xhr'),
+          mime: matchQuery(rec, 'mime:json'),
+          domain: matchQuery(rec, 'domain:127.0.0.1'),
+          size: matchQuery(rec, 'size:>100k'),
+          time: matchQuery(rec, 'time:>500'),
+          andAll: matchQuery(rec, 'method:get status:4xx'),
+          andMiss: matchQuery(rec, 'method:get status:5xx'),
+          negTrue: matchQuery(rec, '!nomatch'),
+          negFalse: matchQuery(rec, '!data'),
+        };
+      })()`);
+      const ok = f.method && f.status4xx && f.statusGe && f.statusLt && !f.statusLtNo && f.type && f.mime && f.domain && f.size && f.time
+        && f.andAll && !f.andMiss && f.negTrue && !f.negFalse;
+      check('过滤语法（字段 / 比较 / 取反）', ok, JSON.stringify(f));
+    } catch (e) { check('过滤语法（字段 / 比较 / 取反）', false, e.message); }
+
+    // 76 列预设切换与落盘
+    try {
+      const colState = await peval(`(() => {
+        const sel = document.getElementById('colSet');
+        sel.value = 'dt';
+        sel.dispatchEvent(new Event('change', { bubbles: true }));
+        const z = document.querySelector('#list .row .z');
+        return { cols: document.getElementById('list').dataset.cols, zDisplay: z ? getComputedStyle(z).display : 'none', zText: z ? z.textContent : '' };
+      })()`);
+      await sleep(500);
+      store.flush();
+      const colOnDisk = JSON.parse(fs.readFileSync(store.filePath(), 'utf8'));
+      const restored = await peval(`(() => {
+        const sel = document.getElementById('colSet');
+        sel.value = 'd';
+        sel.dispatchEvent(new Event('change', { bubbles: true }));
+        return document.getElementById('list').dataset.cols;
+      })()`);
+      await sleep(500);
+      store.flush();
+      check('列预设切换与落盘',
+        colState.cols === 'dt' && colState.zDisplay !== 'none' && colState.zText.length > 0 && colOnDisk.settings.colSet === 'dt' && restored === 'd',
+        `列=${colState.cols} z=${colState.zDisplay} 落盘=${colOnDisk.settings.colSet} 恢复=${restored}`);
+    } catch (e) { check('列预设切换与落盘', false, e.message); }
+
+    // 77 导出筛选结果
+    try {
+      const oneRec = [...state.records].reverse().find((r) => r.url.startsWith(base));
+      const f77 = path.join(outDir, 'one.json');
+      const r77 = await pinvoke('cap:exportAll', [oneRec.id], f77);
+      const json = JSON.parse(fs.readFileSync(f77, 'utf8'));
+      check('导出筛选结果', r77.ok && json.requests.length === 1 && json.requests[0].id === oneRec.id && json.requestCount === 1,
+        `requests=${json.requests.length} id=${json.requests[0] && json.requests[0].id}`);
+    } catch (e) { check('导出筛选结果', false, e.message); }
+
+    // 78 Cookie 增删改
+    try {
+      const set1 = await pinvoke('cap:cookieSet', { url: base + '/', name: 'probe_ck', value: 'v1' });
+      const list1 = await pinvoke('cap:cookies');
+      const removed = await pinvoke('cap:cookieRemove', { url: base + '/', name: 'probe_ck' });
+      const list2 = await pinvoke('cap:cookies');
+      const had = (list1.cookies || []).some((c) => c.name === 'probe_ck' && c.value === 'v1');
+      const gone = !(list2.cookies || []).some((c) => c.name === 'probe_ck');
+      check('Cookie 增删改', set1.ok && had && removed.ok && gone, `设置=${set1.ok} 可见=${had} 删除=${gone}`);
+    } catch (e) { check('Cookie 增删改', false, e.message); }
+
+    // 79 Cookie 导入
+    try {
+      const imp = await pinvoke('cap:cookieImport', { text: 'a=1; b=2', url: base + '/' });
+      const list = await pinvoke('cap:cookies');
+      const names = (list.cookies || []).map((c) => c.name);
+      check('Cookie 导入（Cookie 头形式）', imp.ok && imp.added === 2 && names.includes('a') && names.includes('b'),
+        `added=${imp.added} 现有=${names.join(',')}`);
+      await pinvoke('cap:cookieRemove', { url: base + '/', name: 'a' });
+      await pinvoke('cap:cookieRemove', { url: base + '/', name: 'b' });
+    } catch (e) { check('Cookie 导入（Cookie 头形式）', false, e.message); }
+
+    // 80 Storage 编辑
+    try {
+      const setr = await pinvoke('cap:storageSet', { area: 'local', key: 'probe2', value: 'v2' });
+      const pd2 = await extract.collectPageData();
+      const seen = pd2.page.localStorage && pd2.page.localStorage.probe2 === 'v2';
+      const delr = await pinvoke('cap:storageRemove', { area: 'local', key: 'probe2' });
+      const pd3 = await extract.collectPageData();
+      const gone = !(pd3.page.localStorage || {}).probe2;
+      check('Storage 编辑', setr.ok && seen && delr.ok && gone, `写入=${seen} 删除=${gone}`);
+    } catch (e) { check('Storage 编辑', false, e.message); }
+
+    // 81 Netscape 导出
+    try {
+      const f81 = path.join(outDir, 'cookies.txt');
+      const r81 = await pinvoke('cap:exportCookies', { format: 'netscape', file: f81 });
+      const lines = fs.readFileSync(f81, 'utf8').split('\n');
+      const dataLine = lines.find((l) => l && !l.startsWith('#'));
+      check('Cookie Netscape 导出',
+        r81.ok && lines[0].includes('# Netscape HTTP Cookie File') && dataLine && dataLine.split('\t').length === 7,
+        `${lines.length} 行，字段数=${dataLine ? dataLine.split('\t').length : 0}`);
+    } catch (e) { check('Cookie Netscape 导出', false, e.message); }
+
+    // 82 重放改写
+    try {
+      const postRec = state.records.find((r) => r.method === 'POST' && r.postData === 'ping=1');
+      const rp = await capture.replay(postRec.id, { method: 'PUT', headers: 'X-Probe: 42' });
+      const seen = lastReq['/api/data'] || {};
+      check('重放改写（方法 / 请求头）', rp.ok && seen.method === 'PUT' && seen.headers && seen.headers['x-probe'] === '42',
+        `status=${rp.status} method=${seen.method} x-probe=${seen.headers && seen.headers['x-probe']}`);
+    } catch (e) { check('重放改写（方法 / 请求头）', false, e.message); }
+
+    // 83 请求头行解析
+    try {
+      const ok = format.parseHeaderLines('A: 1\nB:2');
+      const bad = format.parseHeaderLines('oops');
+      check('请求头行解析', ok.ok && ok.value.A === '1' && ok.value.B === '2' && bad.ok === false,
+        `${JSON.stringify(ok.value)} / ${bad.error}`);
+    } catch (e) { check('请求头行解析', false, e.message); }
+
+    // 84 请求体另存
+    try {
+      const postRec2 = state.records.find((r) => r.method === 'POST' && r.postData === 'ping=1');
+      const f84 = path.join(outDir, 'req.txt');
+      const r84 = await pinvoke('cap:saveBody', postRec2.id, 'request', f84);
+      check('请求体另存为文件', r84.ok && fs.readFileSync(f84, 'utf8') === 'ping=1', r84.error || f84);
+    } catch (e) { check('请求体另存为文件', false, e.message); }
+
+    // 85 可见区域截图
+    try {
+      const f85 = path.join(outDir, 'visible.png');
+      const r85 = await pinvoke('cap:screenshot', { mode: 'visible', file: f85 });
+      const buf = fs.readFileSync(f85);
+      check('可见区域截图', r85.ok && buf.slice(0, 4).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47])),
+        `${buf.length} 字节 ${r85.error || ''}`);
+    } catch (e) { check('可见区域截图', false, e.message); }
+
+    // 86 整页截图（高度超过视口）
+    try {
+      const f86 = path.join(outDir, 'full.png');
+      const r86 = await pinvoke('cap:screenshot', { mode: 'full', file: f86 });
+      const buf = fs.readFileSync(f86);
+      const h = buf.readUInt32BE(20);
+      const viewport = state.view.getBounds().height;
+      check('整页截图（超出视口）', r86.ok && h >= viewport, `高度=${h} 视口=${viewport} ${r86.error || ''}`);
+    } catch (e) { check('整页截图（超出视口）', false, e.message); }
+
+    // 87 打印为 PDF
+    try {
+      const f87 = path.join(outDir, 'page.pdf');
+      const r87 = await pinvoke('cap:pdf', { file: f87 });
+      const head = fs.readFileSync(f87).slice(0, 4).toString('latin1');
+      check('打印为 PDF', r87.ok && head === '%PDF', `${head} ${r87.error || ''}`);
+    } catch (e) { check('打印为 PDF', false, e.message); }
+
+    // 88 页面内查找
+    try {
+      const r88 = await pinvoke('cap:find', 'linkA', { forward: true });
+      const stop = await pinvoke('cap:findStop');
+      check('页面内查找', r88.ok && r88.matches >= 1 && stop.ok, `matches=${r88.matches} active=${r88.active}`);
+    } catch (e) { check('页面内查找', false, e.message); }
+
+    // 89 会话写盘
+    try {
+      const saved = session.saveSync();
+      const sessionOnDisk = JSON.parse(fs.readFileSync(session.filePath(), 'utf8'));
+      check('会话写盘', saved.ok && fs.existsSync(session.filePath()) && sessionOnDisk.records.length === Math.min(state.records.length, 2000),
+        `${sessionOnDisk.records.length} 条 / 内存 ${state.records.length} 条`);
+    } catch (e) { check('会话写盘', false, e.message); }
+
+    // 90 会话恢复（跨进程 + 面板横幅路径）
+    try {
+      const info = await pinvoke('cap:sessionInfo');
+      const restored = await pinvoke('cap:sessionRestore');
+      // 面板横幅「恢复」：渲染端 → IPC → 列表整表重建
+      await peval(`(() => {
+        showBanner('自检：发现上次会话', [{ id: 'restoreSession', label: '恢复', primary: true }, { id: 'discardSession', label: '忽略' }]);
+        document.querySelector('#bannerActions button').click();
+        return true;
+      })()`);
+      await waitFor(async () => (await peval('document.querySelectorAll("#list .row").length')) === restored.count && restored.count > 0,
+        8000, '横幅恢复列表').catch(() => {});
+      const uiRows = await peval('document.querySelectorAll("#list .row").length');
+      // 面板横幅「忽略」：删除会话文件
+      await peval(`(() => { document.querySelectorAll('#bannerActions button')[1].click(); return true; })()`);
+      await sleep(300);
+      const discarded = await pinvoke('cap:sessionInfo');
+      check('会话恢复',
+        info.exists === true && restored.ok && restored.count === Math.min(info.count, 2000) && restored.records.length === restored.count
+          && uiRows === restored.count && discarded.exists === false,
+        `exists=${info.exists} 写盘 ${info.count} 条 / 恢复 ${restored.count} 条 / 横幅渲染 ${uiRows} 行 / 忽略后存在=${discarded.exists}`);
+    } catch (e) { check('会话恢复', false, e.message); }
+
+    // 91 会话体积裁剪
+    try {
+      const fake = [];
+      for (let i = 0; i < 2500; i++) {
+        fake.push({
+          id: i + 1, cdpId: null, method: 'GET', url: `${base}/fake/${i}`, type: 'XHR', time: new Date().toISOString(),
+          startedAt: null, requestHeaders: {}, requestHeadersRaw: null, postData: null,
+          status: 200, statusText: 'OK', responseHeaders: null, responseHeadersRaw: null, mime: 'text/plain',
+          encodedDataLength: 40960, duration: 5,
+          body: 'y'.repeat(40960), bodyBase64: false, bodyError: null, failed: null,
+          remoteIP: '', protocol: '', redirects: [], note: '',
+        });
+      }
+      const real = state.records.slice();
+      state.records.length = 0;
+      for (const r of fake) state.records.push(r);
+      const res = session.saveSync();
+      const trimOnDisk = JSON.parse(fs.readFileSync(session.filePath(), 'utf8'));
+      const trimmed = trimOnDisk.records.filter((r) => r.body === null && String(r.bodyError || '').includes('体积上限'));
+      state.records.length = 0;
+      for (const r of real) state.records.push(r);
+      check('会话体积裁剪', res.ok && trimOnDisk.records.length <= 2000 && trimmed.length >= 1,
+        `${trimOnDisk.records.length} 条，省略响应体 ${trimmed.length} 条`);
+    } catch (e) { check('会话体积裁剪', false, e.message); }
+
+    // 92 请求间隔节奏（纯函数：注入时钟，同刻多次调用应逐次 +delay）
+    try {
+      settings.resetPacer(1000);
+      const w = [settings.nextPaceWait(100, 1000), settings.nextPaceWait(100, 1000), settings.nextPaceWait(100, 1000)];
+      const zeroDelay = settings.nextPaceWait(0, 5000);
+      settings.resetPacer(0);
+      const clockAhead = settings.nextPaceWait(100, 10000);     // 时钟已越过游标 → 不等待
+      settings.resetPacer(0);
+      check('请求间隔节奏（纯函数）',
+        w[0] === 0 && w[1] === 100 && w[2] === 200 && zeroDelay === 0 && clockAhead === 0,
+        `等待=${w.join('/')} 零间隔=${zeroDelay} 时钟超前=${clockAhead}`);
+    } catch (e) { check('请求间隔节奏（纯函数）', false, e.message); }
+
+    // 93 请求间隔节流（集成）
+    try {
+      await settings.applySetting('reqDelay', 300);
+      const before = (hitsAt['/api/data'] || []).length;
+      await reloadAndWait(wc, 200);
+      await waitFor(() => (hitsAt['/api/data'] || []).length - before >= 3, 20000, '节流页面三连请求').catch(() => {});
+      const times = (hitsAt['/api/data'] || []).slice(before);
+      const spread = times.length >= 2 ? times[times.length - 1] - times[0] : 0;
+      await settings.applySetting('reqDelay', 0);
+      check('请求间隔节流（集成）', times.length >= 3 && spread >= 500, `${times.length} 次命中，跨度 ${spread}ms`);
+    } catch (e) { check('请求间隔节流（集成）', false, e.message); }
+
+    // 94 新增设置持久化
+    try {
+      await settings.applySetting('reqDelay', 500);
+      await settings.applySetting('ignoreCertErrors', true);
+      await settings.applySetting('authUser', 'u');
+      await sleep(400);
+      store.flush();
+      const cfgOnDisk = JSON.parse(fs.readFileSync(store.filePath(), 'utf8')).settings;
+      const okPersist = cfgOnDisk.reqDelay === 500 && cfgOnDisk.ignoreCertErrors === true && cfgOnDisk.authUser === 'u';
+      await settings.applySetting('reqDelay', 0);
+      await settings.applySetting('ignoreCertErrors', false);
+      await settings.applySetting('authUser', '');
+      await sleep(400);
+      store.flush();
+      check('新增设置持久化', okPersist, `reqDelay=${cfgOnDisk.reqDelay} ignoreCert=${cfgOnDisk.ignoreCertErrors} authUser=${cfgOnDisk.authUser}`);
+    } catch (e) { check('新增设置持久化', false, e.message); }
+
+    // 95 多标签创建与隔离
+    try {
+      await pinvoke('cap:tabNew', `${base}/page/2?tab=2`);
+      await sleep(1800);
+      await pinvoke('cap:tabNew', `${base}/page/3?tab=3`);
+      await sleep(1800);
+      const tabs = await pinvoke('cap:tabList');
+      const per = [];
+      for (const t of tabs) {
+        await pinvoke('cap:tabActivate', t.id);
+        await sleep(400);
+        const l = await pinvoke('cap:list');
+        const marker = (String(l.url).match(/\?tab=\d+/) || [''])[0];
+        per.push({
+          id: t.id, url: l.url, count: l.records.length,
+          hasOwn: l.records.some((r) => r.url === l.url),
+          foreign: l.records.filter((r) => /\?tab=\d+/.test(r.url) && (!marker || !r.url.includes(marker))).length,
+        });
+      }
+      const bad = per.filter((p) => !p.hasOwn || p.foreign > 0);
+      check('多标签创建与隔离', tabs.length === 3 && bad.length === 0,
+        per.map((p) => `#${p.id}${p.url.replace(base, '')} ${p.count}条 foreign=${p.foreign}`).join(' | '));
+    } catch (e) { check('多标签创建与隔离', false, e.message); }
+
+    // 96 标签切换与关闭
+    try {
+      const tabs = await pinvoke('cap:tabList');
+      const first = tabs[0];
+      const ref = state.tabs.find((t) => t.id === first.id);
+      const act = await pinvoke('cap:tabActivate', first.id);
+      await sleep(300);
+      const l1 = await pinvoke('cap:list');
+      const switched = act.ok && l1.activeTabId === first.id;
+      const closed = await pinvoke('cap:tabClose', first.id);
+      await sleep(300);
+      const after = await pinvoke('cap:tabList');
+      const destroyed = !!(ref && ref.wc.isDestroyed());
+      await pinvoke('cap:navigate', `${base}/`);
+      await sleep(1500);
+      const l2 = await pinvoke('cap:list');
+      check('标签切换与关闭', switched && closed.ok && after.length === 2 && destroyed && l2.records.some((r) => r.url === `${base}/`),
+        `切换=${switched} 剩余=${after.length} 视图已销毁=${destroyed} 新标签记录=${l2.records.length}`);
+    } catch (e) { check('标签切换与关闭', false, e.message); }
+
+    // 97 标签栏 UI
+    try {
+      const tabs = await pinvoke('cap:tabList');
+      await sleep(300);
+      const ui = await peval(`(() => ({
+        strip: !!document.getElementById('tabstrip'),
+        list: !!document.getElementById('tabList'),
+        btn: !!document.getElementById('tabNew'),
+        chips: document.querySelectorAll('#tabstrip .tabchip').length,
+      }))()`);
+      check('标签栏 UI', ui.strip && ui.list && ui.btn && ui.chips === tabs.length, `chips=${ui.chips} tabs=${tabs.length}`);
+    } catch (e) { check('标签栏 UI', false, e.message); }
   } catch (e) {
     check('自检执行', false, `${e.message} | status=${state.status} attached=${wc.debugger.isAttached()}`);
   }

@@ -15,7 +15,14 @@ const values = {
   ua: '',                 // 空串 = 用 state.defaultUA
   headers: '',            // 'k=v;k=v'，空串 = 清除
   proxy: '',              // 'scheme://host:port'，空串 = 直连
+  colSet: 'd',            // 列表列预设 d | dt | t
+  reqDelay: 0,            // 请求最小间隔 ms（0 = 不限速）
+  ignoreCertErrors: false,
+  authUser: '',           // Basic 认证用户名（空 = 不自动应答）
+  authPass: '',           // Basic 认证密码（明文存盘，仅本地使用）
 };
+
+const MAX_REQ_DELAY = 10000;
 
 const ASSET_TYPES = new Set(['image', 'media', 'font']);
 const THROTTLE = {
@@ -50,21 +57,54 @@ function parseHeaders(s) {
   return { ok: true, value: out };
 }
 
+let pacerCursor = 0;   // 请求节奏游标（毫秒时间戳）
+
+function clampInt(v, min, max, dflt) {
+  const n = Number(v);
+  return Number.isFinite(n) ? Math.min(max, Math.max(min, Math.round(n))) : dflt;
+}
+
+// 当前节奏游标（自检观测/复位用）
+function pacerState() { return pacerCursor; }
+function resetPacer(now = 0) { pacerCursor = now; return pacerCursor; }
+
+// 纯节奏逻辑（注入时钟便于自检）：返回本次要等多少毫秒，并推进游标
+function nextPaceWait(delay, now) {
+  const d = clampInt(delay, 0, MAX_REQ_DELAY, 0);
+  if (!d) return 0;
+  const wait = Math.max(0, pacerCursor - now);
+  pacerCursor = Math.max(now, pacerCursor) + d;
+  return wait;
+}
+
+function decide(details) {
+  if (values.blockMode === 'assets') return { cancel: ASSET_TYPES.has(details.resourceType) };
+  if (values.blockMode === 'keywords') {
+    const kws = parseKeywords(values.blockKeywords);
+    return { cancel: kws.length > 0 && kws.some((k) => details.url.toLowerCase().includes(k)) };
+  }
+  return { cancel: false };
+}
+
+// 只有放行的请求才占用节奏槽；被拦截的请求不消耗间隔
+function release(details, cb) {
+  const d = decide(details);
+  if (d.cancel) return cb({ cancel: true });
+  const wait = nextPaceWait(values.reqDelay, Date.now());
+  if (!wait) return cb({});
+  setTimeout(() => cb({}), wait);
+}
+
 // 同一 session 的 onBeforeRequest 只能注册一个监听器，因此只在启动时注册一次。
 function registerBlocker() {
   session.fromPartition(PARTITION).webRequest.onBeforeRequest({ urls: ['*://*/*'] }, (details, cb) => {
-    if (values.blockMode === 'assets') return cb({ cancel: ASSET_TYPES.has(details.resourceType) });
-    if (values.blockMode === 'keywords') {
-      const kws = parseKeywords(values.blockKeywords);
-      return cb({ cancel: kws.length > 0 && kws.some((k) => details.url.toLowerCase().includes(k)) });
-    }
-    cb({});
+    release(details, cb);
   });
 }
 
-function viewWc() { return state.view && state.view.webContents; }
+function viewWc(target) { return target || (state.view && state.view.webContents); }
 
-async function applyInner(key, value) {
+async function applyInner(key, value, target) {
   switch (key) {
     case 'blockMode':
       if (!['none', 'assets', 'keywords'].includes(value)) return { ok: false, error: '未知拦截模式' };
@@ -79,9 +119,33 @@ async function applyInner(key, value) {
       values.recordOnly = !!value;
       return { ok: true };
 
+    case 'colSet':
+      if (!['d', 'dt', 't'].includes(value)) return { ok: false, error: '未知列预设' };
+      values.colSet = value;
+      return { ok: true };
+
+    case 'reqDelay': {
+      const n = Number(value);
+      if (!Number.isFinite(n) || n < 0 || n > MAX_REQ_DELAY) return { ok: false, error: `间隔应在 0–${MAX_REQ_DELAY}ms 之间` };
+      values.reqDelay = Math.round(n);
+      return { ok: true };
+    }
+
+    case 'ignoreCertErrors':
+      values.ignoreCertErrors = !!value;
+      return { ok: true };
+
+    case 'authUser':
+      values.authUser = String(value == null ? '' : value).trim();
+      return { ok: true };
+
+    case 'authPass':
+      values.authPass = String(value == null ? '' : value);
+      return { ok: true };
+
     case 'throttle': {
       if (!Object.prototype.hasOwnProperty.call(THROTTLE, value)) return { ok: false, error: '未知限速档位' };
-      const wc = viewWc();
+      const wc = viewWc(target);
       if (!wc || !wc.debugger.isAttached()) return { ok: false, error: 'CDP 未就绪' };
       try {
         await wc.debugger.sendCommand('Network.emulateNetworkConditions', Object.assign({ offline: false }, THROTTLE[value]));
@@ -91,7 +155,7 @@ async function applyInner(key, value) {
     }
 
     case 'ua': {
-      const wc = viewWc();
+      const wc = viewWc(target);
       if (!wc) return { ok: false, error: '视图未就绪' };
       const v = String(value == null ? '' : value).trim();
       wc.setUserAgent(v || state.defaultUA);
@@ -102,7 +166,7 @@ async function applyInner(key, value) {
     case 'headers': {
       const p = parseHeaders(value);
       if (!p.ok) return { ok: false, error: p.error };
-      const wc = viewWc();
+      const wc = viewWc(target);
       if (!wc || !wc.debugger.isAttached()) return { ok: false, error: 'CDP 未就绪' };
       try {
         await wc.debugger.sendCommand('Network.setExtraHTTPHeaders', { headers: p.value });
@@ -151,12 +215,13 @@ function hydrate() {
 }
 
 // 重启后重新应用不会自动恢复的项：UA / 请求头 / 限速 / 代理（其余由拦截器等实时读取）
-async function restoreRuntime() {
+// target 用于把设置应用到指定视图（新建标签时沿用当前设置）
+async function restoreRuntime(target) {
   const failed = [];
   for (const key of ['ua', 'headers', 'throttle', 'proxy']) {
     if (!values[key]) continue;
     try {
-      const r = await applyInner(key, values[key]);
+      const r = await applyInner(key, values[key], target);
       if (!r.ok) failed.push(`${key}: ${r.error}`);
     } catch (e) {
       failed.push(`${key}: ${e.message}`);
@@ -165,4 +230,7 @@ async function restoreRuntime() {
   return failed;
 }
 
-module.exports = { values, applySetting, applyInner, hydrate, restoreRuntime, registerBlocker, parseKeywords, parseHeaders };
+module.exports = {
+  values, applySetting, applyInner, hydrate, restoreRuntime, registerBlocker, parseKeywords, parseHeaders,
+  MAX_REQ_DELAY, nextPaceWait, resetPacer, pacerState, decide, release,
+};

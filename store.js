@@ -17,6 +17,7 @@ const DEFAULTS = {
   settings: {
     blockMode: 'none', blockKeywords: '', recordOnly: false,
     throttle: 'off', ua: '', headers: '', proxy: '',
+    colSet: 'd', reqDelay: 0, ignoreCertErrors: false, authUser: '', authPass: '',
   },
   app: { softwareRendering: false, panelWidth: 520, window: { width: 1440, height: 900, x: null, y: null } },
 };
@@ -55,11 +56,14 @@ function normalize(raw) {
   if (s && typeof s === 'object') {
     for (const k of Object.keys(out.settings)) if (s[k] !== undefined) out.settings[k] = s[k];
     out.settings.recordOnly = !!out.settings.recordOnly;
-    for (const k of ['blockMode', 'blockKeywords', 'throttle', 'ua', 'headers', 'proxy']) {
+    out.settings.ignoreCertErrors = !!out.settings.ignoreCertErrors;
+    out.settings.reqDelay = clampInt(out.settings.reqDelay, 0, 10000, 0);
+    for (const k of ['blockMode', 'blockKeywords', 'throttle', 'ua', 'headers', 'proxy', 'authUser', 'authPass']) {
       out.settings[k] = String(out.settings[k] == null ? '' : out.settings[k]);
     }
     if (!['none', 'assets', 'keywords'].includes(out.settings.blockMode)) out.settings.blockMode = 'none';
     if (!['off', '3g', 'slow'].includes(out.settings.throttle)) out.settings.throttle = 'off';
+    if (!['d', 'dt', 't'].includes(out.settings.colSet)) out.settings.colSet = 'd';
   }
 
   const a = raw.app;

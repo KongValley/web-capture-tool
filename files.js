@@ -47,7 +47,8 @@ function mimeExt(mime) {
 async function saveWithDialog(defaultName, content) {
   const r = await dialog.showSaveDialog(state.win, { defaultPath: path.join(app.getPath('downloads'), defaultName) });
   if (r.canceled || !r.filePath) return { ok: false, canceled: true };
-  await fs.writeFile(r.filePath, content, 'utf8');
+  if (typeof content === 'string') await fs.writeFile(r.filePath, content, 'utf8');
+  else await fs.writeFile(r.filePath, content);
   return { ok: true, file: r.filePath };
 }
 
@@ -59,6 +60,17 @@ async function saveTextFile({ defaultName, content, file } = {}) {
     return { ok: true, file };
   }
   return saveWithDialog(defaultName || 'export.txt', String(content == null ? '' : content));
+}
+
+// 与 saveTextFile 同形，但写 Buffer（截图 / PDF / base64 响应体）
+async function saveBinaryFile({ defaultName, buffer, file } = {}) {
+  const data = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer || '');
+  if (file) {
+    await fs.mkdir(path.dirname(file), { recursive: true });
+    await fs.writeFile(file, data);
+    return { ok: true, file };
+  }
+  return saveWithDialog(defaultName || 'export.bin', data);
 }
 
 async function saveBodies(dir) {
@@ -89,4 +101,4 @@ async function saveBodies(dir) {
   return { ok: true, dir: target, written, skipped };
 }
 
-module.exports = { sanitizeName, uniquePath, mimeExt, saveWithDialog, saveTextFile, saveBodies };
+module.exports = { sanitizeName, uniquePath, mimeExt, saveWithDialog, saveTextFile, saveBinaryFile, saveBodies };

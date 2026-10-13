@@ -10,15 +10,111 @@ let selected = null;
 let detailId = null;
 let view = 'list';
 
+const BODY_PREVIEW = 200 * 1024;          // 详情里文本响应体的预览上限
+const detailFull = new Set();             // 记录「已展开全文」的记录 id
+
+/* ---------------------------------------------------------- 面板宽度拖拽 */
+
+const PANEL_MIN = 320, PANEL_MAX = 1000;
+let dragging = false, dragRaf = 0;
+const applyPanelWidth = (w) => { $('panel').style.width = w + 'px'; };
+const readPanelWidth = () => Math.round($('panel').getBoundingClientRect().width);
+
+// mousedown/mousemove/mouseup（合成事件在自检里可用；Pointer Events 的 setPointerCapture 不能）
+$('splitter').addEventListener('mousedown', (e) => {
+  dragging = true;
+  $('splitter').classList.add('on');
+  e.preventDefault();
+});
+window.addEventListener('mousemove', (e) => {
+  if (!dragging) return;
+  const w = Math.max(PANEL_MIN, Math.min(PANEL_MAX, window.innerWidth - e.clientX));
+  applyPanelWidth(w);
+  if (dragRaf) return;
+  dragRaf = requestAnimationFrame(() => { dragRaf = 0; ipcRenderer.invoke('cap:panelWidth', readPanelWidth()); });
+});
+window.addEventListener('mouseup', () => {
+  if (!dragging) return;
+  dragging = false;
+  $('splitter').classList.remove('on');
+  ipcRenderer.invoke('cap:panelWidth', readPanelWidth());   // 收尾：主进程按最终宽度摆放视图并落盘
+});
+
 /* ------------------------------------------------------------- 列表渲染 */
 
 const statusClass = (s) => (s === 0 ? '' : s >= 500 ? 's5' : s >= 400 ? 's4' : s >= 300 ? 's3' : 's2');
 
+/* --------------------------------------------------------- 过滤语法（纯函数） */
+
+// 数字带 k/m 后缀：100k = 102400
+function parseNumToken(v) {
+  const m = /^(\d+(?:\.\d+)?)([km])?$/.exec(v);
+  if (!m) return null;
+  const mult = m[2] === 'k' ? 1024 : m[2] === 'm' ? 1048576 : 1;
+  return Number(m[1]) * mult;
+}
+
+// '>100k' / '>=400' / '<500' / '204'；没有比较符时是精确相等
+function cmpNumber(value, v) {
+  if (value == null) return false;
+  const c = /^(>=|<=|>|<)(.+)$/.exec(v);
+  const target = parseNumToken(c ? c[2] : v);
+  if (target == null) return false;
+  const n = Number(value);
+  if (!Number.isFinite(n)) return false;
+  if (!c) return n === target;
+  if (c[1] === '>=') return n >= target;
+  if (c[1] === '<=') return n <= target;
+  if (c[1] === '>') return n > target;
+  return n < target;
+}
+
+function matchStatus(status, v) {
+  const s = Number(status) || 0;
+  const klass = /^(\d)xx$/.exec(v);
+  if (klass) { const d = Number(klass[1]) * 100; return s >= d && s < d + 100; }
+  return cmpNumber(s, v);
+}
+
+function matchToken(rec, token) {
+  const i = token.indexOf(':');
+  if (i <= 0) return String(rec.url || '').toLowerCase().includes(token);
+  const key = token.slice(0, i);
+  const v = token.slice(i + 1);
+  switch (key) {
+    case 'method': return String(rec.method || '').toLowerCase() === v;
+    case 'status': return matchStatus(rec.status, v);
+    case 'type': return String(rec.type || '').toLowerCase() === v;
+    case 'mime': return String(rec.mime || '').toLowerCase().includes(v);
+    case 'domain': {
+      let h = '';
+      try { h = new URL(rec.url).hostname.toLowerCase(); } catch (e) { return false; }
+      return h === v || h.endsWith('.' + v);
+    }
+    case 'size': return cmpNumber(rec.size, v);
+    case 'time': return cmpNumber(rec.duration, v);
+    default: return String(rec.url || '').toLowerCase().includes(token);
+  }
+}
+
+// 空白切分，全部命中才算匹配（AND）；以 ! 开头的 token 取反
+function matchQuery(rec, query) {
+  const q = String(query == null ? '' : query).trim().toLowerCase();
+  if (!q) return true;
+  for (const part of q.split(/\s+/)) {
+    if (!part) continue;
+    const neg = part.startsWith('!');
+    const token = neg ? part.slice(1) : part;
+    if (!token) continue;
+    const hit = matchToken(rec, token);
+    if (neg ? hit : !hit) return false;
+  }
+  return true;
+}
+
 function matches(rec) {
-  const f = el.filter.value.trim().toLowerCase();
   if (el.type.value && rec.type !== el.type.value) return false;
-  if (!f) return true;
-  return rec.url.toLowerCase().includes(f) || rec.method.toLowerCase().includes(f) || rec.type.toLowerCase().includes(f);
+  return matchQuery(rec, el.filter.value);
 }
 
 function visible(node) { return node.style.display !== 'none'; }
@@ -26,12 +122,22 @@ function visible(node) { return node.style.display !== 'none'; }
 function makeRow(rec) {
   const node = document.createElement('div');
   node.className = 'row';
-  node.innerHTML = '<span class="m"></span><span class="s"></span><span class="u"></span><span class="t"></span>';
+  node.dataset.id = rec.id;
+  node.innerHTML = '<span class="m"></span><span class="s"></span><span class="u"></span><span class="t"></span><span class="z"></span>';
   node.onclick = () => select(rec.id);
   return node;
 }
 
+function humanSize(n) {
+  if (n == null) return '';
+  if (n < 1024) return n + 'B';
+  if (n < 1048576) return (n / 1024).toFixed(1) + 'K';
+  return (n / 1048576).toFixed(1) + 'M';
+}
+
 function paintRow(node, rec) {
+  const mode = $('colSet').value;
+  el.list.dataset.cols = mode;
   node.dataset.m = rec.method;
   node.children[0].textContent = rec.method;
   const s = node.children[1];
@@ -39,8 +145,17 @@ function paintRow(node, rec) {
   s.className = 's ' + statusClass(rec.status);
   node.children[2].textContent = rec.url;
   node.title = rec.url;
-  node.children[3].textContent = rec.duration != null ? rec.duration + 'ms' : rec.type;
-  node.children[3].className = 't' + (rec.failed ? ' s4' : '');
+  const t = node.children[3];
+  const z = node.children[4];
+  if (mode === 't') {
+    t.textContent = String(rec.time || '').slice(11, 19);
+    z.textContent = '';
+  } else {
+    t.textContent = rec.duration != null ? rec.duration + 'ms' : rec.type;
+    z.textContent = mode === 'dt' ? `${rec.type} ${humanSize(rec.size)}` : '';
+  }
+  t.className = 't' + (rec.failed ? ' s4' : '');
+  z.className = 'z';
 }
 
 function appendRecord(rec) {
@@ -62,7 +177,7 @@ function updateRecord(rec) {
   r.rec = rec;
   paintRow(r.node, rec);
   r.node.style.display = matches(rec) ? '' : 'none';
-  if (selected === rec.id) renderDetail(rec.id);
+  if (selected === rec.id) scheduleDetailRender(rec.id);
   updateCounts();
 }
 
@@ -73,7 +188,13 @@ function updateCounts() {
   $('count').textContent = rows.size;
 }
 
-function refilter() { for (const { rec, node } of rows.values()) node.style.display = matches(rec) ? '' : 'none'; updateCounts(); }
+function refilter() {
+  for (const { rec, node } of rows.values()) {
+    paintRow(node, rec);                              // 列预设可能刚切换，逐行重画
+    node.style.display = matches(rec) ? '' : 'none';
+  }
+  updateCounts();
+}
 
 /* ------------------------------------------------------------- 详情渲染 */
 
@@ -98,12 +219,22 @@ function bodyBlock(r) {
   if (r.body == null) return `<h3>响应体</h3><pre class="muted">（无 / 未捕获）</pre>`;
   if (r.bodyBase64) {
     const kb = Math.round((r.body.length * 3) / 4096);
-    return `<h3>响应体（二进制 ≈${kb}KB）</h3><pre class="muted">base64 已保存在「导出全部」的 JSON 与「响应体存盘」的文件中，此处不展开。</pre>`;
+    return `<h3>响应体（二进制）</h3><pre class="muted">二进制 ≈${kb}KB，不在此展开</pre>` +
+      '<div class="dbar"><button id="bodySave">另存为文件</button></div>';
   }
-  return `<h3>响应体</h3><pre>${esc(r.body)}</pre>`;
+  const big = r.body.length > BODY_PREVIEW;
+  const expanded = !!detailFull.has(r.id);
+  const shown = big && !expanded ? r.body.slice(0, BODY_PREVIEW) : r.body;
+  const size = (r.body.length / 1048576).toFixed(1);
+  const note = !big ? '' : expanded
+    ? `<div class="lbl">已展开全部 ${size}MB</div>`
+    : `<div class="lbl">已截断显示前 200KB（完整 ${size}MB）</div>`;
+  return `<h3>响应体</h3><pre>${esc(shown)}</pre>${note}` +
+    `<div class="dbar"><button id="bodySave">另存为文件</button>${big ? `<button id="bodyToggle">${expanded ? '收起' : '查看全文'}</button>` : ''}</div>`;
 }
 
 function renderDetail(id) {
+  window.__detailRenders = (window.__detailRenders || 0) + 1;   // 自检观测点
   const entry = rows.get(id);
   detailId = id;
   el.detail.classList.add('on');
@@ -111,7 +242,7 @@ function renderDetail(id) {
   ipcRenderer.invoke('cap:detail', id).then((d) => {
     if (!d) { el.detail.innerHTML = '<div class="empty">未找到记录 #' + esc(id) + '</div>'; return; }
     el.detail.innerHTML =
-      `<div class="dbar"><button id="copyCurl">复制 cURL</button><button id="replayReq">重放请求</button></div>` +
+      `<div class="dbar"><button id="copyCurl">复制 cURL</button><button id="replayReq">重放请求</button><button id="expOne">导出此条</button><button id="saveReq">请求体另存</button></div>` +
       `<h3>概要</h3><pre><span class="kv">URL     </span>${esc(d.url)}
 <span class="kv">方法    </span>${esc(d.method)}  <span class="kv">状态</span> ${esc(d.status)} ${esc(d.statusText)}
 <span class="kv">类型    </span>${esc(d.type)}  <span class="kv">MIME</span> ${esc(d.mime)}
@@ -127,12 +258,26 @@ function renderDetail(id) {
 }
 
 function select(id) {
+  clearTimeout(detailTimer);
+  detailTimer = null;
+  detailDirty = false;
   if (selected && rows.has(selected)) rows.get(selected).node.classList.remove('sel');
   selected = id;
   if (rows.has(id)) rows.get(id).node.classList.add('sel');
   view = 'list';
   syncTabs();
   renderDetail(id);
+}
+
+// 抓包事件密集时详情会被反复重建，统一节流到 200ms
+let detailTimer = null, detailDirty = false;
+function scheduleDetailRender(id) {
+  detailDirty = true;
+  if (detailTimer) return;
+  detailTimer = setTimeout(() => {
+    detailTimer = null;
+    if (detailDirty) { detailDirty = false; renderDetail(id); }
+  }, 200);
 }
 
 /* --------------------------------------------------------------- 视图切换 */
@@ -142,6 +287,50 @@ function syncTabs() {
   el.list.classList.toggle('on', view === 'list');
   el.ws.classList.toggle('on', view === 'ws');
   el.detail.classList.toggle('on', view === 'list' && selected != null);
+}
+
+/* -------------------------------------------------------------- 多标签 */
+
+function renderTabs(list, activeId) {
+  const box = $('tabList');
+  box.innerHTML = '';
+  for (const t of list || []) {
+    const chip = document.createElement('div');
+    chip.className = 'tabchip' + (t.id === activeId ? ' on' : '');
+    chip.title = t.url || '';
+    const label = document.createElement('span');
+    label.className = 't';
+    label.textContent = String(t.title || t.url || '(新标签)').slice(0, 40);
+    chip.appendChild(label);
+    const x = document.createElement('span');
+    x.className = 'x';
+    x.textContent = '✕';
+    x.title = '关闭标签';
+    x.onclick = (e) => { e.stopPropagation(); ipcRenderer.invoke('cap:tabClose', t.id); };
+    chip.appendChild(x);
+    chip.onclick = () => ipcRenderer.invoke('cap:tabActivate', t.id);
+    box.appendChild(chip);
+  }
+}
+
+// 整表刷新（切换标签 / 恢复会话后）：记录、WebSocket、标签条、状态一次同步
+function refreshActiveList(d) {
+  rows.clear();
+  el.list.innerHTML = '<div class="empty">等待抓取…</div>';
+  el.ws.innerHTML = '';
+  el.detail.innerHTML = '';
+  selected = null;
+  detailId = null;
+  $('nWs').textContent = '0';
+  (d.records || []).forEach(appendRecord);
+  (d.wsFrames || []).forEach(appendWs);
+  updateCounts();
+  renderTabs(d.tabs, d.activeTabId);
+  if (d.url && d.url !== 'about:blank') $('url').value = d.url;
+  toggleState = d.enabled;
+  $('toggle').textContent = d.enabled ? '暂停' : '继续';
+  $('status').textContent = d.status;
+  syncTabs();
 }
 
 /* -------------------------------------------------------------- WebSocket */
@@ -219,6 +408,251 @@ function dataTable(cols, rows) {
   return table;
 }
 
+// 空表壳（表头 + tbody），用于需要输入控件 / 按钮的表格
+function makeTable(cols) {
+  const table = document.createElement('table');
+  const thead = document.createElement('thead');
+  const htr = document.createElement('tr');
+  for (const c of cols) { const th = document.createElement('th'); th.textContent = c; htr.appendChild(th); }
+  thead.appendChild(htr);
+  table.appendChild(thead);
+  const tbody = document.createElement('tbody');
+  table.appendChild(tbody);
+  return { table, tbody };
+}
+
+function tdText(v) {
+  const td = document.createElement('td');
+  td.textContent = v == null ? '' : String(v);
+  return td;
+}
+
+function tdInput(value, onChange) {
+  const td = document.createElement('td');
+  const inp = document.createElement('input');
+  inp.value = value == null ? '' : String(value);
+  inp.style.width = '100%';
+  inp.addEventListener('change', () => onChange(inp));
+  td.appendChild(inp);
+  return td;
+}
+
+function tdBtn(label, onClick) {
+  const td = document.createElement('td');
+  const b = document.createElement('button');
+  b.textContent = label;
+  b.onclick = onClick;
+  td.appendChild(b);
+  return td;
+}
+
+function sectionTitle(text) {
+  const d = document.createElement('div');
+  d.className = 'lbl';
+  d.style.margin = '10px 0 4px';
+  d.textContent = text;
+  return d;
+}
+
+function cookieUrl(c) {
+  return 'https://' + String(c.domain || '').replace(/^\./, '') + (c.path || '/');
+}
+
+function cookieAttrs(c) {
+  const d = {};
+  if (c.domain) d.domain = c.domain;
+  if (c.path) d.path = c.path;
+  if (c.secure != null) d.secure = !!c.secure;
+  if (c.httpOnly != null) d.httpOnly = !!c.httpOnly;
+  if (c.expirationDate) d.expirationDate = c.expirationDate;
+  return d;
+}
+
+function originOf(url) {
+  try { const u = new URL(url); return u.protocol + '//' + u.host + '/'; } catch (e) { return ''; }
+}
+
+/* ---- 会话数据：Cookie / Storage / 页面信息（写操作后整体刷新，界面与进程内一致）---- */
+
+function cookieRow(c, refresh) {
+  const tr = document.createElement('tr');
+  tr.appendChild(tdText(c.name));
+  tr.appendChild(tdText(c.domain));
+  tr.appendChild(tdText(c.path));
+  tr.appendChild(tdInput(c.value, async (inp) => {
+    const r = await ipcRenderer.invoke('cap:cookieSet', Object.assign({ url: cookieUrl(c), name: c.name, value: inp.value }, cookieAttrs(c)));
+    if (!r || !r.ok) {
+      toast('修改失败：' + ((r && r.error) || '未知错误'), 'err');
+      inp.value = c.value == null ? '' : String(c.value);
+      return;
+    }
+    refresh();
+  }));
+  tr.appendChild(tdText(c.secure ? '是' : ''));
+  tr.appendChild(tdText(c.httpOnly ? '是' : ''));
+  tr.appendChild(tdBtn('删除', async () => {
+    const r = await ipcRenderer.invoke('cap:cookieRemove', { url: cookieUrl(c), name: c.name });
+    if (!r || !r.ok) return toast('删除失败：' + ((r && r.error) || '未知错误'), 'err');
+    refresh();
+  }));
+  return tr;
+}
+
+function storageTable(area, obj) {
+  const t = makeTable(['键', '值', '操作']);
+  for (const [k, v] of Object.entries(obj || {})) {
+    const tr = document.createElement('tr');
+    tr.appendChild(tdText(k));
+    tr.appendChild(tdInput(v, async (inp) => {
+      const r = await ipcRenderer.invoke('cap:storageSet', { area, key: k, value: inp.value });
+      if (!r || !r.ok) {
+        toast('修改失败：' + ((r && r.error) || '未知错误'), 'err');
+        inp.value = v == null ? '' : String(v);
+        return;
+      }
+      openSessionData();
+    }));
+    tr.appendChild(tdBtn('删除', async () => {
+      const r = await ipcRenderer.invoke('cap:storageRemove', { area, key: k });
+      if (!r || !r.ok) return toast('删除失败：' + ((r && r.error) || '未知错误'), 'err');
+      openSessionData();
+    }));
+    t.tbody.appendChild(tr);
+  }
+  const tr = document.createElement('tr');
+  const kIn = document.createElement('input');
+  const vIn = document.createElement('input');
+  kIn.placeholder = '键';
+  vIn.placeholder = '值';
+  kIn.style.width = '100%';
+  vIn.style.width = '100%';
+  const tdKey = document.createElement('td');
+  tdKey.appendChild(kIn);
+  const tdVal = document.createElement('td');
+  tdVal.appendChild(vIn);
+  tr.appendChild(tdKey);
+  tr.appendChild(tdVal);
+  tr.appendChild(tdBtn('新增', async () => {
+    const r = await ipcRenderer.invoke('cap:storageSet', { area, key: kIn.value.trim(), value: vIn.value });
+    if (!r || !r.ok) return toast('新增失败：' + ((r && r.error) || '未知错误'), 'err');
+    openSessionData();
+  }));
+  t.tbody.appendChild(tr);
+  return t.table;
+}
+
+async function openSessionData() {
+  const [pd, ck] = await Promise.all([ipcRenderer.invoke('cap:pageData'), ipcRenderer.invoke('cap:cookies')]);
+  const origin = originOf(pd.url);
+  const cookies = (ck && ck.cookies) || [];
+  const box = document.createElement('div');
+
+  const info = document.createElement('pre');
+  info.textContent = `当前页：${pd.title || '(无标题)'}\nURL：${pd.url}\nHTML：${pd.htmlLength} 字符\n\ndocument.cookie：\n${pd.page.cookies || '(空)'}`;
+  box.appendChild(info);
+
+  const bar = document.createElement('div');
+  bar.className = 'dbar';
+  const mkBtn = (label, fn) => { const b = document.createElement('button'); b.textContent = label; b.onclick = fn; bar.appendChild(b); return b; };
+  mkBtn('新增', () => {
+    const nameIn = document.createElement('input');
+    const valIn = document.createElement('input');
+    openModal('新增 Cookie', [labelled('名称', nameIn), labelled('值', valIn)], [
+      { label: '提交', primary: true, onClick: async () => {
+        if (!origin) return toast('当前页面不是 http(s) 页面，无法添加 Cookie', 'warn');
+        const r = await ipcRenderer.invoke('cap:cookieSet', { url: origin, name: nameIn.value.trim(), value: valIn.value });
+        if (!r || !r.ok) return toast('添加失败：' + ((r && r.error) || '未知错误'), 'err');
+        toast('已添加 ' + nameIn.value.trim(), 'ok');
+        openSessionData();
+      } },
+      { label: '取消', onClick: () => openSessionData() },
+    ]);
+  });
+  mkBtn('导入', () => {
+    const ta = textarea('a=1; b=2 或 JSON 数组；Cookie 头形式会挂到当前页 origin', '');
+    openModal('导入 Cookie', [labelled('内容', ta)], [
+      { label: '导入', primary: true, onClick: async () => {
+        const r = await ipcRenderer.invoke('cap:cookieImport', { text: ta.value, url: origin });
+        if (!r || !r.ok) return toast('导入失败：' + ((r && r.error) || '未知错误'), 'err');
+        const bad = (r.failed || []).length;
+        toast(`已导入 ${r.added} 条${bad ? `，失败 ${bad} 条` : ''}`, bad ? 'warn' : 'ok');
+        openSessionData();
+      } },
+      { label: '取消', onClick: () => openSessionData() },
+    ]);
+  });
+  mkBtn('刷新', () => openSessionData());
+
+  box.appendChild(sectionTitle(`Cookie（${cookies.length} 条）`));
+  box.appendChild(bar);
+  const ct = makeTable(['名称', '域', '路径', '值', 'Secure', 'HttpOnly', '操作']);
+  for (const c of cookies) ct.tbody.appendChild(cookieRow(c, openSessionData));
+  box.appendChild(ct.table);
+
+  box.appendChild(sectionTitle(`localStorage（${Object.keys(pd.page.localStorage || {}).length} 项）`));
+  box.appendChild(storageTable('local', pd.page.localStorage));
+  box.appendChild(sectionTitle(`sessionStorage（${Object.keys(pd.page.sessionStorage || {}).length} 项）`));
+  box.appendChild(storageTable('session', pd.page.sessionStorage));
+
+  openModal('会话数据', [box], [
+    { label: '导出 Cookie JSON', onClick: () => exportResult(ipcRenderer.invoke('cap:exportCookies', { format: 'json' })) },
+    { label: '导出 Cookie Netscape', onClick: () => exportResult(ipcRenderer.invoke('cap:exportCookies', { format: 'netscape' })) },
+    { label: '关闭', primary: true, onClick: closeModal },
+  ]);
+}
+
+/* ---- 重放请求：可改写方法 / URL / 请求头 / 请求体 ---- */
+
+async function openReplayModal() {
+  if (detailId == null) return;
+  const d = await ipcRenderer.invoke('cap:detail', detailId);
+  if (!d) return toast('记录不存在', 'err');
+  const hd = await ipcRenderer.invoke('cap:format', 'reqHeaders', detailId);
+
+  const methodIn = document.createElement('input');
+  methodIn.value = d.method || 'GET';
+  const urlIn = document.createElement('input');
+  urlIn.value = d.url || '';
+  const headersTa = textarea('每行 名称: 值', hd && hd.ok ? hd.text : '');
+  const bodyTa = textarea('请求体', d.postData || '');
+  bodyTa.id = 'replayBody';
+  const out = document.createElement('pre');
+  out.id = 'replayOut';
+  out.hidden = true;
+
+  const send = async () => {
+    out.hidden = false;
+    out.textContent = '重放中…';
+    $('status').textContent = '重放中…';
+    const r = await ipcRenderer.invoke('cap:replay', detailId, {
+      method: methodIn.value.trim(), url: urlIn.value.trim(),
+      headers: headersTa.value, body: bodyTa.value,
+    });
+    const text = r.ok
+      ? `${r.status} ${r.statusText}  ${r.tookMs}ms${r.truncated ? '（响应体已截断到 1MB）' : ''}\n${JSON.stringify(r.headers, null, 2)}\n\n${r.body}`
+      : '重放失败：' + r.error;
+    out.textContent = text;
+    $('status').textContent = r.ok ? `重放完成：${r.status}` : '重放失败';
+    const h = document.createElement('h3');
+    h.textContent = '重放结果';
+    const pre = document.createElement('pre');
+    pre.textContent = text;
+    el.detail.appendChild(h);
+    el.detail.appendChild(pre);
+  };
+
+  openModal('重放请求', [
+    labelled('方法', methodIn),
+    labelled('URL', urlIn),
+    labelled('请求头（每行 名称: 值）', headersTa),
+    labelled('请求体', bodyTa),
+    out,
+  ], [
+    { id: 'replaySend', label: '发送', primary: true, onClick: send },
+    { label: '取消', onClick: closeModal },
+  ]);
+}
+
 /* ---------------------------------------------------------------- 轻提示 */
 
 // 非阻塞提示：最多同时 4 条，超出移除最早的一条
@@ -232,6 +666,41 @@ function toast(msg, kind = 'info', ms = 4000) {
   setTimeout(() => div.remove(), ms);
   return div;
 }
+
+/* ------------------------------------------------------------ 键盘快捷键 */
+
+function stepSelection(delta) {
+  const nodes = [...el.list.querySelectorAll('.row')].filter(visible);
+  if (!nodes.length) return;
+  let idx = nodes.findIndex((n) => Number(n.dataset.id) === selected);
+  if (idx < 0) idx = delta > 0 ? -1 : 0;
+  const node = nodes[Math.max(0, Math.min(nodes.length - 1, idx + delta))];
+  if (!node) return;
+  select(Number(node.dataset.id));
+  node.scrollIntoView({ block: 'nearest' });
+}
+
+// 只注册这一个 keydown 监听；Ctrl+R / Ctrl+Shift+I 留给 Electron 默认菜单
+function onKey(e) {
+  const tag = (document.activeElement && document.activeElement.tagName) || '';
+  const typing = tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT';
+  if (e.ctrlKey && !e.shiftKey && !e.altKey) {
+    const k = e.key.toLowerCase();
+    if (k === 'l') { e.preventDefault(); $('url').focus(); $('url').select(); return; }
+    if (k === 'f') { e.preventDefault(); $('filter').focus(); $('filter').select(); return; }
+    if (k === 'p') { e.preventDefault(); $('toggle').click(); return; }
+    return;
+  }
+  if (e.key === 'Escape') {
+    if (!$('modal').hidden) { closeModal(); return; }
+    if (!$('findbar').hidden) { $('findbar').hidden = true; ipcRenderer.invoke('cap:findStop'); return; }
+    if (document.activeElement && document.activeElement.blur) document.activeElement.blur();
+    return;
+  }
+  if (typing) return;
+  if (e.key === 'ArrowDown' || e.key === 'ArrowUp') { e.preventDefault(); stepSelection(e.key === 'ArrowDown' ? 1 : -1); }
+}
+window.addEventListener('keydown', onKey);
 
 /* ------------------------------------------------------------ 保存与导出 */
 
@@ -266,15 +735,16 @@ $('clear').onclick = () => ipcRenderer.invoke('cap:clear').then(() => {
 $('toggle').onclick = () => ipcRenderer.invoke('cap:setEnabled', !toggleState).then((v) => {
   toggleState = v; $('toggle').textContent = v ? '暂停' : '继续';
 });
-$('pageData').onclick = () => ipcRenderer.invoke('cap:pageData').then((d) => {
-  const pre = document.createElement('pre');
-  pre.textContent = `当前页：${d.title || '(无标题)'}\nURL：${d.url}\nHTML：${d.htmlLength} 字符\nCookie：${d.cookies.length} 条\nlocalStorage：${Object.keys(d.page.localStorage || {}).length} 项\nsessionStorage：${Object.keys(d.page.sessionStorage || {}).length} 项\n\ndocument.cookie：\n${d.page.cookies || '(空)'}`;
-  openModal('页面数据', [pre], [{ label: '关闭', onClick: closeModal }]);
-});
+$('pageData').onclick = () => openSessionData();
 $('expAll').onclick = () => exportResult(ipcRenderer.invoke('cap:exportAll'));
+$('expFiltered').onclick = () => {
+  const ids = [...el.list.querySelectorAll('.row')].filter(visible).map((n) => Number(n.dataset.id));
+  if (!ids.length) return toast('当前没有筛选项', 'warn');
+  exportResult(ipcRenderer.invoke('cap:exportAll', ids));
+};
 $('expHtml').onclick = () => exportResult(ipcRenderer.invoke('cap:exportHtml'));
 $('expCookie').onclick = () => exportResult(ipcRenderer.invoke('cap:exportCookieJson'));
-$('expHar').onclick = () => exportResult(ipcRenderer.invoke('cap:exportHar'));
+$('expHar').onclick = () => exportResult(ipcRenderer.invoke('cap:exportHar', {}));
 $('modalClose').onclick = closeModal;
 
 /* ---- 详情：复制 cURL / 重放（详情 HTML 每次重建，只能事件委托）---- */
@@ -287,18 +757,26 @@ el.detail.addEventListener('click', async (e) => {
     clipboard.writeText(r.text);
     $('status').textContent = '已复制 cURL 到剪贴板';
   } else if (id === 'replayReq') {
+    openReplayModal();
+  } else if (id === 'saveReq') {
     if (detailId == null) return;
-    $('status').textContent = '重放中…';
-    const r = await ipcRenderer.invoke('cap:replay', detailId);
-    const h = document.createElement('h3');
-    h.textContent = '重放结果';
-    const pre = document.createElement('pre');
-    pre.textContent = r.ok
-      ? `${r.status} ${r.statusText}  ${r.tookMs}ms${r.truncated ? '（响应体已截断到 1MB）' : ''}\n${JSON.stringify(r.headers, null, 2)}\n\n${r.body}`
-      : '重放失败：' + r.error;
-    el.detail.appendChild(h);
-    el.detail.appendChild(pre);
-    $('status').textContent = r.ok ? `重放完成：${r.status}` : '重放失败';
+    const r = await ipcRenderer.invoke('cap:saveBody', detailId, 'request');
+    if (r && r.ok) toast('已保存：' + r.file, 'ok');
+    else if (r && r.canceled) $('status').textContent = '已取消保存';
+    else toast('保存失败：' + ((r && r.error) || '未知错误'), 'err');
+  } else if (id === 'expOne') {
+    if (detailId == null) return;
+    exportResult(ipcRenderer.invoke('cap:exportAll', [detailId]));
+  } else if (id === 'bodyToggle') {
+    if (detailId == null) return;
+    if (detailFull.has(detailId)) detailFull.delete(detailId); else detailFull.add(detailId);
+    renderDetail(detailId);
+  } else if (id === 'bodySave') {
+    if (detailId == null) return;
+    const r = await ipcRenderer.invoke('cap:saveBody', detailId, 'response');
+    if (r && r.ok) toast('已保存：' + r.file, 'ok');
+    else if (r && r.canceled) $('status').textContent = '已取消保存';
+    else toast('保存失败：' + ((r && r.error) || '未知错误'), 'err');
   }
 });
 
@@ -324,6 +802,8 @@ $('recordOnly').addEventListener('change', () => cfg('recordOnly', $('recordOnly
 $('throttle').addEventListener('change', () => cfg('throttle', $('throttle').value));
 $('headers').addEventListener('change', () => cfg('headers', $('headers').value));
 $('proxy').addEventListener('change', () => cfg('proxy', $('proxy').value));
+$('colSet').addEventListener('change', () => { refilter(); cfg('colSet', $('colSet').value); });
+$('reqDelay').addEventListener('change', () => cfg('reqDelay', +$('reqDelay').value));
 $('uaSel').addEventListener('change', () => {
   const v = $('uaSel').value;
   const custom = v === 'custom';
@@ -418,6 +898,65 @@ $('harvest').onclick = async () => {
   ]);
 };
 
+/* ---- 页面内查找 ---- */
+async function doFind(forward) {
+  const text = $('findText').value;
+  if (!text) { $('findCount').textContent = ''; return; }
+  const r = await ipcRenderer.invoke('cap:find', text, { forward });
+  $('findCount').textContent = r && r.ok ? `${r.active || 0}/${r.matches}` : ((r && r.error) || '');
+}
+
+$('findPage').onclick = () => {
+  const bar = $('findbar');
+  bar.hidden = !bar.hidden;
+  if (bar.hidden) { ipcRenderer.invoke('cap:findStop'); $('findCount').textContent = ''; }
+  else $('findText').focus();
+};
+$('findText').addEventListener('input', () => doFind(true));
+$('findText').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') { e.preventDefault(); doFind(!e.shiftKey); }
+});
+$('findNext').onclick = () => doFind(true);
+$('findPrev').onclick = () => doFind(false);
+$('findClose').onclick = () => { $('findbar').hidden = true; ipcRenderer.invoke('cap:findStop'); };
+
+/* ---- 截图 / PDF ---- */
+$('pageTools').onclick = () => {
+  const sel = document.createElement('input');
+  sel.placeholder = 'CSS 选择器（按选择器截图时用）';
+  const out = document.createElement('pre');
+  out.id = 'pageToolOut';
+  out.hidden = true;
+  const show = (r, verb) => {
+    out.hidden = false;
+    if (r && r.ok) {
+      out.textContent = `${verb}完成：${r.file}`;
+      toast(`${verb}完成：${r.file}`, 'ok', 7000);
+    } else if (r && r.canceled) {
+      out.textContent = '已取消保存';
+    } else {
+      out.textContent = `${verb}失败：${(r && r.error) || '未知错误'}`;
+      toast(`${verb}失败：${(r && r.error) || '未知错误'}`, 'err');
+    }
+  };
+  const shot = async (mode) => {
+    out.hidden = false;
+    out.textContent = '处理中…';
+    show(await ipcRenderer.invoke('cap:screenshot', { mode, selector: sel.value.trim() }), '截图');
+  };
+  openModal('页面工具', [labelled('选择器（留空 = 整页）', sel), out], [
+    { label: '可见区域截图', onClick: () => shot('visible') },
+    { label: '整页截图', primary: true, onClick: () => shot('full') },
+    { label: '按选择器截图', onClick: () => shot('element') },
+    { label: '打印为 PDF', onClick: async () => {
+      out.hidden = false;
+      out.textContent = '处理中…';
+      show(await ipcRenderer.invoke('cap:pdf', {}), 'PDF');
+    } },
+    { label: '关闭', onClick: closeModal },
+  ]);
+};
+
 /* ---- 响应体存盘 ---- */
 $('saveBodies').onclick = () => ipcRenderer.invoke('cap:saveBodies').then((r) => {
   if (!r) return;
@@ -429,6 +968,7 @@ $('saveBodies').onclick = () => ipcRenderer.invoke('cap:saveBodies').then((r) =>
 /* ---- 应用设置：软件渲染 / GPU 状态 ---- */
 async function openAppSettings() {
   const gs = await ipcRenderer.invoke('cap:gpuStatus');
+  const cfgAll = await ipcRenderer.invoke('cap:cfgAll');
   const box = document.createElement('div');
 
   const hint = document.createElement('div');
@@ -468,22 +1008,111 @@ GPU 进程异常次数：${gs.crashes}
 只有驱动缺失、显卡过老（不满足 D3D11）或虚拟机/远程桌面才会落到软件渲染。`;
   box.appendChild(info);
 
+  /* 兼容：证书 / Basic 认证 */
+  const compatTitle = document.createElement('div');
+  compatTitle.className = 'lbl';
+  compatTitle.textContent = '兼容';
+  compatTitle.style.margin = '10px 0 4px';
+  box.appendChild(compatTitle);
+
+  const certRow = document.createElement('label');
+  certRow.className = 'lbl';
+  const cert = document.createElement('input');
+  cert.type = 'checkbox';
+  cert.id = 'ignoreCert';
+  cert.checked = !!cfgAll.ignoreCertErrors;
+  cert.onchange = async () => {
+    const r = await ipcRenderer.invoke('cap:cfg', { key: 'ignoreCertErrors', value: cert.checked });
+    if (!r || !r.ok) { toast('设置失败：' + ((r && r.error) || '未知错误'), 'err'); cert.checked = !cert.checked; }
+  };
+  certRow.appendChild(cert);
+  certRow.appendChild(document.createTextNode(' 忽略证书错误'));
+  box.appendChild(certRow);
+  const certWarn = document.createElement('div');
+  certWarn.className = 'lbl';
+  certWarn.textContent = '仅用于内网自签名站点，会降低连接安全性';
+  box.appendChild(certWarn);
+
+  const uIn = document.createElement('input');
+  uIn.id = 'authUser';
+  uIn.value = cfgAll.authUser || '';
+  uIn.placeholder = '用户名';
+  uIn.onchange = () => cfg('authUser', uIn.value);
+  const pIn = document.createElement('input');
+  pIn.id = 'authPass';
+  pIn.type = 'password';
+  pIn.value = cfgAll.authPass || '';
+  pIn.placeholder = '密码';
+  pIn.onchange = () => cfg('authPass', pIn.value);
+  box.appendChild(labelled('Basic 认证用户名', uIn));
+  box.appendChild(labelled('Basic 认证密码（明文保存在 settings.json，仅本地使用）', pIn));
+
+  const logTitle = document.createElement('div');
+  logTitle.className = 'lbl';
+  logTitle.textContent = '诊断日志（最近 200 行）';
+  logTitle.style.margin = '10px 0 4px';
+  const logPre = document.createElement('pre');
+  logPre.id = 'logTail';
+  const refreshLog = () => ipcRenderer.invoke('cap:logTail').then((r) => {
+    logPre.textContent = (r && r.ok && r.text) || '(暂无日志)';
+  });
+  refreshLog();
+  box.appendChild(logTitle);
+  box.appendChild(logPre);
+
   openModal('设置', [box], [
     { label: '立即重启', onClick: () => ipcRenderer.invoke('cap:restart') },
+    { id: 'logRefresh', label: '刷新日志', onClick: refreshLog },
+    { id: 'logOpen', label: '打开日志所在文件夹', onClick: () => ipcRenderer.invoke('cap:openLog') },
     { label: '关闭', primary: true, onClick: closeModal },
   ]);
 }
 
 $('appSettings').onclick = openAppSettings;
 $('bannerClose').onclick = () => { $('banner').hidden = true; };
-ipcRenderer.on('cap:banner', (_e, b) => {
-  $('bannerText').textContent = b.text;
-  const act = $('bannerAction');
-  const isRestart = b.action === 'restart';
-  act.textContent = isRestart ? '立即重启' : '打开设置';
-  act.onclick = () => { if (isRestart) ipcRenderer.invoke('cap:restart'); else openAppSettings(); };
+
+function showBanner(text, actions) {
+  $('bannerText').textContent = text;
+  const box = $('bannerActions');
+  box.innerHTML = '';
+  for (const a of actions || []) {
+    const btn = document.createElement('button');
+    btn.textContent = a.label;
+    if (a.primary) btn.className = 'primary';
+    btn.onclick = () => bannerAction(a.id);
+    box.appendChild(btn);
+  }
   $('banner').hidden = false;
-});
+}
+
+async function bannerAction(id) {
+  if (id === 'restart') return ipcRenderer.invoke('cap:restart');
+  if (id === 'settings') return openAppSettings();
+  if (id === 'restoreSession') {
+    const r = await ipcRenderer.invoke('cap:sessionRestore');
+    if (!r || !r.ok) return toast('恢复失败：' + ((r && r.error) || '未知错误'), 'err');
+    rows.clear();
+    el.list.innerHTML = '<div class="empty">等待抓取…</div>';
+    el.ws.innerHTML = '';
+    el.detail.innerHTML = '';
+    selected = null;
+    detailId = null;
+    $('nWs').textContent = '0';
+    r.records.forEach(appendRecord);
+    (r.wsFrames || []).forEach(appendWs);
+    updateCounts();
+    $('banner').hidden = true;
+    toast(`已恢复 ${r.count} 条记录`, 'ok');
+    return undefined;
+  }
+  if (id === 'discardSession') {
+    $('banner').hidden = true;
+    await ipcRenderer.invoke('cap:sessionDiscard');
+  }
+  return undefined;
+}
+
+ipcRenderer.on('cap:banner', (_e, b) => showBanner(b.text, b.actions));
 
 async function navigate(input) {
   const r = await ipcRenderer.invoke('cap:navigate', input);
@@ -506,21 +1135,18 @@ ipcRenderer.on('cap:navigated', (_e, d) => {
   $('fwd').disabled = !d.canGoForward;
 });
 
+$('tabNew').onclick = () => ipcRenderer.invoke('cap:tabNew');
+ipcRenderer.on('cap:tabs', (_e, d) => renderTabs(d && d.tabs, d && d.activeTabId));
+ipcRenderer.on('cap:tabChanged', async () => refreshActiveList(await ipcRenderer.invoke('cap:list')));
+
 /* -------------------------------------------------------------- 初始化 */
 
 let toggleState = true;
 (async () => {
   const d = await ipcRenderer.invoke('cap:list');
-  toggleState = d.enabled;
-  $('toggle').textContent = d.enabled ? '暂停' : '继续';
-  $('status').textContent = d.status;
-  if (d.url && d.url !== 'about:blank') $('url').value = d.url;
-  // 同步面板宽度：主进程按 panelWidth 摆放原生视图
-  await ipcRenderer.invoke('cap:panelWidth', $('panel').offsetWidth);
-  d.records.forEach(appendRecord);
-  (d.wsFrames || []).forEach(appendWs);
-  updateCounts();
-  syncTabs();
+  // 按持久化宽度摆放面板（主进程已按同一数值摆放原生视图；不要再回传，否则会反向覆盖）
+  applyPanelWidth(Math.max(PANEL_MIN, Math.min(PANEL_MAX, d.panelWidth || 520)));
+  refreshActiveList(d);
 
   // 回填爬虫设置控件
   const cfgAll = await ipcRenderer.invoke('cap:cfgAll');
@@ -530,9 +1156,22 @@ let toggleState = true;
   $('throttle').value = cfgAll.throttle;
   $('headers').value = cfgAll.headers;
   $('proxy').value = cfgAll.proxy;
+  $('colSet').value = cfgAll.colSet || 'd';
+  refilter();
+  $('reqDelay').value = Number.isFinite(Number(cfgAll.reqDelay)) ? Number(cfgAll.reqDelay) : 0;
   if (cfgAll.ua) {
     const preset = Object.keys(UA_PRESETS).find((k) => UA_PRESETS[k] === cfgAll.ua);
     if (preset) $('uaSel').value = preset;
     else { $('uaSel').value = 'custom'; $('uaCustom').hidden = false; $('uaCustom').value = cfgAll.ua; }
+  }
+
+  // 上次会话可恢复 → 横幅提示
+  const si = await ipcRenderer.invoke('cap:sessionInfo');
+  if (si && si.exists) {
+    const when = si.savedAt ? new Date(si.savedAt).toLocaleString() : '未知时间';
+    showBanner(`发现上次会话（${si.count} 条记录，保存于 ${when}）`, [
+      { id: 'restoreSession', label: '恢复', primary: true },
+      { id: 'discardSession', label: '忽略' },
+    ]);
   }
 })();

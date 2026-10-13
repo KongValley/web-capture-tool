@@ -59,7 +59,7 @@
   button.ghost:hover:not(:disabled) { background: var(--elev); }
   :focus-visible { outline: none; box-shadow: 0 0 0 2px var(--accent-dim); }
 
-  /* 工具栏（三行高度必须与 state.js 的 TOOLBAR_H = 124 一致） */
+  /* 工具栏（四行高度必须与 state.js 的 TOOLBAR_H = 164 一致） */
   #toolbar {
     height: 44px; display: flex; align-items: center; gap: 6px; padding: 0 8px;
     border-bottom: 1px solid var(--line); background: var(--panel);
@@ -70,6 +70,22 @@
     overflow-x: auto; overflow-y: hidden; white-space: nowrap;
   }
   .lbl { color: var(--muted); font-size: 12px; flex: none; }
+
+  /* 标签栏（第四行，全宽；高度计入 TOOLBAR_H） */
+  #tabstrip {
+    height: 40px; display: flex; align-items: center; gap: 6px; padding: 0 8px;
+    border-bottom: 1px solid var(--line); background: var(--panel); overflow-x: auto; overflow-y: hidden;
+  }
+  #tabList { display: flex; gap: 4px; }
+  .tabchip {
+    display: flex; align-items: center; gap: 6px; height: 28px; max-width: 220px; padding: 0 8px;
+    border: 1px solid var(--line); border-radius: var(--radius-sm); background: var(--elev);
+    cursor: pointer; font-size: 12px; flex: none;
+  }
+  .tabchip.on { background: var(--sel); border-color: var(--accent); }
+  .tabchip .t { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .tabchip .x { color: var(--muted); }
+  .tabchip .x:hover { color: var(--err); }
   .num { width: 58px; }
   .sep { width: 1px; height: 20px; background: var(--line); margin: 0 2px; flex: none; }
   .chip {
@@ -81,12 +97,15 @@
   #status { color: var(--muted); font-size: 12px; max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   #count { color: var(--accent); font-variant-numeric: tabular-nums; font-weight: 600; }
 
-  #body { height: calc(100% - 124px); display: flex; }
+  #body { height: calc(100% - 164px); display: flex; }
   #pageArea { flex: 1; min-width: 0; }
   #panel {
-    width: 520px; flex: none; display: flex; flex-direction: column;
+    width: 520px; flex: none; display: flex; flex-direction: column; position: relative;
     border-left: 1px solid var(--line); background: var(--panel);
   }
+  /* 拖拽条必须在面板内部：原生视图盖在左侧区域之上，放到外面收不到鼠标事件 */
+  #splitter { position: absolute; left: 0; top: 0; bottom: 0; width: 6px; z-index: 6; cursor: col-resize; background: transparent; }
+  #splitter:hover, #splitter.on { background: var(--accent-dim); }
 
   /* GPU/软件渲染提示条 */
   #banner {
@@ -95,6 +114,7 @@
     color: var(--warn); font-size: 12px;
   }
   #bannerText { flex: 1; min-width: 0; }
+  #bannerActions { display: flex; gap: 6px; flex: none; }
   #banner button { height: 22px; font-size: 12px; }
 
   #panelHead { display: flex; gap: 6px; padding: 6px; border-bottom: 1px solid var(--line); }
@@ -102,6 +122,8 @@
   #tabs { display: flex; gap: 2px; padding: 0 6px; border-bottom: 1px solid var(--line); }
   .tab { border-radius: var(--radius-sm) var(--radius-sm) 0 0; border-bottom: none; }
   .tab.on { background: var(--bg); border-color: var(--accent); }
+  #findbar { display: flex; align-items: center; gap: 6px; padding: 6px; border-bottom: 1px solid var(--line); }
+  #findText { flex: 1; min-width: 40px; }
   #list { flex: 1; overflow: auto; scrollbar-gutter: stable; }
   .row {
     display: flex; align-items: center; gap: 6px; height: 26px; padding: 0 8px;
@@ -123,6 +145,9 @@
   .row .s { width: 34px; flex: none; text-align: right; }
   .row .u { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; direction: rtl; text-align: left; }
   .row .t { width: 62px; flex: none; color: var(--muted); text-align: right; }
+  .row .z { width: 96px; flex: none; color: var(--muted); text-align: right; overflow: hidden; text-overflow: ellipsis; }
+  #list[data-cols="d"] .z, #list[data-cols="t"] .z { display: none; }
+  #list[data-cols="t"] .t { width: 66px; }
   .s2 { color: var(--ok); } .s3 { color: var(--warn); } .s4, .s5 { color: var(--err); }
   .muted { color: var(--muted); }
 
@@ -191,7 +216,7 @@
     <button id="toggle" title="暂停/继续抓取">暂停</button>
     <button id="clear" title="清空已抓取记录">清空</button>
     <span class="sep"></span>
-    <button id="pageData" title="读取当前页 HTML / Cookie / Storage">页面数据</button>
+    <button id="pageData" title="管理 Cookie / localStorage / sessionStorage，查看页面数据">会话数据</button>
     <button id="expAll" title="导出全部：页面数据 + Cookie + 请求记录 + WebSocket 帧">导出全部</button>
     <button id="expHtml" title="保存当前页 HTML">导出 HTML</button>
     <button id="expCookie" title="保存 Cookie 为 JSON">导出 Cookie</button>
@@ -231,6 +256,9 @@
     <span class="sep"></span>
     <span class="lbl">代理</span>
     <input id="proxy" type="text" placeholder="socks5://127.0.0.1:1080" style="width:170px">
+    <span class="sep"></span>
+    <span class="lbl">间隔</span>
+    <input id="reqDelay" class="num" type="number" min="0" max="10000" step="100" value="0" title="请求最小间隔 ms（礼貌抓取）">
   </div>
 
   <div id="toolbar3">
@@ -247,32 +275,54 @@
     <button id="extract">CSS 提取</button>
     <button id="harvest">页面清单</button>
     <span class="sep"></span>
+    <button id="findPage" title="在页面内查找文本">页面查找</button>
+    <button id="pageTools" title="截图 / 打印为 PDF">截图/PDF</button>
+    <span class="sep"></span>
     <button id="saveBodies">响应体存盘</button>
     <button id="expHar">导出 HAR</button>
+    <button id="expFiltered" title="导出当前列表里筛出来的记录">导出筛选结果</button>
     <span class="sep"></span>
     <button id="appSettings" class="ghost" title="应用设置：软件渲染 / GPU 状态">设置</button>
+  </div>
+
+  <div id="tabstrip">
+    <div id="tabList"></div>
+    <button id="tabNew" class="ghost" title="新建标签">＋</button>
   </div>
 
   <div id="body">
     <div id="pageArea"><!-- 原生 BrowserView 覆盖在此区域之上 --></div>
     <div id="panel">
+      <div id="splitter" title="拖动调整面板宽度"></div>
       <div id="banner" hidden>
         <span id="bannerText"></span>
-        <button id="bannerAction" class="primary"></button>
+        <span id="bannerActions"></span>
         <button id="bannerClose" class="ghost">忽略</button>
       </div>
       <div id="panelHead">
-        <input id="filter" placeholder="过滤 URL / 方法 / 类型">
+        <input id="filter" placeholder="过滤：url 子串 / method:post / status:4xx / type:xhr / mime:json / domain:x / size:&gt;100k / time:&gt;500（前缀 ! 取反）">
         <select id="typeFilter">
           <option value="">全部类型</option>
           <option>XHR</option><option>Fetch</option><option>Document</option>
           <option>Script</option><option>Stylesheet</option><option>Image</option>
           <option>Media</option><option>Font</option><option>WebSocket</option><option>Other</option>
         </select>
+        <select id="colSet" title="列表列">
+          <option value="d">方法·状态·URL·耗时</option>
+          <option value="dt">附加类型·大小</option>
+          <option value="t">时间戳</option>
+        </select>
       </div>
       <div id="tabs">
         <button class="tab on" data-view="list">请求 <span id="nReq">0</span></button>
         <button class="tab" data-view="ws">WebSocket <span id="nWs">0</span></button>
+      </div>
+      <div id="findbar" hidden>
+        <input id="findText" placeholder="页面内查找">
+        <button id="findPrev" title="上一个">↑</button>
+        <button id="findNext" title="下一个">↓</button>
+        <span id="findCount" class="lbl"></span>
+        <button id="findClose" class="ghost" title="结束查找">✕</button>
       </div>
       <div id="list"><div class="empty">等待抓取…</div></div>
       <div id="ws"></div>

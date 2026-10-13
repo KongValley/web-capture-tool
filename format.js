@@ -32,6 +32,23 @@ function headerValue(list, name) {
 
 const SKIP_CURL = new Set(['content-length', 'host']);
 
+// 请求头文本 → { name: value }：每行按第一个 ':' 切分；空行跳过
+function parseHeaderLines(text) {
+  const out = {};
+  let bad = 0;
+  for (const line of String(text == null ? '' : text).split('\n')) {
+    const t = line.trim();
+    if (!t) continue;
+    const i = t.indexOf(':');
+    if (i <= 0) { bad++; continue; }
+    const k = t.slice(0, i).trim();
+    if (!k) { bad++; continue; }
+    out[k] = t.slice(i + 1).trim();
+  }
+  if (!Object.keys(out).length && bad) return { ok: false, error: '请求头格式应为 名称: 值（每行一个）' };
+  return { ok: true, value: out };
+}
+
 function shellQuote(s) {
   return "'" + String(s).replace(/'/g, "'\\''") + "'";
 }
@@ -127,6 +144,6 @@ function buildHar(records, title) {
 }
 
 module.exports = {
-  mergedHeaders, requestHeaderList, responseHeaderList, headerValue,
+  mergedHeaders, requestHeaderList, responseHeaderList, headerValue, parseHeaderLines,
   buildCurl, csvEscape, rowsToCsv, tablesToCsv, buildHar,
 };

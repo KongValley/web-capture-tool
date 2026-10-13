@@ -14,12 +14,14 @@
  * 模块：state.js 共享状态 / capture.js 抓取 / extract.js 页面提取 / 其余见各文件头。
  * 依赖方向单向：所有模块 require('./state')，禁止任何模块 require main.js。
  */
-const { app, BrowserWindow, BrowserView, ipcMain, session, screen } = require('electron');
+const { app, BrowserWindow, BrowserView, ipcMain, session, screen, shell } = require('electron');
 const path = require('node:path');
 const os = require('node:os');
 
-const { PARTITION, TOOLBAR_H, state, send, setStatus, normalizeUrl } = require('./state');
+const { PARTITION, TOOLBAR_H, state, send, setStatus, normalizeUrl, syncActive, resetActive } = require('./state');
 const store = require('./store');
+const logger = require('./logger');
+const sessionStore = require('./session');
 const gpu = require('./gpu');
 const capture = require('./capture');
 const extract = require('./extract');
@@ -32,9 +34,23 @@ const ICON = path.join(__dirname, 'build', 'icon.ico');
 if (process.platform === 'win32') app.setAppUserModelId('com.kongvalley.web-capture-tool');
 
 // 自检改道到临时配置，绝不碰用户真实配置；随后同步读盘（后续默认值都从这里取）
-if (state.selftest) store.useFile(path.join(os.tmpdir(), 'wct-selftest-settings', 'settings.json'));
+if (state.selftest) {
+  store.useFile(path.join(os.tmpdir(), 'wct-selftest-settings', 'settings.json'));
+  logger.useFile(path.join(os.tmpdir(), 'wct-selftest-logs', 'app.log'));
+  sessionStore.useFile(path.join(os.tmpdir(), 'wct-selftest-session', 'last.json'));
+}
 const boot = store.load();
 state.panelWidth = boot.app.panelWidth;
+
+/* ------------------------------------------------------- 异常兜底与日志 */
+
+// 未捕获异常一律记日志并提示，不退出进程（抓取任务不应因一次异常整体崩掉）
+process.on('uncaughtException', (e) => {
+  logger.log('fatal', (e && e.stack) || String(e));
+  setStatus(`内部错误：${(e && e.message) || e}（详见日志）`);
+});
+process.on('unhandledRejection', (r) => logger.log('reject', (r && r.stack) || String(r)));
+app.on('render-process-gone', (_e, _wc, d) => logger.log('render-gone', `${(d && d.reason) || ''} exitCode=${(d && d.exitCode) || 0}`));
 
 // 软件渲染：必须在 app ready 之前决定（disableHardwareAcceleration 只在此阶段有效）
 const forcedSoftware = process.argv.includes('--software-rendering');
@@ -91,7 +107,7 @@ function offerSoftware(reason, persist = true) {
   }
   send('cap:banner', {
     text: persist ? `${reason}，已切换为软件渲染（重启后生效）` : `${reason}，建议在「设置」里开启软件渲染`,
-    action: persist ? 'restart' : 'settings',
+    actions: persist ? [{ id: 'restart', label: '立即重启', primary: true }] : [{ id: 'settings', label: '打开设置' }],
   });
 }
 
@@ -111,12 +127,128 @@ function checkGpuOnce() {
 function watchGpu() {
   app.on('child-process-gone', (_e, details) => {
     if (!details || details.type !== 'GPU') return;
+    logger.log('gpu', `${details.type} ${details.reason}`);
     state.gpuCrashes++;
     if (state.softwareMode) return;
     // 第一次只提示；反复崩溃且 GPU 状态确实不可用时才落盘
     if (state.gpuCrashes >= 2 && gpu.statusLooksSoftware(gpu.currentStatus())) offerSoftware('GPU 进程反复异常退出');
     else offerSoftware('GPU 进程异常退出', false);
   });
+}
+
+/* ------------------------------------------------------------------ 标签 */
+
+let tabSeq = 0;
+
+function tabList() {
+  return state.tabs.map((t) => ({
+    id: t.id, title: t.title, url: t.url, active: t === state.activeTab, count: t.records.length,
+  }));
+}
+
+function tabsPayload() {
+  return { tabs: tabList(), activeTabId: state.activeTab ? state.activeTab.id : null };
+}
+
+// 新建标签：建视图 → 激活 → 空导航挂 CDP → 载入目标 URL（目标首次加载不能漏抓）
+function newTab(url = 'about:blank') {
+  const win = state.win;
+  if (!win || win.isDestroyed()) return null;
+  const target = String(url || 'about:blank');
+  const view = new BrowserView({
+    webPreferences: {
+      partition: PARTITION,
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+      webSecurity: true,
+      backgroundThrottling: false,   // 后台标签继续跑自动化与抓包
+    },
+  });
+  const tab = {
+    id: ++tabSeq, view, wc: view.webContents,
+    title: '', url: target,
+    records: [], byId: new Map(), pendingExtra: new Map(),
+    wsFrames: [], seq: 0, storedBytes: 0, enabled: state.enabled,
+  };
+  state.tabs.push(tab);
+  view.setBackgroundColor('#ffffff');
+
+  const wc = tab.wc;
+  if (!state.defaultUA) state.defaultUA = wc.getUserAgent();
+  wc.setWindowOpenHandler(({ url: u }) => {            // target=_blank / window.open 留在同一标签
+    const n = normalizeUrl(u);
+    if (n) wc.loadURL(n).catch(() => {});
+    return { action: 'deny' };
+  });
+  wc.on('did-navigate', (_e, u) => {
+    tab.url = u;
+    tab.title = wc.getTitle();
+    if (tab === state.activeTab) send('cap:navigated', { url: u, canGoBack: wc.canGoBack(), canGoForward: wc.canGoForward() });
+    send('cap:tabs', tabsPayload());
+  });
+  wc.on('did-navigate-in-page', (_e, u, isMainFrame) => {
+    if (!isMainFrame) return;
+    tab.url = u;
+    if (tab === state.activeTab) send('cap:navigated', { url: u, canGoBack: wc.canGoBack(), canGoForward: wc.canGoForward() });
+  });
+  wc.on('did-finish-load', () => {
+    tab.title = wc.getTitle();
+    send('cap:tabs', tabsPayload());
+  });
+  wc.on('did-fail-load', (_e, code, desc, u, isMainFrame) => {
+    if (isMainFrame && code !== -3) {
+      logger.log('load', `${code} ${desc} ${u}`);
+      setStatus(`加载失败 ${code} ${desc} ${u}`);
+    }
+  });
+
+  activateTab(tab);
+  // 渲染进程是惰性创建的：先空导航让 CDP 目标就绪，挂上抓取后再真正导航，目标的首次加载才不会漏抓
+  wc.loadURL('about:blank')
+    .then(async () => {
+      const ok = await capture.attachCapture(tab);
+      if (!ok) return;
+      const failed = await settings.restoreRuntime(wc);   // 该标签沿用当前 UA/请求头/限速（重启后恢复）
+      if (failed.length) setStatus(`部分设置恢复失败：${failed.join('；')}`);
+      if (target !== 'about:blank') await wc.loadURL(target);
+    })
+    .catch((e) => setStatus(`初始化失败：${e.message}`));
+  return tab;
+}
+
+function activateTab(tab) {
+  if (!tab) return;
+  syncActive(tab);
+  const { win } = state;
+  if (win && !win.isDestroyed()) {
+    win.setBrowserView(tab.view);
+    layout();
+  }
+  send('cap:tabChanged', { id: tab.id });
+  send('cap:tabs', tabsPayload());
+}
+
+function closeTab(id) {
+  const idx = state.tabs.findIndex((t) => t.id === id);
+  if (idx < 0) return { ok: false, error: '标签不存在' };
+  const tab = state.tabs[idx];
+  const wasActive = state.activeTab === tab;
+  state.tabs.splice(idx, 1);
+  // 先把窗口切到相邻标签，再销毁旧视图（避免窗口短暂挂着一个已销毁的 BrowserView）
+  if (wasActive) {
+    const next = state.tabs[Math.min(idx, state.tabs.length - 1)];
+    if (next) activateTab(next);
+  }
+  try {
+    // BrowserView 的 webContents：close() 只是走 window.close() 流程，实测不会销毁（渲染进程会残留），
+    // destroy() 在 Electron 22 运行时存在且真正释放；类型定义里没有，所以做存在性兜底。
+    if (typeof tab.wc.destroy === 'function') tab.wc.destroy();
+    else tab.wc.close();
+  } catch (e) { logger.log('tab', `关闭标签失败：${e.message}`); }
+  if (!state.tabs.length) newTab();          // 最后一个标签关掉后回到全新标签
+  send('cap:tabs', tabsPayload());
+  return { ok: true };
 }
 
 function createWindow() {
@@ -131,58 +263,38 @@ function createWindow() {
       nodeIntegration: true,
       contextIsolation: false,
       sandbox: false,
+      backgroundThrottling: false,   // 窗口被遮挡时面板仍要按点刷新（节流计时器、轻提示）
     },
   }));
   state.win = win;
   win.loadFile(path.join(__dirname, 'index.html'));
+  // 窗口创建时的 setBounds 早于窗口真正显示，Chromium 会把它落在 0 高度的视口上；
+  // 面板加载完成 = 窗口已显示，此时重排一次，页面视口才拿到真实高度。
+  win.webContents.once('did-finish-load', layout);
   win.on('resize', layout);
   win.on('resize', rememberBounds);
   win.on('move', rememberBounds);
   win.on('closed', () => { state.win = null; });
 
-  const view = new BrowserView({
-    webPreferences: {
-      partition: PARTITION,
-      contextIsolation: true,
-      nodeIntegration: false,
-      sandbox: true,
-      webSecurity: true,
-    },
-  });
-  state.view = view;
-  view.setBackgroundColor('#ffffff');
-  win.setBrowserView(view);
-  layout();
-
-  const wc = view.webContents;
-  state.defaultUA = wc.getUserAgent();
-  wc.setWindowOpenHandler(({ url }) => {            // target=_blank / window.open 留在同一视图
-    const u = normalizeUrl(url);
-    if (u) wc.loadURL(u).catch(() => {});
-    return { action: 'deny' };
-  });
-  wc.on('did-navigate', (_e, url) => send('cap:navigated', { url, canGoBack: wc.canGoBack(), canGoForward: wc.canGoForward() }));
-  wc.on('did-navigate-in-page', (_e, url, isMainFrame) => { if (isMainFrame) send('cap:navigated', { url, canGoBack: wc.canGoBack(), canGoForward: wc.canGoForward() }); });
-  wc.on('did-fail-load', (_e, code, desc, url, isMainFrame) => {
-    if (isMainFrame && code !== -3) setStatus(`加载失败 ${code} ${desc} ${url}`);
-  });
-
-  // 渲染进程是惰性创建的：必须先有一次导航，CDP 目标才存在，否则 sendCommand 会一直挂起。
-  wc.loadURL('about:blank')
-    .then(async () => {
-      const ok = await capture.attachCapture(wc);
-      if (!ok) return;
-      const failed = await settings.restoreRuntime();   // 重启后恢复 UA/请求头/限速/代理
-      if (failed.length) setStatus(`部分设置恢复失败：${failed.join('；')}`);
-    })
-    .catch((e) => setStatus(`初始化失败：${e.message}`));
+  newTab();
   return win;
 }
 
 /* -------------------------------------------------------------- 导出组装 */
 
-async function buildExport() {
+// Cookie 的统一字段映射（面板、导出、会话数据模态共用一份）
+function mapCookie(c) {
+  return {
+    name: c.name, value: c.value, domain: c.domain, path: c.path,
+    secure: c.secure, httpOnly: c.httpOnly, session: c.session,
+    sameSite: c.sameSite, expirationDate: c.expirationDate,
+  };
+}
+
+async function buildExport(ids) {
   const pd = await extract.collectPageData();
+  const set = Array.isArray(ids) && ids.length ? new Set(ids) : null;
+  const list = set ? state.records.filter((r) => set.has(r.id)) : state.records;
   return {
     exportedAt: new Date().toISOString(),
     url: pd.url,
@@ -194,8 +306,8 @@ async function buildExport() {
     })),
     storage: { localStorage: pd.page.localStorage || {}, sessionStorage: pd.page.sessionStorage || {}, documentCookie: pd.page.cookies || '' },
     html: pd.html,
-    requestCount: state.records.length,
-    requests: state.records.map(capture.fullRecord),
+    requestCount: list.length,
+    requests: list.map(capture.fullRecord),
     webSocketFrames: state.wsFrames,
   };
 }
@@ -209,6 +321,7 @@ function registerIpc() {
     status: state.status, enabled: state.enabled, panelWidth: state.panelWidth,
     url: state.view ? state.view.webContents.getURL() : '',
     title: state.view ? state.view.webContents.getTitle() : '',
+    tabs: tabList(), activeTabId: state.activeTab ? state.activeTab.id : null,
   }));
   ipcMain.handle('cap:detail', (_e, id) => {
     const r = state.records.find((x) => x.id === id);
@@ -218,15 +331,19 @@ function registerIpc() {
     const url = normalizeUrl(input);
     if (!url) return { ok: false, error: '请输入网址' };
     try { await state.view.webContents.loadURL(url); return { ok: true }; }
-    catch (e) { return { ok: false, error: e.message }; }
+    catch (e) { logger.log('ipc', `cap:navigate: ${e.message}`); return { ok: false, error: e.message }; }
   });
   ipcMain.handle('cap:back', () => { const wc = state.view.webContents; if (wc.canGoBack()) wc.goBack(); return true; });
   ipcMain.handle('cap:forward', () => { const wc = state.view.webContents; if (wc.canGoForward()) wc.goForward(); return true; });
   ipcMain.handle('cap:reload', () => { state.view.webContents.reload(); return true; });
-  ipcMain.handle('cap:setEnabled', (_e, v) => { state.enabled = !!v; setStatus(state.enabled ? '抓取中' : '已暂停'); return state.enabled; });
+  ipcMain.handle('cap:setEnabled', (_e, v) => {
+    state.enabled = !!v;
+    for (const t of state.tabs) t.enabled = state.enabled;   // 暂停/继续是全局的，所有标签一起生效
+    setStatus(state.enabled ? '抓取中' : '已暂停');
+    return state.enabled;
+  });
   ipcMain.handle('cap:clear', () => {
-    state.records.length = 0; state.byId.clear(); state.wsFrames.length = 0;
-    state.storedBytes = 0; state.seq = 0;
+    resetActive();
     return true;
   });
   ipcMain.handle('cap:panelWidth', (_e, w) => {
@@ -238,26 +355,136 @@ function registerIpc() {
   });
   ipcMain.handle('cap:pageData', () => extract.collectPageData().then((pd) => ({
     url: pd.url, title: pd.title, htmlLength: pd.html.length, html: pd.html,
-    page: pd.page, cookies: pd.cookies.map((c) => ({ name: c.name, value: c.value, domain: c.domain, path: c.path, secure: c.secure, httpOnly: c.httpOnly, session: c.session, sameSite: c.sameSite, expirationDate: c.expirationDate })),
+    page: pd.page, cookies: pd.cookies.map(mapCookie),
   })));
-  ipcMain.handle('cap:exportAll', async () => {
+  ipcMain.handle('cap:exportAll', async (_e, ids, file) => {
     try {
-      const data = await buildExport();
-      return await files.saveWithDialog(`capture-${new Date().toISOString().replace(/[:.]/g, '-')}.json`, JSON.stringify(data, null, 2));
-    } catch (e) { return { ok: false, error: e.message }; }
+      const data = await buildExport(ids);
+      const name = `capture-${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
+      if (file) return await files.saveTextFile({ defaultName: name, content: JSON.stringify(data, null, 2), file });
+      return await files.saveWithDialog(name, JSON.stringify(data, null, 2));
+    } catch (e) { logger.log('ipc', `cap:exportAll: ${e.message}`); return { ok: false, error: e.message }; }
   });
   ipcMain.handle('cap:exportHtml', async () => {
     try {
       const pd = await extract.collectPageData();
       const html = pd.html.replace('<head>', `<head>\n<!-- 抓取自 ${pd.url} @ ${new Date().toISOString()} -->`);
       return await files.saveWithDialog(`page-${new Date().toISOString().replace(/[:.]/g, '-')}.html`, html);
-    } catch (e) { return { ok: false, error: e.message }; }
+    } catch (e) { logger.log('ipc', `cap:exportHtml: ${e.message}`); return { ok: false, error: e.message }; }
   });
   ipcMain.handle('cap:exportCookieJson', async () => {
     try {
       const cookies = await session.fromPartition(PARTITION).cookies.get({});
       return await files.saveWithDialog(`cookies-${new Date().toISOString().replace(/[:.]/g, '-')}.json`, JSON.stringify(cookies, null, 2));
-    } catch (e) { return { ok: false, error: e.message }; }
+    } catch (e) { logger.log('ipc', `cap:exportCookieJson: ${e.message}`); return { ok: false, error: e.message }; }
+  });
+
+  /* --------------------------------------------------- Cookie 与会话数据 */
+
+  ipcMain.handle('cap:cookies', async () => {
+    try {
+      const cookies = await session.fromPartition(PARTITION).cookies.get({});
+      return { ok: true, cookies: cookies.map(mapCookie) };
+    } catch (e) { logger.log('ipc', `cap:cookies: ${e.message}`); return { ok: false, error: e.message, cookies: [] }; }
+  });
+  ipcMain.handle('cap:cookieSet', async (_e, details) => {
+    try {
+      const d = details || {};
+      if (!d.name) return { ok: false, error: '缺少 cookie 名称' };
+      if (!d.url) return { ok: false, error: '缺少 cookie 所属 URL' };
+      await session.fromPartition(PARTITION).cookies.set(d);
+      return { ok: true };
+    } catch (e) { logger.log('ipc', `cap:cookieSet: ${e.message}`); return { ok: false, error: e.message }; }
+  });
+  ipcMain.handle('cap:cookieRemove', async (_e, payload) => {
+    const { url, name } = payload || {};
+    if (!url || !name) return { ok: false, error: '缺少 url 或 name' };
+    try {
+      await session.fromPartition(PARTITION).cookies.remove(url, name);
+      return { ok: true };
+    } catch (e) { logger.log('ipc', `cap:cookieRemove: ${e.message}`); return { ok: false, error: e.message }; }
+  });
+  ipcMain.handle('cap:cookieImport', async (_e, payload) => {
+    try {
+      const { text, url } = payload || {};
+      const raw = String(text == null ? '' : text).trim();
+      if (!raw) return { ok: false, error: '没有可导入的内容' };
+      const list = [];
+      if (raw.startsWith('[') || raw.startsWith('{')) {
+        const arr = JSON.parse(raw);
+        for (const c of [].concat(arr)) if (c && c.name) list.push(c);
+      } else {
+        for (const seg of raw.split(/[;\n]/)) {         // Cookie 头形式：a=1; b=2
+          const t = seg.trim();
+          if (!t) continue;
+          const i = t.indexOf('=');
+          if (i <= 0) continue;
+          list.push({ url, name: t.slice(0, i).trim(), value: t.slice(i + 1).trim() });
+        }
+      }
+      if (!list.length) return { ok: false, error: '没有可导入的内容' };
+      const ses = session.fromPartition(PARTITION);
+      let added = 0;
+      const failed = [];
+      for (const c of list) {
+        try {
+          const details = { url: c.url || url, name: c.name, value: c.value == null ? '' : String(c.value) };
+          for (const k of ['domain', 'path', 'secure', 'httpOnly', 'expirationDate', 'sameSite']) {
+            if (c[k] !== undefined) details[k] = c[k];
+          }
+          await ses.cookies.set(details);
+          added++;
+        } catch (e) { failed.push({ name: c.name, error: e.message }); }
+      }
+      return { ok: true, added, failed };
+    } catch (e) { logger.log('ipc', `cap:cookieImport: ${e.message}`); return { ok: false, error: e.message }; }
+  });
+  ipcMain.handle('cap:storageSet', async (_e, payload) => {
+    const { area, key, value } = payload || {};
+    const name = area === 'local' ? 'localStorage' : area === 'session' ? 'sessionStorage' : '';
+    if (!name) return { ok: false, error: '未知存储区' };
+    if (!key) return { ok: false, error: '缺少键名' };
+    try {
+      await extract.evalPage(`(() => { ${name}.setItem(${JSON.stringify(String(key))}, ${JSON.stringify(String(value == null ? '' : value))}); return true; })()`);
+      return { ok: true };
+    } catch (e) { logger.log('ipc', `cap:storageSet: ${e.message}`); return { ok: false, error: e.message }; }
+  });
+  ipcMain.handle('cap:storageRemove', async (_e, payload) => {
+    const { area, key } = payload || {};
+    const name = area === 'local' ? 'localStorage' : area === 'session' ? 'sessionStorage' : '';
+    if (!name) return { ok: false, error: '未知存储区' };
+    if (!key) return { ok: false, error: '缺少键名' };
+    try {
+      await extract.evalPage(`(() => { ${name}.removeItem(${JSON.stringify(String(key))}); return true; })()`);
+      return { ok: true };
+    } catch (e) { logger.log('ipc', `cap:storageRemove: ${e.message}`); return { ok: false, error: e.message }; }
+  });
+  ipcMain.handle('cap:exportCookies', async (_e, payload) => {
+    try {
+      const { format, file } = payload || {};
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+      const cookies = await session.fromPartition(PARTITION).cookies.get({});
+      if (format === 'netscape') {
+        const lines = ['# Netscape HTTP Cookie File'];
+        for (const c of cookies) {
+          const domain = c.domain || '';
+          lines.push([
+            domain,
+            domain.startsWith('.') ? 'TRUE' : 'FALSE',
+            c.path || '/',
+            c.secure ? 'TRUE' : 'FALSE',
+            c.session ? '0' : String(Math.round(c.expirationDate || 0)),
+            c.name,
+            c.value == null ? '' : String(c.value),
+          ].join('\t'));
+        }
+        return await files.saveTextFile({ defaultName: `cookies-${stamp}.txt`, content: lines.join('\n') + '\n', file });
+      }
+      if (format !== 'json' && format !== undefined && format !== null && format !== '') {
+        return { ok: false, error: '未知导出格式' };
+      }
+      return await files.saveTextFile({ defaultName: `cookies-${stamp}.json`, content: JSON.stringify(cookies.map(mapCookie), null, 2), file });
+    } catch (e) { logger.log('ipc', `cap:exportCookies: ${e.message}`); return { ok: false, error: e.message }; }
   });
 
   /* ---------------------------------------------------------- 爬虫功能 */
@@ -280,21 +507,169 @@ function registerIpc() {
         const rec = state.records.find((x) => x.id === data);
         return rec ? { ok: true, text: format.buildCurl(rec) } : { ok: false, error: '记录不存在' };
       }
+      if (kind === 'reqHeaders') {
+        const rec = state.records.find((x) => x.id === data);
+        if (!rec) return { ok: false, error: '记录不存在' };
+        const lines = format.requestHeaderList(rec)
+          .filter((h) => !['content-length', 'host'].includes(h.name.toLowerCase()))
+          .map((h) => `${h.name}: ${h.value}`);
+        return { ok: true, text: lines.join('\n') };
+      }
       if (kind === 'rowsCsv') return { ok: true, text: format.rowsToCsv(data) };
       if (kind === 'tablesCsv') return { ok: true, text: format.tablesToCsv(data) };
       return { ok: false, error: '未知格式' };
-    } catch (e) { return { ok: false, error: e.message }; }
+    } catch (e) { logger.log('ipc', `cap:format: ${e.message}`); return { ok: false, error: e.message }; }
   });
   ipcMain.handle('cap:saveText', (_e, payload) => files.saveTextFile(payload));
   ipcMain.handle('cap:saveBodies', (_e, dir) => files.saveBodies(dir));
-  ipcMain.handle('cap:exportHar', async (_e, file) => {
+  ipcMain.handle('cap:saveBody', async (_e, id, kind, file) => {
     try {
-      const har = format.buildHar(state.records, state.view ? state.view.webContents.getTitle() : '');
+      const rec = state.records.find((x) => x.id === id);
+      if (!rec) return { ok: false, error: '记录不存在' };
+      const want = kind === 'request' ? 'request' : 'response';
+      if (want === 'request' && !rec.postData) return { ok: false, error: '该请求没有请求体' };
+      if (want === 'response' && rec.body == null) return { ok: false, error: '没有响应体' };
+      let hostPath = '';
+      try { const u = new URL(rec.url); hostPath = u.host + u.pathname; } catch (e) { hostPath = rec.url; }
+      const base = files.sanitizeName(`${want === 'request' ? 'request' : 'body'}-${rec.id}-${hostPath}`);
+      const ext = want === 'request' ? 'txt' : files.mimeExt(rec.mime);
+      const defaultName = `${base}.${ext}`;
+      if (want === 'response' && rec.bodyBase64) {
+        return await files.saveBinaryFile({ defaultName, buffer: Buffer.from(rec.body, 'base64'), file });
+      }
+      return await files.saveTextFile({ defaultName, content: String(want === 'request' ? rec.postData : rec.body), file });
+    } catch (e) {
+      logger.log('ipc', `cap:saveBody: ${e.message}`);
+      return { ok: false, error: e.message };
+    }
+  });
+  ipcMain.handle('cap:logTail', () => ({ ok: true, text: logger.tail(200), file: logger.filePath() }));
+  ipcMain.handle('cap:openLog', () => {
+    shell.showItemInFolder(logger.filePath());
+    return { ok: true };
+  });
+  ipcMain.handle('cap:exportHar', async (_e, payload) => {
+    try {
+      const { file, ids } = payload || {};
+      const set = Array.isArray(ids) && ids.length ? new Set(ids) : null;
+      const list = set ? state.records.filter((r) => set.has(r.id)) : state.records;
+      const har = format.buildHar(list, state.view ? state.view.webContents.getTitle() : '');
       const name = `capture-${new Date().toISOString().replace(/[:.]/g, '-')}.har`;
       return await files.saveTextFile({ defaultName: name, content: JSON.stringify(har, null, 2), file });
-    } catch (e) { return { ok: false, error: e.message }; }
+    } catch (e) { logger.log('ipc', `cap:exportHar: ${e.message}`); return { ok: false, error: e.message }; }
   });
-  ipcMain.handle('cap:replay', (_e, id) => capture.replay(id));
+  ipcMain.handle('cap:replay', (_e, id, overrides) => capture.replay(id, overrides));
+
+  /* ------------------------------------------------------------ 页面工具 */
+
+  ipcMain.handle('cap:screenshot', async (_e, payload) => {
+    try {
+      const { mode, selector, file } = payload || {};
+      const wc = state.view.webContents;
+      let buffer;
+      if (mode === 'element') {
+        const sel = String(selector || '').trim();
+        if (!sel) return { ok: false, error: '请填写选择器' };
+        const box = await extract.evalPage(`(() => {
+          const el = document.querySelector(${JSON.stringify(sel)});
+          if (!el) return null;
+          const r = el.getBoundingClientRect();
+          return { x: r.left + window.scrollX, y: r.top + window.scrollY, width: r.width, height: r.height };
+        })()`);
+        if (!box) return { ok: false, error: '未找到匹配元素' };
+        const shot = await wc.debugger.sendCommand('Page.captureScreenshot', {
+          format: 'png',
+          captureBeyondViewport: true,
+          clip: { x: box.x, y: box.y, width: Math.max(1, box.width), height: Math.max(1, box.height), scale: 1 },
+        });
+        buffer = Buffer.from(shot.data, 'base64');
+      } else if (mode === 'full') {
+        const m = await wc.debugger.sendCommand('Page.getLayoutMetrics');
+        const size = m.cssContentSize || m.contentSize || { width: 0, height: 0 };
+        const shot = await wc.debugger.sendCommand('Page.captureScreenshot', {
+          format: 'png',
+          captureBeyondViewport: true,
+          clip: { x: 0, y: 0, width: Math.max(1, Math.ceil(size.width)), height: Math.max(1, Math.ceil(size.height)), scale: 1 },
+        });
+        buffer = Buffer.from(shot.data, 'base64');
+      } else {
+        const image = await wc.capturePage();
+        buffer = image.toPNG();
+      }
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+      return await files.saveBinaryFile({ defaultName: `shot-${stamp}.png`, buffer, file });
+    } catch (e) { logger.log('ipc', `cap:screenshot: ${e.message}`); return { ok: false, error: e.message }; }
+  });
+  ipcMain.handle('cap:pdf', async (_e, payload) => {
+    try {
+      const { file } = payload || {};
+      const buffer = await state.view.webContents.printToPDF({ printBackground: true, pageSize: 'A4', landscape: false });
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+      return await files.saveBinaryFile({ defaultName: `page-${stamp}.pdf`, buffer, file });
+    } catch (e) { logger.log('ipc', `cap:pdf: ${e.message}`); return { ok: false, error: e.message }; }
+  });
+  ipcMain.handle('cap:find', (_e, text, opts) => new Promise((resolve) => {
+    const q = String(text == null ? '' : text);
+    if (!q) return resolve({ ok: false, error: '请输入查找内容' });
+    const wc = state.view.webContents;
+    const o = opts || {};
+    // findInPage 只返回 requestId，结果走 found-in-page 事件
+    let last = null;
+    let done = false;
+    const finish = (r) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      wc.off('found-in-page', onFound);
+      resolve({ ok: true, matches: r.matches || 0, active: r.activeMatchOrdinal || 0 });
+    };
+    const onFound = (_ev, result) => {
+      last = result;
+      if (result && result.finalUpdate) finish(result);
+    };
+    const timer = setTimeout(() => finish(last || {}), 3000);
+    wc.on('found-in-page', onFound);
+    wc.findInPage(q, { forward: !!o.forward, matchCase: !!o.matchCase });
+  }));
+  ipcMain.handle('cap:findStop', () => {
+    state.view.webContents.stopFindInPage('clearSelection');
+    return { ok: true };
+  });
+
+  /* ---------------------------------------------------------- 会话持久化 */
+
+  ipcMain.handle('cap:sessionInfo', () => sessionStore.info());
+  ipcMain.handle('cap:sessionRestore', () => {
+    const r = sessionStore.load();
+    if (!r.ok) return r;
+    state.records.length = 0;
+    state.byId.clear();
+    state.wsFrames.length = 0;
+    state.storedBytes = 0;
+    for (const rec of r.records) {
+      state.records.push(rec);
+      if (rec.cdpId) state.byId.set(rec.cdpId, rec);
+    }
+    state.seq = state.records.reduce((m, x) => Math.max(m, x.id || 0), 0);
+    for (const f of r.wsFrames) state.wsFrames.push(f);
+    return { ok: true, savedAt: r.savedAt, count: state.records.length, records: state.records.map(capture.summarize), wsFrames: state.wsFrames };
+  });
+  ipcMain.handle('cap:sessionDiscard', () => sessionStore.discard());
+
+  /* -------------------------------------------------------------- 多标签 */
+
+  ipcMain.handle('cap:tabList', () => tabList());
+  ipcMain.handle('cap:tabNew', (_e, url) => {
+    const tab = newTab(normalizeUrl(url) || 'about:blank');
+    return tab ? { ok: true, id: tab.id, tabs: tabList() } : { ok: false, error: '窗口未就绪' };
+  });
+  ipcMain.handle('cap:tabActivate', (_e, id) => {
+    const tab = state.tabs.find((t) => t.id === id);
+    if (!tab) return { ok: false, error: '标签不存在' };
+    activateTab(tab);
+    return { ok: true, tabs: tabList() };
+  });
+  ipcMain.handle('cap:tabClose', (_e, id) => closeTab(id));
 
   /* ------------------------------------------------------ 应用级（重启/GPU）*/
 
@@ -315,15 +690,47 @@ app.whenReady().then(() => {
   session.fromPartition(PARTITION).setPermissionRequestHandler((_wc, _perm, cb) => cb(true));
   settings.registerBlocker();          // 必须在任何导航之前注册（同一 session 只能注册一个监听器）
   settings.hydrate();                  // 磁盘设置灌进内存，控件与拦截器都读同一份
+
+  // 证书错误：只有显式勾选「忽略证书错误」才放行，其余保持 Chromium 默认拒绝
+  app.on('certificate-error', (event, _wc, url, error, _cert, callback) => {
+    if (settings.values.ignoreCertErrors) {
+      event.preventDefault();
+      logger.log('cert', `${error} ${url}`);
+      return callback(true);
+    }
+    callback(false);
+  });
+
+  // HTTP 认证：设置里填了用户名就用它直接应答；没填则不调 callback（等价取消，避免弹系统框）
+  app.on('login', (event, _wc, details, _authInfo, callback) => {
+    if (!settings.values.authUser) {
+      setStatus('站点要求认证，请在「设置」里填写用户名与密码');
+      logger.log('auth', `未配置凭据 ${details.url}`);
+      return;
+    }
+    event.preventDefault();
+    callback(settings.values.authUser, settings.values.authPass);
+    logger.log('auth', `已用配置的用户名应答 ${details.url}`);
+  });
+
   registerIpc();
   createWindow();
   watchGpu();
+  if (!state.selftest) sessionStore.start();    // 自检自己调 save/load，不受 30s 定时器干扰
   // GPU 状态需要一点时间上报，面板首帧之后再判定（首次采样后还会二次复核，见 checkGpuOnce）
   if (state.win) state.win.webContents.once('did-finish-load', () => setTimeout(checkGpuOnce, 3000));
   if (state.selftest) {
-    require('./selftest.js').run({ state, store, gpu, capture, extract, settings, automation, format, files, PARTITION, TOOLBAR_H, layout });
+    require('./selftest.js').run({
+      state, store, gpu, capture, extract, settings, automation, format, files, logger,
+      session: sessionStore, resetActive, PARTITION,
+    });
   }
   app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
 });
 
 app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
+
+app.on('before-quit', () => {
+  sessionStore.stop();
+  if (!state.selftest) sessionStore.saveSync();   // 自检退出时不写会话文件，避免污染断言数据
+});
