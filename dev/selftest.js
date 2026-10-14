@@ -10,6 +10,7 @@ const crypto = require('node:crypto');
 const os = require('node:os');
 const fs = require('node:fs');
 const path = require('node:path');
+const { pathToFileURL } = require('node:url');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -103,7 +104,9 @@ function startServer() {
       lastReq[u.pathname] = { method: req.method, headers: req.headers };
       (hitsAt[u.pathname] = hitsAt[u.pathname] || []).push(Date.now());
       const noStore = { 'Cache-Control': 'no-store' };
-      const port = server.address().port;
+      // close() 之后 address() 为 null：退出途中的在途请求（浏览器 keep-alive 复用连接）仍会进来，别在这里再炸一次
+      const addr = server.address();
+      const port = addr ? addr.port : 0;
       if (u.pathname === '/api/data') {
         let body = '';
         req.on('data', (c) => { body += c; });
@@ -135,7 +138,7 @@ function startServer() {
       }
       if (u.pathname === '/style.css') {
         res.writeHead(200, Object.assign({ 'Content-Type': 'text/css' }, noStore));
-        res.end('body { margin: 0; }');
+        res.end('body { margin: 0; background: url(/img.png); }');
         return;
       }
       if (u.pathname === '/') {
@@ -177,7 +180,7 @@ function reloadAndWait(wc, ms = 900) {
   });
 }
 
-async function run({ state, store, gpu, extract, settings, automation, format, files, capture, logger, session, recorder, picker, resetActive, PARTITION }) {
+async function run({ state, store, gpu, extract, settings, automation, format, files, bundle, capture, logger, session, recorder, picker, resetActive, PARTITION }) {
   const results = [];
   const check = (name, cond, extra = '') => {
     results.push({ name, pass: !!cond, extra });
@@ -2082,6 +2085,89 @@ async function run({ state, store, gpu, extract, settings, automation, format, f
         `快照=${list156.snaps.length} 条数=${list156.snaps.map((s) => s.count).join('/')} 新增=${d156.addedN} 消失=${d156.removedN} 变化=${d156.changedN} 表格=${tables156}`);
       await peval(`document.getElementById('modalClose').click()`);
     } catch (e) { check('快照保存与对比', false, e.message); }
+
+    // ---------------- 158-161 离线包（当前页 + 静态资源镜像 / JS 清单 / network / hints）----------------
+    // 先回到首页：入口必须是 base + '/'（标题 selftest），且它的 HTML / CSS / 图片都已被抓下
+    const bundleDir = path.join(outDir, 'bundle');
+    let bd = null;
+    try {
+      await state.view.webContents.loadURL(base + '/');
+      await waitFor(() => ['/', '/style.css', '/img.png'].every((p) => state.records.some((r) => r.url === base + p && r.body != null)), 20000, '离线包资源');
+      await sleep(300);
+      bd = await pinvoke('cap:bundleSave', { dir: bundleDir, includeNetwork: true, includeHints: true });
+    } catch (e) { bd = { ok: false, error: e.message }; }
+    const bundleRead = (rel) => fs.readFileSync(path.join(bundleDir, ...String(rel).split('/')), 'utf8');
+
+    // 158 打包落盘与结构
+    try {
+      if (!bd || !bd.ok) throw new Error('导出失败：' + JSON.stringify(bd || null));
+      const manifest = JSON.parse(bundleRead('manifest.json'));
+      const allOnDisk = manifest.files.every((f) => fs.existsSync(path.join(bundleDir, ...String(f.local).split('/'))));
+      const jsIndex = JSON.parse(bundleRead('js/index.json'));
+      const inlineText = bundleRead('js/_inline/001.js');
+      check('离线包落盘与结构',
+        bd.files >= 4 && bd.missing.length === 0 && fs.existsSync(path.join(bundleDir, ...String(bd.entry).split('/')))
+          && allOnDisk && inlineText.includes('probe_cookie') && jsIndex.scripts.some((s) => s.kind === 'inline'),
+        `${bd.files} 文件 / ${bd.bytes} 字节；entry=${bd.entry}；缺失=${bd.missing.length}；脚本=${jsIndex.scripts.map((s) => s.kind).join(',')}`);
+    } catch (e) { check('离线包落盘与结构', false, e.message); }
+
+    // 159 引用重写与字节一致
+    try {
+      if (!bd || !bd.ok) throw new Error('导出失败：' + JSON.stringify(bd || null));
+      const manifest = JSON.parse(bundleRead('manifest.json'));
+      const html = bundleRead(bd.entry);
+      const cssRef = manifest.files.find((f) => /\/style\.css$/.test(f.url));
+      const imgRef = manifest.files.find((f) => /\/img\.png$/.test(f.url));
+      const css = cssRef ? bundleRead(cssRef.local) : '';
+      const imgBytes = imgRef ? fs.readFileSync(path.join(bundleDir, ...String(imgRef.local).split('/'))) : Buffer.alloc(0);
+      // 纯函数不变量：查询串哈希命名、目录 URL 的 index 命名、CSS 里 url(…) 的重写
+      const namingOk = bundle.localPathOf('http://h/a.js?x=1', 'application/javascript', false) === `site/h/a_q_${crypto.createHash('sha1').update('x=1').digest('hex').slice(0, 8)}.js`
+        && bundle.localPathOf('http://h/dir/', 'text/css', false) === 'site/h/dir/index.css'
+        && bundle.rewriteRefs('body{background:url(/img.png)}', 'http://h/style.css', new Map([['http://h/img.png', 'site/h/img.png']]), 'site/h/style.css') === 'body{background:url(img.png)}';
+      check('离线包引用重写与字节一致',
+        !html.includes('href="/style.css"') && !html.includes('src="/img.png"') && /href="[^"]*style\.css"/.test(html)
+          && css.includes('url(') && !css.includes('127.0.0.1:' + port) && imgBytes.equals(PNG_1PX) && namingOk,
+        `HTML 重写=${/href="[^"]*style\.css"/.test(html)} CSS=${cssRef && cssRef.local} 图片=${imgBytes.length} 字节 纯函数=${namingOk}`);
+    } catch (e) { check('离线包引用重写与字节一致', false, e.message); }
+
+    // 160 离线可开：file:// 打开镜像入口，图片 / CSS / 内联脚本都生效
+    try {
+      if (!bd || !bd.ok) throw new Error('导出失败：' + JSON.stringify(bd || null));
+      const entryPath = path.join(bundleDir, ...String(bd.entry).split('/'));
+      await state.view.webContents.loadURL(pathToFileURL(entryPath).href);
+      const imgExpr = `(() => { const p = document.querySelector('#pic'); return p ? p.naturalWidth : 0; })()`;
+      await waitFor(async () => (await state.view.webContents.executeJavaScript(imgExpr, true)) > 0, 8000, '离线图片渲染').catch(() => {});
+      const off = await state.view.webContents.executeJavaScript(`({
+        title: document.title,
+        img: ${imgExpr},
+        margin: getComputedStyle(document.body).marginTop,
+        probe: localStorage.getItem('probe'),
+      })`, true);
+      await state.view.webContents.loadURL(base + '/');          // 复位：后续断言继续用在线页
+      check('离线包离线可开', off.title === 'selftest' && off.img > 0 && off.margin === '0px' && off.probe === '1',
+        `title=${off.title} 图片宽=${off.img} margin=${off.margin} localStorage=${off.probe}`);
+    } catch (e) { check('离线包离线可开', false, e.message); }
+
+    // 161 network / hints 与面板入口
+    try {
+      if (!bd || !bd.ok) throw new Error('导出失败：' + JSON.stringify(bd || null));
+      const net = JSON.parse(bundleRead('network.json'));
+      const hints = JSON.parse(bundleRead('hints.json'));
+      const postInNet = net.records.some((r) => r.method === 'POST' && r.postData === 'ping=1');
+      const ping = hints.keywords.find((k) => k.keyword === 'ping');
+      const probe = await peval(`(() => {
+        const b = document.getElementById('bundleBtn');
+        if (!b) return { exists: false, open: false, closed: false };
+        b.click();
+        const open = !document.getElementById('modal').hidden;
+        document.getElementById('modalClose').click();
+        return { exists: true, open, closed: document.getElementById('modal').hidden };
+      })()`);
+      check('离线包 network 与 hints',
+        postInNet && !!ping && ping.hits.length > 0 && String(ping.hits[0].file).startsWith('js/_inline/')
+          && probe.exists && probe.open && probe.closed,
+        `POST 记录=${postInNet}；ping 命中=${ping ? ping.hits.length : 0}（${ping && ping.hits[0] ? `${ping.hits[0].file}:${ping.hits[0].line}` : '无'}）；按钮=${probe.exists} 模态=${probe.open}`);
+    } catch (e) { check('离线包 network 与 hints', false, e.message); }
   } catch (e) {
     check('自检执行', false, `${e.message} | status=${state.status} attached=${wc.debugger.isAttached()}`);
   }
