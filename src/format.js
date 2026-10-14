@@ -32,6 +32,23 @@ function headerValue(list, name) {
 
 const SKIP_CURL = new Set(['content-length', 'host']);
 
+// CDP response.timing → 分段耗时（ms）：DNS / 连接 / TLS / 发送 / 等待(TTFB) / 下载。
+// CDP 用 -1 表示该段不适用（连接复用、无 TLS 等）；durationMs 未到时下载段为 0。
+function timingParts(timing, durationMs) {
+  if (!timing) return null;
+  const seg = (a, b) => (a > 0 && b > a ? Math.round(b - a) : 0);
+  const head = timing.receiveHeadersEnd > 0 ? timing.receiveHeadersEnd : 0;
+  const wait = head ? Math.round(head - Math.max(timing.sendEnd || 0, timing.connectEnd || 0, 0)) : 0;
+  return {
+    dns: seg(timing.dnsStart, timing.dnsEnd),
+    connect: seg(timing.connectStart, timing.connectEnd),
+    tls: seg(timing.sslStart, timing.sslEnd),
+    send: seg(timing.sendStart, timing.sendEnd),
+    wait: Math.max(0, wait),
+    download: Math.max(0, Math.round((durationMs || 0) - head)),
+  };
+}
+
 // 请求头文本 → { name: value }：每行按第一个 ':' 切分；空行跳过
 function parseHeaderLines(text) {
   const out = {};
@@ -121,7 +138,12 @@ function buildHar(records, title) {
         headersSize: -1, bodySize: rec.encodedDataLength || 0,
       },
       cache: {},
-      timings: { send: 0, wait: rec.duration || 0, receive: 0 },
+      timings: (() => {
+        const p = timingParts(rec.timing, rec.duration);
+        return p
+          ? { blocked: 0, dns: p.dns, connect: p.connect + p.tls, send: p.send, wait: p.wait, receive: p.download }
+          : { send: 0, wait: rec.duration || 0, receive: 0 };
+      })(),
       serverIPAddress: rec.remoteIP || '',
       _resourceType: rec.type,
     };
@@ -264,6 +286,106 @@ function buildNodeAxios(rec) {
   return out.join('\n') + '\n';
 }
 
+/* ------------------------------------------------------------------ OpenAPI 3 */
+
+// 请求体示例：JSON > 表单（k=v&…）> 纯文本
+function bodyExample(postData) {
+  const text = String(postData == null ? '' : postData);
+  if (!text) return null;
+  try {
+    const v = JSON.parse(text);
+    if (v && typeof v === 'object') return { mime: 'application/json', example: v };
+  } catch (e) { /* 不是 JSON，继续按表单看 */ }
+  if (/^[^=&\s]+=[^&]*(&[^=&\s]+=[^&]*)*$/.test(text)) {
+    const obj = {};
+    for (const pair of text.split('&')) {
+      const i = pair.indexOf('=');
+      if (i > 0) obj[pair.slice(0, i)] = pair.slice(i + 1);
+    }
+    if (Object.keys(obj).length) return { mime: 'application/x-www-form-urlencoded', example: obj };
+  }
+  return { mime: 'text/plain', example: text.slice(0, 65536) };
+}
+
+// 响应体示例：能 JSON 解析就用解析值，否则文本截断 64KB；二进制不展开
+function responseExample(rec) {
+  if (!rec || rec.body == null) return null;
+  if (rec.bodyBase64) return `二进制响应体（base64 ${String(rec.body).length} 字符，未展开）`;
+  const text = String(rec.body).slice(0, 65536);
+  try { return JSON.parse(text); } catch (e) { return text; }
+}
+
+// OpenAPI 3.0：按 origin + 路径模板（纯数字段 → {id}）归并 2xx 的 http/https 记录
+function buildOpenApi(records, meta) {
+  const all = records || [];
+  const src = all.filter((r) => r && r.status >= 200 && r.status < 300 && /^https?:/i.test(String(r.url || '')));
+  const byOrigin = new Map();
+  for (const r of src) {
+    let u = null;
+    try { u = new URL(r.url); } catch (e) { continue; }
+    if (!byOrigin.has(u.origin)) byOrigin.set(u.origin, []);
+    byOrigin.get(u.origin).push({ rec: r, url: u });
+  }
+  let server = '';
+  let picked = [];
+  for (const [origin, list] of byOrigin) {
+    if (list.length > picked.length) { server = origin; picked = list; }
+  }
+  const otherOrigins = [...byOrigin.keys()].filter((o) => o !== server);
+  const groups = new Map();
+  let over = 0;
+  for (const { rec, url } of picked) {
+    const segs = url.pathname.split('/');
+    const tpl = segs.map((s) => (/^\d+$/.test(s) ? '{id}' : s)).join('/') || '/';
+    const method = String(rec.method || 'GET').toLowerCase();
+    const key = `${method} ${tpl}`;
+    let g = groups.get(key);
+    if (!g) {
+      if (groups.size >= 500) { over++; continue; }
+      g = { method, tpl, query: new Map(), path: new Map(), rec: null };
+      groups.set(key, g);
+    }
+    for (const [k, v] of url.searchParams) if (!g.query.has(k)) g.query.set(k, v);
+    const tplSegs = tpl.split('/');
+    for (let i = 0; i < tplSegs.length; i++) if (tplSegs[i] === '{id}' && !g.path.has(i)) g.path.set(i, segs[i]);
+    if (!g.rec) g.rec = rec;
+  }
+  const paths = {};
+  for (const g of groups.values()) {
+    const rec = g.rec;
+    const op = {
+      operationId: `${g.method}_${g.tpl}`.replace(/[{}]/g, '').replace(/[^a-zA-Z0-9_]+/g, '_').replace(/^_+|_+$/g, '') || g.method,
+      responses: {},
+    };
+    const params = [];
+    for (const [k, v] of g.query) params.push({ name: k, in: 'query', required: false, schema: { type: 'string' }, example: v });
+    for (const [, v] of g.path) params.push({ name: 'id', in: 'path', required: true, schema: { type: 'string' }, example: v });
+    if (params.length) op.parameters = params;
+    const be = bodyExample(rec.postData);
+    if (be) {
+      op.requestBody = { content: { [be.mime]: { schema: { type: typeof be.example === 'string' ? 'string' : 'object' }, example: be.example } } };
+    }
+    const ex = responseExample(rec);
+    const desc = rec.statusText || 'OK';
+    op.responses[String(rec.status)] = ex === null
+      ? { description: desc }
+      : { description: desc, content: { [rec.mime || 'application/octet-stream']: { example: ex } } };
+    if (!paths[g.tpl]) paths[g.tpl] = {};
+    paths[g.tpl][g.method] = op;
+  }
+  const host = server ? new URL(server).host : '';
+  const note = [
+    `由网页抓取工具从 ${(meta && meta.url) || ''} 的抓包生成。`,
+    `只导出 ${host || '（无同源记录）'} 的 2xx 记录；跳过 ${all.length - picked.length} 条（${otherOrigins.length ? `${otherOrigins.length} 个其他域名 / ` : ''}非 2xx${over ? ` / ${over} 条超出 500 操作上限` : ''}）。`,
+  ].join('');
+  return {
+    openapi: '3.0.3',
+    info: { title: `${(meta && meta.title) || host || '抓包'} 接口文档`, version: '1.0.0', description: note },
+    servers: server ? [{ url: server }] : [],
+    paths,
+  };
+}
+
 // Postman Collection v2.1（可直接导入 Postman / Insomnia）
 function buildPostmanCollection(records, name) {
   return {
@@ -308,7 +430,7 @@ function buildMarkdownTable(records) {
 }
 
 module.exports = {
-  mergedHeaders, requestHeaderList, responseHeaderList, headerValue, parseHeaderLines,
+  mergedHeaders, requestHeaderList, responseHeaderList, headerValue, parseHeaderLines, timingParts,
   buildCurl, csvEscape, rowsToCsv, tablesToCsv, buildHar, buildStats, diffSnapshots,
-  buildPythonRequests, buildNodeFetch, buildNodeAxios, buildPostmanCollection, buildMarkdownTable,
+  buildPythonRequests, buildNodeFetch, buildNodeAxios, buildPostmanCollection, buildOpenApi, buildMarkdownTable,
 };

@@ -12,13 +12,11 @@
  */
 const fs = require('node:fs/promises');
 const path = require('node:path');
-const crypto = require('node:crypto');
 const { state } = require('./state');
 const files = require('./files');
 const capture = require('./capture');
 const extract = require('./extract');
 
-const SITE_DIR = 'site';                       // 镜像站根目录
 const INLINE_DIR = 'js/_inline';               // 内联脚本副本目录
 const STATIC_RECORD_TYPES = new Set(['Script', 'Stylesheet', 'Image', 'Font', 'Media']);
 // performance 条目里排除「接口类」initiator：它们的字节不属于离线复现所需的静态资源（network.json 里另有记录）
@@ -40,37 +38,10 @@ const PAGE_EXPR = `(() => ({
 }))()`;
 
 const stripHash = (s) => String(s == null ? '' : s).split('#')[0];
-const hasExt = (name) => /\.[a-z0-9]{1,10}$/i.test(name);
 const skippable = (url) => /^(data|blob|javascript|about|chrome-extension):/i.test(String(url || ''));
 const toBuffer = (rec) => (rec.bodyBase64 ? Buffer.from(rec.body, 'base64') : Buffer.from(String(rec.body), 'utf8'));
 
-/* ------------------------------------------------------- 路径映射 / 引用重写（纯函数） */
-
-// URL → 包内相对路径：site/<host>/<路径段…>/<文件名>
-function localPathOf(url, mime, isEntry) {
-  let u = null;
-  try { u = url instanceof URL ? url : new URL(String(url)); } catch (e) { /* 非标准 URL：按原串当路径 */ }
-  const host = files.sanitizeName(u ? u.host : 'raw', 60);
-  const rawPath = u ? u.pathname : String(url == null ? '' : url).split(/[?#]/)[0];
-  const segs = rawPath.split('/').filter((s) => s && s !== '.' && s !== '..').map((s) => files.sanitizeName(s, 80));
-  let name = segs.pop() || '';
-  if (/\/$/.test(rawPath) || !name) {            // 目录（含根路径）：末段换成 index 文件
-    if (name) segs.push(name);
-    name = '';
-  }
-  let ext = '';
-  if (name && hasExt(name)) {
-    const i = name.lastIndexOf('.');
-    ext = name.slice(i);
-    name = name.slice(0, i);
-  }
-  if (!name) name = 'index';
-  if (!ext) ext = '.' + files.mimeExt(isEntry ? 'text/html' : mime);
-  const query = u ? u.search.replace(/^\?/, '') : '';
-  if (query) name += '_q_' + crypto.createHash('sha1').update(query).digest('hex').slice(0, 8);
-  return [SITE_DIR, host].concat(segs, name + ext).join('/');
-}
-
+/* ---------------------------------------------------- 引用重写（纯函数） */
 const escapeRe = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 // 把文本里的引用（绝对 URL / //host/… / /path / 相对 baseUrl 形态）换成相对 fromFile 的路径。
@@ -198,6 +169,8 @@ function networkSnapshot(pageUrl) {
         size: f.encodedDataLength, duration: f.durationMs, failed: f.failed,
         redirects: f.redirects,
         requestHeaders: f.requestHeaders, requestHeadersRaw: f.requestHeadersRaw, postData: f.postData,
+        initiator: f.initiator || null,
+        timing: f.timing || null, timingParts: f.timingParts || null,
         responseHeaders: f.responseHeaders, responseHeadersRaw: f.responseHeadersRaw,
       };
     }),
@@ -266,14 +239,14 @@ async function saveBundle(opts = {}) {
     const missing = [];
     const jobs = [];
     const entryRec = pageUrl ? bodyRecord(pageUrl) : null;
-    const entryLocal = pageUrl ? localPathOf(pageUrl, (entryRec && entryRec.mime) || 'text/html', true) : '';
+    const entryLocal = pageUrl ? files.localPathOf(pageUrl, (entryRec && entryRec.mime) || 'text/html', true) : '';
     if (pageUrl) jobs.push({ url: pageUrl, local: entryLocal, mime: (entryRec && entryRec.mime) || 'text/html', type: (entryRec && entryRec.type) || 'Document', rec: entryRec, isEntry: true });
     for (const it of [...urls.values()].sort((a, b) => a.url.localeCompare(b.url))) {
       if (it.url === pageUrl) continue;
       const rec = bodyRecord(it.url);
       jobs.push({
         url: it.url,
-        local: localPathOf(it.url, (rec && rec.mime) || '', false),
+        local: files.localPathOf(it.url, (rec && rec.mime) || '', false),
         mime: (rec && rec.mime) || '', type: it.type || (rec && rec.type) || '', rec,
       });
     }
@@ -370,4 +343,4 @@ async function saveBundle(opts = {}) {
   }
 }
 
-module.exports = { saveBundle, localPathOf, rewriteRefs, buildHints };
+module.exports = { saveBundle, rewriteRefs, buildHints };

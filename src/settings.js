@@ -24,6 +24,7 @@ const values = {
   sortBy: 'time',         // 列表排序：time | domain | size | duration | status
   tasks: [],              // 提取任务预设（最多 20 条），见 applyInner('tasks')
   saveRule: { on: false, urlRe: '', mimes: '', types: 'all', dir: '' },   // 响应体落盘规则
+  mock: { on: false, rules: [] },                                        // Mock：URL 规则 → 本地响应（最多 30 条）
 };
 
 const MAX_REQ_DELAY = 10000;
@@ -106,6 +107,13 @@ function registerBlocker() {
   });
 }
 
+// 摘掉 onBeforeRequest 监听器：Mock（CDP Fetch 域）开启期间必须先摘掉，
+// 否则 Electron 会把 Fetch.fulfillRequest 的状态码与响应头丢掉（只保留 body）。
+// 关闭 Mock 时用 registerBlocker() 重新挂上；代价是 Mock 期间资源阻断 / 请求间隔暂停生效。
+function unregisterBlocker() {
+  session.fromPartition(PARTITION).webRequest.onBeforeRequest(null);
+}
+
 function viewWc(target) { return target || (state.view && state.view.webContents); }
 
 async function applyInner(key, value, target) {
@@ -186,6 +194,29 @@ async function applyInner(key, value, target) {
         mimes: String(r.mimes == null ? '' : r.mimes).slice(0, 200),
         types, dir: String(r.dir == null ? '' : r.dir).slice(0, 500),
       };
+      return { ok: true };
+    }
+
+    case 'mock': {
+      const m = (value && typeof value === 'object') ? value : {};
+      const raw = Array.isArray(m.rules) ? m.rules.slice(0, 30) : [];
+      const rules = [];
+      for (let i = 0; i < raw.length; i++) {
+        const r = (raw[i] && typeof raw[i] === 'object') ? raw[i] : {};
+        const urlRe = String(r.urlRe == null ? '' : r.urlRe).slice(0, 300);
+        if (urlRe) {
+          try { new RegExp(urlRe); } catch (e) { return { ok: false, error: `第 ${i + 1} 条 URL 正则无法解析：${e.message}` }; }
+        }
+        rules.push({
+          id: String(r.id == null ? '' : r.id).slice(0, 24) || `m${Date.now().toString(36)}${i}`,
+          on: r.on !== false, urlRe,
+          status: clampInt(r.status, 100, 599, 200),
+          headers: String(r.headers == null ? '' : r.headers).slice(0, 2000),
+          body: String(r.body == null ? '' : r.body).slice(0, 2 * 1024 * 1024),
+          bodyBase64: !!r.bodyBase64,
+        });
+      }
+      values.mock = { on: !!m.on, rules };
       return { ok: true };
     }
 
@@ -297,6 +328,6 @@ async function applyToAllTabs() {
 }
 
 module.exports = {
-  values, applySetting, applyInner, hydrate, restoreRuntime, registerBlocker, parseKeywords, parseHeaders,
+  values, applySetting, applyInner, hydrate, restoreRuntime, registerBlocker, unregisterBlocker, parseKeywords, parseHeaders,
   MAX_REQ_DELAY, nextPaceWait, resetPacer, pacerState, decide, release, applyToAllTabs,
 };

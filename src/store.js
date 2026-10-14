@@ -22,6 +22,7 @@ const DEFAULTS = {
     sortBy: 'time',                                   // 列表排序 / 分组：time | domain | size | duration | status
     tasks: [],                                        // 提取任务预设（最多 20 条，见 settings.applyInner）
     saveRule: { on: false, urlRe: '', mimes: '', types: 'all', dir: '' },   // 响应体落盘规则
+    mock: { on: false, rules: [] },                                         // Mock：URL 规则 → 本地响应
   },
   app: { softwareRendering: false, panelWidth: 520, window: { width: 1440, height: 900, x: null, y: null } },
 };
@@ -72,6 +73,7 @@ function normalize(raw) {
     if (!['time', 'domain', 'size', 'duration', 'status'].includes(out.settings.sortBy)) out.settings.sortBy = 'time';
     if (!Array.isArray(out.settings.tasks)) out.settings.tasks = [];
     if (!out.settings.saveRule || typeof out.settings.saveRule !== 'object') out.settings.saveRule = defaults().settings.saveRule;
+    if (!out.settings.mock || typeof out.settings.mock !== 'object' || !Array.isArray(out.settings.mock.rules)) out.settings.mock = defaults().settings.mock;
   }
 
   const a = raw.app;

@@ -129,6 +129,12 @@
   #findbar { display: flex; align-items: center; gap: 6px; padding: 6px; border-bottom: 1px solid var(--line); }
   #findText { flex: 1; min-width: 40px; }
   #list { flex: 1; overflow: auto; scrollbar-gutter: stable; }
+  /* 虚拟滚动：行与分组标题绝对定位（top = 序号 × 26px），#listInner 只提供总高度 */
+  #listInner { position: relative; width: 100%; }
+  .grp {
+    position: absolute; left: 0; right: 0; height: 26px; line-height: 26px; padding: 0 8px;
+    background: var(--panel); border-bottom: 1px solid var(--line); color: var(--muted); font-size: 12px;
+  }
   #listNote { padding: 2px 8px; }
   #listNew { position: absolute; left: 50%; transform: translateX(-50%); bottom: 8px; z-index: 5; }
   #ctxMenu {
@@ -142,8 +148,9 @@
     display: flex; align-items: center; gap: 6px; height: 26px; padding: 0 8px;
     border-bottom: 1px solid var(--line); cursor: pointer; white-space: nowrap;
     font-size: 12px; font-variant-numeric: tabular-nums;
+    position: absolute; left: 0; right: 0;
   }
-  .row:nth-child(even) { background: #ffffff05; }
+  .row[data-alt="1"] { background: #ffffff05; }
   .row:hover { background: var(--elev); }
   .row.sel { background: var(--sel); }
   .row .m {
@@ -202,7 +209,7 @@
     position: absolute; left: 6px; top: 0; z-index: 1; font-size: 11px; color: var(--muted);
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 60%; pointer-events: none;
   }
-  .empty { color: var(--muted); padding: 16px; text-align: center; }
+  .empty { color: var(--muted); padding: 16px; text-align: center; position: absolute; left: 0; right: 0; top: 0; }
 
   /* 共用模态框 */
   #modal {
@@ -295,6 +302,7 @@
     <input id="proxy" type="text" placeholder="socks5://127.0.0.1:1080" style="width:170px">
     <button id="proxyTest" class="ghost" title="用当前代理设置访问当前站点，验证连通性与出口">测代理</button>
     <button id="saveRule" class="ghost" title="按规则把命中的响应体直接写进目录">落盘</button>
+    <button id="mockRule" class="ghost" title="按 URL 规则本地返回响应（搭测试环境用）">Mock</button>
     <span class="sep"></span>
     <span class="lbl">间隔</span>
     <input id="reqDelay" class="num" type="number" min="0" max="10000" step="100" value="0" title="请求最小间隔 ms（礼貌抓取）">
@@ -325,6 +333,7 @@
     <button id="expFiltered" title="导出当前列表里筛出来的记录">导出筛选结果</button>
     <button id="statsBtn" title="按域名/类型/状态统计当前标签的抓包">统计概览</button>
     <button id="expPostman" title="把当前记录导出为 Postman Collection">导出 Postman</button>
+    <button id="expOpenApi" title="把当前记录导出为 OpenAPI 3 文档">导出 OpenAPI</button>
     <button id="copyMd" title="把当前筛选结果复制为 Markdown 表格">复制表格</button>
     <button id="snapBtn" title="保存抓包快照并对比两次差异">快照</button>
     <span class="sep"></span>
@@ -387,7 +396,7 @@
         <span id="findCount" class="lbl"></span>
         <button id="findClose" class="ghost" title="结束查找">✕</button>
       </div>
-      <div id="list"><div class="empty">等待抓取…</div></div>
+      <div id="list"><div id="listInner"><div class="empty">等待抓取…</div></div></div>
       <div id="wsView"><div id="wsbar">
         <label class="lbl" title="暂停后新帧不再进入列表（数据仍在主进程）"><input id="wsPause" type="checkbox"> 暂停</label>
         <input id="wsFilter" placeholder="帧内容过滤">

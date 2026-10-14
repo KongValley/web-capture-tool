@@ -1,11 +1,12 @@
 'use strict';
 /*
- * 落盘：保存对话框、文本写入、响应体批量导出。
+ * 落盘：保存对话框、文本写入、响应体批量导出、站点目录树路径（离线包与规则落盘共用）。
  * 所有文件写入都从这里走；重名不覆盖，自动加 -1/-2 后缀。
  */
 const { app, dialog } = require('electron');
 const fs = require('node:fs/promises');
 const path = require('node:path');
+const crypto = require('node:crypto');
 const { state } = require('./state');
 
 function sanitizeName(s, max = 120) {
@@ -27,6 +28,18 @@ async function uniquePath(dir, base, ext) {
   return p;
 }
 
+// 按「包内相对路径」落盘；同名时在扩展名前插 -1/-2（与 uniquePath 同一套语义）
+async function uniquePathUnder(dir, local) {
+  const parts = String(local).split('/');
+  const name = parts.pop();
+  const ext = path.extname(name);
+  const stem = ext ? name.slice(0, -ext.length) : name;
+  let p = path.join(dir, ...parts, name);
+  for (let i = 1; i <= 999 && (await exists(p)); i++) p = path.join(dir, ...parts, `${stem}-${i}${ext}`);
+  if (await exists(p)) throw new Error('同名文件过多（已到 -999）');
+  return p;
+}
+
 function mimeExt(mime) {
   const m = String(mime || '').toLowerCase().split(';')[0].trim();
   if (m.includes('json')) return 'json';
@@ -42,6 +55,37 @@ function mimeExt(mime) {
   if (m.includes('xml')) return 'xml';
   if (m.startsWith('text/')) return 'txt';
   return 'bin';
+}
+
+/* --------------------------------------- 站点目录树路径（离线包 / 规则落盘共用） */
+
+const SITE_DIR = 'site';                       // 镜像站根目录
+
+// URL → 包内相对路径：site/<host>/<路径段…>/<文件名>
+// host 目录；路径段逐段 sanitize、丢弃空段与 ..；目录 URL 的末段用 index.<mimeExt>；
+// 无扩展名补 mimeExt；查询串非空在扩展名前插 _q_<sha1 前 8 位>；入口页额外保证 .html
+function localPathOf(url, mime, isEntry) {
+  let u = null;
+  try { u = url instanceof URL ? url : new URL(String(url)); } catch (e) { /* 非标准 URL：按原串当路径 */ }
+  const host = sanitizeName(u ? u.host : 'raw', 60);
+  const rawPath = u ? u.pathname : String(url == null ? '' : url).split(/[?#]/)[0];
+  const segs = rawPath.split('/').filter((s) => s && s !== '.' && s !== '..').map((s) => sanitizeName(s, 80));
+  let name = segs.pop() || '';
+  if (/\/$/.test(rawPath) || !name) {            // 目录（含根路径）：末段换成 index 文件
+    if (name) segs.push(name);
+    name = '';
+  }
+  let ext = '';
+  if (name && /\.[a-z0-9]{1,10}$/i.test(name)) {
+    const i = name.lastIndexOf('.');
+    ext = name.slice(i);
+    name = name.slice(0, i);
+  }
+  if (!name) name = 'index';
+  if (!ext) ext = '.' + mimeExt(isEntry ? 'text/html' : mime);
+  const query = u ? u.search.replace(/^\?/, '') : '';
+  if (query) name += '_q_' + crypto.createHash('sha1').update(query).digest('hex').slice(0, 8);
+  return [SITE_DIR, host].concat(segs, name + ext).join('/');
 }
 
 async function saveWithDialog(defaultName, content) {
@@ -108,16 +152,14 @@ async function saveBodies(dir) {
   return { ok: true, dir: target, written, skipped };
 }
 
-// 落盘规则命中时写一条响应体：平铺到目标目录，文件名 = 序号_方法_主机+路径，重名加 -1/-2 后缀
+// 落盘规则命中时写一条响应体：按站点目录树镜像（site/<host>/<路径>），重名在扩展名前加 -1/-2
 async function saveAutoBody(rec, dir) {
-  let hostPath = rec.url;
-  try { const u = new URL(rec.url); hostPath = u.host + u.pathname; } catch (e) { /* 非标准 URL 用原串 */ }
-  const base = `${String(rec.id).padStart(4, '0')}_${rec.method}_${sanitizeName(hostPath, 80)}`;
-  const file = await uniquePath(dir, base, mimeExt(rec.mime));
+  const local = localPathOf(rec.url, rec.mime, false);
+  const file = await uniquePathUnder(dir, local);
   const data = rec.bodyBase64 ? Buffer.from(rec.body, 'base64') : Buffer.from(String(rec.body), 'utf8');
   await fs.mkdir(path.dirname(file), { recursive: true });
   await fs.writeFile(file, data);
-  return path.basename(file);
+  return local;                                   // 包内相对路径：capture 用它写 note，界面能看到落点
 }
 
 // 站点前缀：只取主机名，非法字符换成 _，解析失败返回空串
@@ -142,7 +184,7 @@ async function pickJsonFile() {
 }
 
 module.exports = {
-  sanitizeName, uniquePath, mimeExt, saveWithDialog, saveTextFile, saveBinaryFile, saveBodies,
+  sanitizeName, uniquePath, uniquePathUnder, mimeExt, localPathOf, saveWithDialog, saveTextFile, saveBinaryFile, saveBodies,
   pickDirectory, saveAutoBody,
   siteHost, exportBaseName, pickJsonFile,
 };

@@ -11,6 +11,16 @@ const picker = require('./picker');
 const files = require('./files');
 const logger = require('./logger');
 
+/* -------------------------------------------------- 记录字段（initiator） */
+
+// CDP initiator 裁剪：只留定位加密代码需要的字段，栈最多 12 帧（会话体积：5000 条 × 每帧约 60B）
+function trimInitiator(i) {
+  const frames = ((i.stack && i.stack.callFrames) || []).slice(0, 12).map((f) => ({
+    fn: f.functionName || '(anonymous)', url: f.url || '', line: f.lineNumber, col: f.columnNumber,
+  }));
+  return { type: i.type || '', url: i.url || '', lineNumber: i.lineNumber || 0, columnNumber: i.columnNumber || 0, stack: frames };
+}
+
 /* ------------------------------------------------------------ 规则落盘 */
 
 // 单次运行最多落盘这么多文件 / 字节（切换规则即重置）
@@ -52,9 +62,11 @@ function fullRecord(r) {
     status: r.status, statusText: r.statusText, mime: r.mime,
     remoteIP: r.remoteIP, protocol: r.protocol,
     requestHeaders: r.requestHeaders, requestHeadersRaw: r.requestHeadersRaw, postData: r.postData,
+    initiator: r.initiator || null,
     responseHeaders: r.responseHeaders, responseHeadersRaw: r.responseHeadersRaw,
     redirects: r.redirects, failed: r.failed,
     encodedDataLength: r.encodedDataLength, durationMs: r.duration,
+    timing: r.timing || null, timingParts: format.timingParts(r.timing, r.duration),
     bodyBase64: r.bodyBase64, bodyError: r.bodyError, body: r.body,
     star: !!r.star, comment: r.comment || '',
     restored: !!r.restored,
@@ -62,7 +74,7 @@ function fullRecord(r) {
 }
 
 function onRequestWillBeSent(tab, ev) {
-  const { requestId, request, timestamp, wallTime, type, redirectResponse } = ev;
+  const { requestId, request, timestamp, wallTime, type, redirectResponse, initiator } = ev;
   if (!tab.enabled) return;
   if (settings.values.recordOnly && type !== 'XHR' && type !== 'Fetch') return;
   const prev = tab.byId.get(requestId);
@@ -72,6 +84,7 @@ function onRequestWillBeSent(tab, ev) {
     prev.url = request.url;
     prev.method = request.method;
     prev.type = type || prev.type;
+    if (initiator) prev.initiator = trimInitiator(initiator);
     prev.requestHeaders = request.headers || {};
     prev.postData = request.postData != null ? request.postData : prev.postData;
     prev.startedAt = timestamp;
@@ -93,6 +106,7 @@ function onRequestWillBeSent(tab, ev) {
     startedAt: timestamp, requestHeaders: request.headers || {},
     requestHeadersRaw: extra ? extra.headers || null : null,
     postData: request.postData != null ? request.postData : null,
+    initiator: initiator ? trimInitiator(initiator) : null,
     status: 0, statusText: '', responseHeaders: null, responseHeadersRaw: null,
     mime: '', encodedDataLength: 0, duration: null,
     body: null, bodyBase64: false, bodyError: null, failed: null,
@@ -119,6 +133,7 @@ function onResponseReceived(tab, ev) {
   rec.mime = ev.response.mimeType || '';
   rec.remoteIP = ev.response.remoteIPAddress || '';
   rec.protocol = ev.response.protocol || '';
+  rec.timing = ev.response.timing || null;
   if (!rec.type && ev.type) rec.type = ev.type;
   queueBatch(tab, 'update', summarize(rec));
   recorder.onResponse(tab, rec);
@@ -133,6 +148,71 @@ function onResponseExtraInfo(tab, ev) {
     rec.status = ev.statusCode;
     queueBatch(tab, 'update', summarize(rec));
   }
+}
+
+/* -------------------------------------------------------------- Mock 改写 */
+
+// 命中计数（改规则 / 开关即清零，与规则落盘同一语义）与正则缓存
+const mockHits = new Map();
+let mockOn = false;
+let mockRe = new Map();
+
+// 开关 / 规则变化：给所有标签挂上或摘掉 CDP Fetch 域，并清空命中计数
+async function syncMock() {
+  const m = settings.values.mock;
+  mockOn = !!(m && m.on);
+  mockRe = new Map();
+  mockHits.clear();
+  // 关键：Mock 期间必须摘掉 webRequest 拦截器，否则 Electron 会丢掉 fulfil 的状态码与响应头
+  if (mockOn) settings.unregisterBlocker();
+  else settings.registerBlocker();
+  for (const t of state.tabs || []) {
+    try {
+      if (mockOn) {
+        await t.wc.debugger.sendCommand('Fetch.enable', { patterns: [{ urlPattern: '*', requestStage: 'Request' }] });
+        await t.wc.debugger.sendCommand('Network.setCacheDisabled', { cacheDisabled: true });   // 关缓存：命中缓存的请求不经 Fetch 域
+      } else {
+        await t.wc.debugger.sendCommand('Fetch.disable');
+        await t.wc.debugger.sendCommand('Network.setCacheDisabled', { cacheDisabled: false });
+      }
+    } catch (e) { /* 标签已销毁 / 调试器未挂：忽略 */ }
+  }
+  return { ok: true };
+}
+
+function mockState() { return { on: mockOn, hits: Object.fromEntries(mockHits) }; }
+
+// 规则顺序即优先级：第一条「启用且正则命中」的规则生效
+function findMockRule(url) {
+  for (const r of settings.values.mock.rules) {
+    if (!r.on || !r.urlRe) continue;
+    let re = mockRe.get(r.urlRe);
+    if (!re) {
+      try { re = new RegExp(r.urlRe); } catch (e) { continue; }
+      mockRe.set(r.urlRe, re);
+    }
+    if (re.test(url)) return r;
+  }
+  return null;
+}
+
+// 每个被暂停的请求都必须有下文：命中就本地应答，否则原样放行（阻断 / 限速由 webRequest 那层继续管）
+function onRequestPaused(tab, p) {
+  const dbg = tab.wc.debugger;
+  const url = (p.request && p.request.url) || '';
+  const rule = mockOn ? findMockRule(url) : null;
+  if (!rule) return dbg.sendCommand('Fetch.continueRequest', { requestId: p.requestId }).catch(() => {});
+  mockHits.set(rule.id, (mockHits.get(rule.id) || 0) + 1);
+  const parsed = format.parseHeaderLines(rule.headers);
+  const responseHeaders = parsed.ok
+    ? Object.entries(parsed.value).filter(([k]) => k.toLowerCase() !== 'content-length').map(([name, value]) => ({ name, value }))
+    : [];
+  const body = rule.bodyBase64 ? rule.body : Buffer.from(rule.body, 'utf8').toString('base64');
+  return dbg.sendCommand('Fetch.fulfillRequest', { requestId: p.requestId, responseCode: rule.status, responseHeaders, body })
+    .catch((e) => {
+      logger.log('mock', `本地应答失败（规则 ${rule.id}）：${e.message}`);
+      return dbg.sendCommand('Fetch.continueRequest', { requestId: p.requestId }).catch(() => {});
+    });
 }
 
 /* ---------------------------------------------------------- 面板推送批处理 */
@@ -250,6 +330,7 @@ async function attachCapture(tab) {
       case 'Network.responseReceivedExtraInfo': onResponseExtraInfo(tab, params); break;
       case 'Network.loadingFinished': onLoadingFinished(tab, params); break;
       case 'Network.loadingFailed': onLoadingFailed(tab, params); break;
+      case 'Fetch.requestPaused': onRequestPaused(tab, params); break;
       case 'Network.webSocketCreated': pushWs(tab, { kind: 'open', requestId: params.requestId, url: params.url, time: Date.now() }); break;
       case 'Network.webSocketFrameSent': pushWs(tab, { kind: 'sent', requestId: params.requestId, opcode: params.response.opcode, payload: params.response.payloadData, time: Date.now() }); break;
       case 'Network.webSocketFrameReceived': pushWs(tab, { kind: 'recv', requestId: params.requestId, opcode: params.response.opcode, payload: params.response.payloadData, time: Date.now() }); break;
@@ -270,6 +351,10 @@ async function attachCapture(tab) {
       maxPostDataSize: 16 * 1024 * 1024,
     });
     await dbg.sendCommand('Page.enable');    // Page.captureScreenshot / getLayoutMetrics 需要
+    if (settings.values.mock.on) {           // Mock 开着时新标签也要挂 Fetch 域，否则新标签不生效
+      await dbg.sendCommand('Fetch.enable', { patterns: [{ urlPattern: '*', requestStage: 'Request' }] });
+      await dbg.sendCommand('Network.setCacheDisabled', { cacheDisabled: true });
+    }
   } catch (e) {
     setStatus(`Network.enable 失败：${e.message}`);
     return false;
@@ -362,4 +447,4 @@ function markNote(url, note) {
   return true;
 }
 
-module.exports = { summarize, fullRecord, attachCapture, replay, flushBatch, markNote, resetAutoSave, autoSaveState, matchSaveRule };
+module.exports = { summarize, fullRecord, attachCapture, replay, flushBatch, markNote, resetAutoSave, autoSaveState, matchSaveRule, syncMock, mockState };

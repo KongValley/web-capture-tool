@@ -4,14 +4,18 @@ const { ipcRenderer, clipboard } = require('electron');
 
 const $ = (id) => document.getElementById(id);
 const el = { list: $('list'), ws: $('ws'), wsView: $('wsView'), detail: $('detail'), filter: $('filter'), type: $('typeFilter'), sort: $('sortBy') };
+el.listInner = el.list.querySelector('#listInner');
 
-const rows = new Map();     // id -> {rec, node, visible}（node 可能为 null：超出渲染上限后仅保留数据）
+const rows = new Map();     // id -> { rec }：全部记录（内存唯一真相源；导出 / 详情 / 瀑布图都读它）
+const live = new Map();     // index -> node：只有滚动窗口内的条目才有 DOM（虚拟滚动）
 let colMode = 'd';          // 当前列预设（与 #colSet 同步；只在切换时更新，避免逐行读 DOM）
-const LIST_MAX_ROWS = 3000; // 列表最多渲染的行数（超出后移除最早的 DOM，数据仍在内存与导出里）
-let domRows = 0;            // 当前 DOM 里的行数
-let visibleCount = 0;       // 当前可见行数（过滤命中的行，增量维护；updateCounts 直接用它）
+let order = [];             // 渲染顺序：[{ t:'row', id } | { t:'grp', host, count }]（过滤 + 排序 + 分组的结果）
+let orderDirty = false;     // order 落后于 rows（新记录 / 更新到达），等合并重建
+let visibleCount = 0;       // 过滤命中的记录数（内存口径，增量维护；updateCounts 直接用它）
 let listNew = 0;            // 未读新记录数（用户不在底部时累计）
 let selected = null;
+const ROW_H = 26;           // 与 .row / .grp 的 CSS 高度一致（box-sizing: border-box）
+const OVERSCAN = 8;         // 窗口上下各多渲染几行，滚动时不闪
 let detailId = null;
 let detailData = null;      // 当前详情面板对应的记录（复制按钮用）
 let view = 'list';
@@ -158,37 +162,29 @@ function matches(rec) {
   return matchParsed(rec, queryParts());
 }
 
-// 行在 DOM 里且没被过滤隐藏
-const visible = (node) => !!node && node.style.display !== 'none';
-
-// 行可见性的唯一入口：display 与 visibleCount 永远一起改（过滤 / 新记录 / 上限移除都走这里）
-function setRowVisible(id, want) {
-  const r = rows.get(id);
-  if (!r || !r.node) return;
-  const should = !!want;
-  if (r.visible === should) return;
-  r.visible = should;
-  visibleCount += should ? 1 : -1;
-  r.node.style.display = should ? '' : 'none';
-}
-
-// 把行从列表里移除（超出上限 / 主进程 drop），计数一起维护
+// 把一行从内存与窗口里移除（主进程 drop / 整表同步）
 function dropRow(id) {
   const r = rows.get(id);
   if (!r) return;
-  if (r.node) { r.node.remove(); domRows--; }   // 已超出渲染上限的行没有 DOM，不能减 domRows
-  if (r.visible) visibleCount--;
+  if (matches(r.rec)) visibleCount--;
+  removeLive(id);
   rows.delete(id);
+  orderDirty = true;
+  scheduleOrder();
   invalidateBottom();
 }
 
 // 清空列表与计数（「清空」按钮 / 会话恢复前调用）
 function resetListDom() {
   rows.clear();
+  live.clear();
+  order = [];
+  orderDirty = false;
   visibleCount = 0;
-  domRows = 0;
   listNew = 0;
-  el.list.innerHTML = '<div class="empty">等待抓取…</div>';
+  el.listInner._h = 0;
+  el.listInner.style.height = '0px';
+  el.listInner.innerHTML = '<div class="empty">等待抓取…</div>';
   invalidateBottom();
   el.ws.innerHTML = '';
   $('nWs').textContent = '0';
@@ -262,9 +258,8 @@ function updateListNote() {
     $('listNote').textContent = `响应体命中 ${bodyHits.size} 条`;
     return;
   }
-  const hidden = rows.size - domRows;
-  $('listNote').hidden = hidden <= 0;
-  $('listNote').textContent = hidden > 0 ? `已隐藏更早 ${hidden} 条（可导出）` : '';
+  $('listNote').hidden = true;
+  $('listNote').textContent = '';
 }
 
 /* 列表跟随滚动：「是否在底部」不再每行都去读 scrollHeight。
@@ -282,7 +277,8 @@ function invalidateBottom() {
 
 function listAtBottom() {
   if (bottomCache === null) {
-    bottomCache = el.list.scrollHeight - el.list.scrollTop - el.list.clientHeight <= 40;
+    // 总高度 = 条目数 × 26px（不再读 scrollHeight，避免强制布局）
+    bottomCache = (order.length * ROW_H) - el.list.scrollTop - el.list.clientHeight <= ROW_H;
   }
   return bottomCache;
 }
@@ -290,8 +286,9 @@ function listAtBottom() {
 // 立刻滚到底（用户点击「↓ N 条新记录」这类显式动作）
 function scrollListToBottom() {
   pendingScroll = false;
-  el.list.scrollTop = 1e9;      // 1e9 由浏览器夹到最大滚动位置；赋值本身也会触发一次布局
+  el.list.scrollTop = order.length * ROW_H;    // 浏览器自会把超出的值夹到最大滚动位置
   bottomCache = true;
+  renderWindow();
 }
 
 // 跟随到底：一轮任务里只写一次 scrollTop（写它同样要算滚动范围，会强制布局）
@@ -302,7 +299,8 @@ function scheduleScrollToBottom() {
   Promise.resolve().then(() => {
     if (!pendingScroll) return;
     pendingScroll = false;
-    el.list.scrollTop = 1e9;
+    el.list.scrollTop = order.length * ROW_H;
+    renderWindow();
   });
 }
 
@@ -312,136 +310,166 @@ Object.defineProperty(el.list, 'scrollTop', {
   get() { return scrollTopDesc.get.call(el.list); },
   set(v) { invalidateBottom(); scrollTopDesc.set.call(el.list, v); },
 });
-el.list.addEventListener('scroll', invalidateBottom, { passive: true });
+el.list.addEventListener('scroll', () => { invalidateBottom(); renderWindow(); }, { passive: true });
 
 function appendRecord(rec) {
   if (rows.has(rec.id)) return;
-  const node = makeRow(rec);
-  paintRow(node, rec);
-  const empty = el.list.querySelector('.empty');
+  rows.set(rec.id, { rec });
+  const matched = matches(rec);
+  if (matched) visibleCount++;
+  if (matched && el.sort.value === 'time' && !orderDirty) order.push({ t: 'row', id: rec.id });
+  else { orderDirty = true; scheduleOrder(); }
+  const empty = el.listInner.querySelector('.empty');
   if (empty) empty.remove();
-  el.list.appendChild(node);
-  rows.set(rec.id, { rec, node, visible: false });
-  domRows++;
-  setRowVisible(rec.id, matches(rec));
-  if (selected === rec.id) node.classList.add('sel');
   if (listAtBottom()) scheduleScrollToBottom();
   else { listNew++; updateListNew(); }
-  while (domRows > LIST_MAX_ROWS) {
-    let victim = null;
-    for (const [id2, r2] of rows) {          // rows 保持插入顺序 = 最旧优先（排序只动 DOM，不动内存顺序）
-      if (r2.node) { victim = [id2, r2]; break; }
-    }
-    if (!victim) break;
-    const vrow = victim[1];
-    if (vrow.visible) visibleCount--;
-    vrow.node.remove();
-    vrow.node = null;                        // 只丢 DOM，数据留在内存（导出/过滤仍可用）
-    vrow.visible = false;
-    domRows--;
-  }
+  renderWindow();
   updateCounts();
   updateListNote();
-  scheduleSort();
   if (view === 'wf') scheduleWaterfall();
 }
 
 function updateRecord(rec) {
   const r = rows.get(rec.id);
   if (!r) return appendRecord(rec);
+  if (matches(r.rec)) visibleCount--;
   r.rec = rec;
-  if (r.node) {
-    paintRow(r.node, rec);
-    setRowVisible(rec.id, matches(rec));
-  }
+  if (matches(rec)) visibleCount++;
+  orderDirty = true;
+  scheduleOrder();                        // 100ms 合并：排序键 / 分组计数 / 过滤命中都可能变
+  renderWindow();
   if (selected === rec.id) scheduleDetailRender(rec.id);
   updateCounts();
-  scheduleSort();
   if (view === 'wf') scheduleWaterfall();
 }
 
-// 可见数由 setRowVisible / dropRow 增量维护，这里只写文本（O(1)，不再每行扫 DOM）
+// 可见数由 appendRecord / updateRecord / dropRow 增量维护，这里只写文本（O(1)，不再每行扫 DOM）
 function updateCounts() {
   $('nReq').textContent = visibleCount;
   $('count').textContent = rows.size;
 }
 
-/* 列预设 / 过滤两个入口：
- * refilter     —— 列预设或类型筛选变化：行内文本要重算，逐行重画 + 重算可见性
- * reapplyFilter —— 只有过滤串变化：只重算可见性，不碰行内文本（打字时走这条） */
+/* 列预设 / 过滤两个入口（都同步重建顺序表：过滤命中的记录才进 order，窗口渲染会重画窗口内的行） */
 function refilter() {
-  for (const [id, r] of rows) {
-    if (!r.node) continue;                  // 已超出渲染上限的行只在内存里
-    paintRow(r.node, r.rec);                // 列预设可能刚切换，逐行重画
-    setRowVisible(id, matches(r.rec));
-  }
-  updateCounts();
-  scheduleSort();                            // 分组标题条数 / 隐藏行要跟着筛选刷新
-  invalidateBottom();
+  applySort();
   if (view === 'wf') scheduleWaterfall();      // 瀑布图跟随筛选
 }
 
 function reapplyFilter() {
-  for (const [id, r] of rows) {
-    if (!r.node) continue;
-    setRowVisible(id, matches(r.rec));
-  }
-  updateCounts();
-  scheduleSort();
-  invalidateBottom();
+  applySort();
   if (view === 'wf') scheduleWaterfall();
 }
 
 /* ---------------------------------------------------------------- 排序与分组 */
 
-let sortTimer = null;
+let orderTimer = null;
 
-// 非「时间」排序才需要重排 DOM；流式追加时按 500ms 合并，避免每批都重排
-function scheduleSort() {
-  if (el.sort.value === 'time') return;
-  if (sortTimer) return;
-  sortTimer = setTimeout(() => { sortTimer = null; applySort(); }, 500);
+// 流式追加 / 更新：顺序表重建合并到 100ms 一次（与抓包推送同一量级）；用户动作走同步的 applySort()
+function scheduleOrder() {
+  if (orderTimer) return;
+  orderTimer = setTimeout(() => { orderTimer = null; applySort(); }, 100);
 }
 
-// 排序/分组：按内存记录决定顺序，再按顺序把已有的 DOM 节点 appendChild 回去（节点被移动而不是重建）
-// 分组标题（.grp）每次重建，不计入 domRows
+// 顺序表 = 过滤命中（matches）的记录，按当前排序 / 分组排列；渲染只按它取窗口
 function applySort() {
+  if (orderTimer) { clearTimeout(orderTimer); orderTimer = null; }
   const mode = el.sort.value;
-  for (const g of el.list.querySelectorAll('.grp')) g.remove();
-  const items = [...rows.values()].filter((r) => r.node);
-  if (mode === 'time') {                     // 回到时间序：按插入顺序（= 时间序）摆回来
-    for (const r of items) el.list.appendChild(r.node);
-    invalidateBottom();
-    return;
-  }
   const hostOf = (rec) => { try { return new URL(rec.url).host; } catch (e) { return '(无法解析)'; } };
   const cmp = {
     size: (a, b) => (b.rec.size || 0) - (a.rec.size || 0),
     duration: (a, b) => (b.rec.duration || 0) - (a.rec.duration || 0),
     status: (a, b) => (b.rec.status || 0) - (a.rec.status || 0),
   }[mode];
+  const list = [];
+  for (const [id, r] of rows) if (matches(r.rec)) list.push({ id, rec: r.rec });
+  visibleCount = list.length;
+  order = [];
   if (mode === 'domain') {
     const groups = new Map();
-    for (const r of items) {
-      if (!r.visible) continue;              // 只给看得见的行分组，标题条数才与筛选一致
-      const h = hostOf(r.rec);
+    for (const it of list) {                 // 只给过滤命中的记录分组，标题条数才与筛选一致
+      const h = hostOf(it.rec);
       if (!groups.has(h)) groups.set(h, []);
-      groups.get(h).push(r);
+      groups.get(h).push(it);
     }
     for (const host of [...groups.keys()].sort()) {
-      const head = document.createElement('div');
-      head.className = 'grp lbl';
-      head.textContent = `${host} · ${groups.get(host).length} 条`;
-      el.list.appendChild(head);
-      for (const r of groups.get(host)) el.list.appendChild(r.node);
+      order.push({ t: 'grp', host, count: groups.get(host).length });
+      for (const it of groups.get(host)) order.push({ t: 'row', id: it.id });
     }
-    return;
+  } else if (mode === 'time') {
+    for (const it of list) order.push({ t: 'row', id: it.id });   // rows 的插入顺序 = 时间序
+  } else {
+    list.sort(cmp);
+    for (const it of list) order.push({ t: 'row', id: it.id });
   }
-  for (const r of items.slice().sort(cmp)) el.list.appendChild(r.node);
-  invalidateBottom();                        // 重排/加分组标题都会改变滚动位置的含义
+  orderDirty = false;
+  renderWindow();
+  updateCounts();
+  updateListNote();
+  invalidateBottom();                        // 顺序变了：滚动位置的含义随之改变
 }
 
-// 过滤结果的唯一来源：按内存记录算 id（DOM 只渲染最近 3000 行，不能作为导出依据）
+/* --------------------------------------------------- 窗口渲染（虚拟滚动） */
+
+const clampIdx = (n, lo, hi) => Math.max(lo, Math.min(hi, n));
+
+function makeGroup(e) {
+  const head = document.createElement('div');
+  head.className = 'grp lbl';
+  head.textContent = `${e.host} · ${e.count} 条`;
+  return head;
+}
+
+function removeLive(id) {
+  for (const [i, node] of live) {
+    if (node._rowId === id) { node.remove(); live.delete(i); return; }
+  }
+}
+
+// 只渲染滚动窗口覆盖到的条目（上下各多 OVERSCAN 个），行/组头绝对定位（top = 序号 × 26px），
+// #listInner 的高度 = 条目数 × 26px —— 因此 DOM 行数恒定在「视口高度 / 26 + 16」上下，与总条数无关
+function renderWindow() {
+  const n = order.length;
+  const height = n * ROW_H;
+  if (el.listInner._h !== height) {           // 高度只在条数变化时写：逐行追加也不必每行重写样式
+    el.listInner._h = height;
+    el.listInner.style.height = height + 'px';
+  }
+  const first = clampIdx(Math.floor(el.list.scrollTop / ROW_H) - OVERSCAN, 0, n);
+  const last = clampIdx(Math.ceil((el.list.scrollTop + el.list.clientHeight) / ROW_H) + OVERSCAN, 0, n);
+  for (const [i, node] of [...live]) {
+    if (i < first || i >= last || !node.parentNode) { node.remove(); live.delete(i); }
+  }
+  for (let i = last - 1; i >= first; i--) {     // 反向遍历：处理 i 时 i+1 已经摆好，可用作插入参照
+    const e = order[i];
+    if (!e) continue;
+    const row = e.t === 'row' ? rows.get(e.id) : null;
+    if (e.t === 'row' && !row) continue;        // 记录已被 drop、order 还没重建：跳过这一条
+    const key = e.t === 'grp' ? `grp:${e.host}` : `row:${e.id}`;
+    let node = live.get(i);
+    if (node && node._key !== key) { node.remove(); live.delete(i); node = null; }
+    if (!node) {
+      node = e.t === 'grp' ? makeGroup(e) : makeRow(row.rec);
+      node._key = key;
+      live.set(i, node);
+    }
+    const ref = i + 1 < last ? (live.get(i + 1) || null) : null;
+    // 位置已经正确时不动 DOM：流式追加下窗口每移动一行只动 1 个节点（全量 appendChild 会把追加拖慢 40 倍）
+    if (node.parentNode !== el.listInner || node.nextSibling !== ref) el.listInner.insertBefore(node, ref);
+    if (node._i !== i) {                       // top 用「在 order 里的绝对序号」：纯追加时既有行不需要重写 top
+      node._i = i;
+      node.style.top = (i * ROW_H) + 'px';
+    }
+    const alt = i % 2 ? '1' : '';
+    if (node.dataset.alt !== alt) node.dataset.alt = alt;
+    if (e.t === 'row') {
+      node._rowId = e.id;
+      paintRow(node, row.rec);
+      node.classList.toggle('sel', selected === e.id);
+    }
+  }
+}
+
+// 过滤结果的唯一来源：按内存记录算 id（虚拟滚动下 DOM 只是窗口切片，绝不能作为导出依据）
 function filteredIds() {
   const out = [];
   for (const [id, r] of rows) if (matches(r.rec)) out.push(id);
@@ -504,6 +532,24 @@ function bodyBlock(r) {
     `<div class="dbar">${prettyBtn}<button id="bodySave">另存为文件</button>${big ? `<button id="bodyToggle">${expanded ? '收起' : '查看全文'}</button>` : ''}</div>`;
 }
 
+// 发起者：纯文本行（详情展示与「复制发起者」共用同一份）
+function initiatorLines(it) {
+  return [it.type + (it.url ? ` · ${it.url}${it.lineNumber ? ':' + it.lineNumber : ''}` : '')]
+    .concat((it.stack || []).map((f) => `${f.fn} @ ${f.url || '(inline)'}:${f.line}:${f.col}`));
+}
+
+function initiatorBlock(d) {
+  if (!d.initiator) return '';
+  return `<h3>发起者</h3><pre>${initiatorLines(d.initiator).map(esc).join('\n')}</pre>` +
+    '<div class="dbar"><button id="copyInit">复制发起者</button></div>';
+}
+
+function timingBlock(d) {
+  const p = d.timingParts;
+  if (!p) return '';
+  return `<h3>耗时分解</h3><pre>DNS ${p.dns}ms · 连接 ${p.connect}ms · TLS ${p.tls}ms · 发送 ${p.send}ms · 等待 ${p.wait}ms · 下载 ${p.download}ms</pre>`;
+}
+
 function renderDetail(id) {
   window.__detailRenders = (window.__detailRenders || 0) + 1;   // 自检观测点
   const entry = rows.get(id);
@@ -514,13 +560,15 @@ function renderDetail(id) {
     if (!d) { el.detail.innerHTML = '<div class="empty">未找到记录 #' + esc(id) + '</div>'; return; }
     detailData = d;
     el.detail.innerHTML =
-      `<div class="dbar"><button id="markStar">${d.star ? '★ 已标记（点击取消）' : '★ 标记'}</button><button id="copyCurl">复制 cURL</button><button id="replayReq">重放请求</button><button id="expOne">导出此条</button><button id="saveReq">请求体另存</button><button id="copyUrl">复制 URL</button><button id="copyRespHeaders">复制响应头</button><button id="copyBody">复制响应体</button><button id="codeBtn">复制代码…</button></div>` +
+      `<div class="dbar"><button id="markStar">${d.star ? '★ 已标记（点击取消）' : '★ 标记'}</button><button id="copyCurl">复制 cURL</button><button id="replayReq">重放请求</button><button id="expOne">导出此条</button><button id="saveReq">请求体另存</button><button id="copyUrl">复制 URL</button><button id="copyRespHeaders">复制响应头</button><button id="copyBody">复制响应体</button><button id="codeBtn">复制代码…</button><button id="mockRec">设为 mock</button></div>` +
       `<input id="markComment" placeholder="备注（回车保存）" value="${escAttr(d.comment || '')}">` +
       `<h3>概要</h3><pre><span class="kv">URL     </span>${esc(d.url)}
 <span class="kv">方法    </span>${esc(d.method)}  <span class="kv">状态</span> ${esc(d.status)} ${esc(d.statusText)}
 <span class="kv">类型    </span>${esc(d.type)}  <span class="kv">MIME</span> ${esc(d.mime)}
 <span class="kv">远端    </span>${esc(d.remoteIP)}  ${esc(d.protocol)}  <span class="kv">耗时</span> ${d.durationMs == null ? '-' : d.durationMs + 'ms'}  <span class="kv">大小</span> ${d.encodedDataLength}B
 <span class="kv">时间    </span>${esc(d.time)}</pre>` +
+      initiatorBlock(d) +
+      timingBlock(d) +
       (d.restored ? '<h3>来源</h3><pre class="muted">上次会话恢复（不是本次抓取）</pre>' : '') +
       (d.failed ? `<h3>失败</h3><pre class="s4">${esc(d.failed.errorText)}${d.failed.blockedReason ? ' · ' + esc(d.failed.blockedReason) : ''}</pre>` : '') +
       (d.redirects.length ? `<h3>重定向链</h3><pre>${d.redirects.map((x) => `${x.status} ${esc(x.url)}\n   → ${esc(x.location)}`).join('\n')}</pre>` : '') +
@@ -535,11 +583,19 @@ function select(id) {
   clearTimeout(detailTimer);
   detailTimer = null;
   detailDirty = false;
-  const prev = selected != null ? rows.get(selected) : null;
-  if (prev && prev.node) prev.node.classList.remove('sel');
+  if (selected != null) {
+    const prevIdx = order.findIndex((e) => e.t === 'row' && e.id === selected);
+    const prevNode = prevIdx >= 0 ? live.get(prevIdx) : null;
+    if (prevNode) prevNode.classList.remove('sel');
+  }
   selected = id;
-  const cur = rows.get(id);
-  if (cur && cur.node) cur.node.classList.add('sel');
+  const idx = order.findIndex((e) => e.t === 'row' && e.id === id);
+  if (idx >= 0 && !live.has(idx)) {            // 目标不在窗口里：先滚到它附近
+    el.list.scrollTop = Math.max(0, idx * ROW_H - Math.round(el.list.clientHeight / 2));
+  }
+  renderWindow();
+  const node = idx >= 0 ? live.get(idx) : null;
+  if (node) node.classList.add('sel');
   view = 'list';
   syncTabs();
   renderDetail(id);
@@ -678,17 +734,10 @@ function refreshActiveList(d) {
     if (rows.has(rec.id)) updateRecord(rec);
     else appendRecord(rec);
   }
-  if (!rows.size) el.list.innerHTML = '<div class="empty">等待抓取…</div>';
-  // 整表同步是唯一允许 O(n) 扫一遍的地方：把 visible / domRows / visibleCount 与真实 DOM 对齐
-  visibleCount = 0;
-  domRows = 0;
-  for (const r of rows.values()) {
-    if (!r.node) continue;
-    domRows++;
-    r.visible = visible(r.node);
-    if (r.visible) visibleCount++;
-  }
+  if (!rows.size) el.listInner.innerHTML = '<div class="empty">等待抓取…</div>';
   listNew = 0;
+  applySort();                                          // 重建顺序表（过滤 + 排序 + 分组）并按窗口渲染
+  scrollListToBottom();                                 // 整表同步后停在最新（与原「DOM 全量重建」语义一致）
   updateListNew();
   updateListNote();
   rebuildWs(d.wsFrames || []);
@@ -1161,14 +1210,14 @@ function toast(msg, kind = 'info', ms = 4000, action) {
 /* ------------------------------------------------------------ 键盘快捷键 */
 
 function stepSelection(delta) {
-  const nodes = [...el.list.querySelectorAll('.row')].filter(visible);
-  if (!nodes.length) return;
-  let idx = nodes.findIndex((n) => Number(n.dataset.id) === selected);
+  const ids = [];
+  for (const e of order) if (e.t === 'row') ids.push(e.id);
+  if (!ids.length) return;
+  let idx = ids.indexOf(selected);
   if (idx < 0) idx = delta > 0 ? -1 : 0;
-  const node = nodes[Math.max(0, Math.min(nodes.length - 1, idx + delta))];
-  if (!node) return;
-  select(Number(node.dataset.id));
-  node.scrollIntoView({ block: 'nearest' });
+  const next = ids[Math.max(0, Math.min(ids.length - 1, idx + delta))];
+  if (next == null) return;
+  select(next);                                  // select 负责把目标滚进窗口并高亮
 }
 
 // 只注册这一个 keydown 监听；默认菜单栏已移除，Ctrl+R / Ctrl+Shift+R/I / F11 在这里补齐
@@ -1255,6 +1304,7 @@ $('expHtml').onclick = () => exportResult(ipcRenderer.invoke('cap:exportHtml'));
 $('expCookie').onclick = () => exportResult(ipcRenderer.invoke('cap:exportCookieJson'));
 $('expHar').onclick = () => exportResult(ipcRenderer.invoke('cap:exportHar', {}));
 $('expPostman').onclick = () => exportResult(ipcRenderer.invoke('cap:exportPostman', {}));
+$('expOpenApi').onclick = () => exportResult(ipcRenderer.invoke('cap:exportOpenApi', {}));
 $('copyMd').onclick = async () => {
   const ids = filteredIds();
   if (!ids.length) return toast('当前没有筛选项', 'warn');
@@ -1282,7 +1332,7 @@ el.detail.addEventListener('click', async (e) => {
     if (!r || !r.ok) return toast('标记失败：' + ((r && r.error) || '未知错误'), 'err');
     if (cur) {
       cur.rec = Object.assign({}, cur.rec, { star: r.record.star });
-      if (cur.node) paintRow(cur.node, cur.rec);
+      renderWindow();                        // 窗口内的行重画（星级在行 dataset 上）
     }
     if (detailData) detailData.star = r.record.star;
     renderDetail(detailId);
@@ -1315,6 +1365,28 @@ el.detail.addEventListener('click', async (e) => {
       : String(detailData.body == null ? '' : detailData.body);
     clipboard.writeText(text);
     $('status').textContent = `已复制${id === 'copyUrl' ? ' URL' : id === 'copyRespHeaders' ? '响应头' : '响应体'}（${text.length} 字符）`;
+  } else if (id === 'mockRec') {
+    const d = detailData;
+    if (!d) return;
+    let urlRe;
+    try { const u = new URL(d.url); urlRe = '^' + (u.origin + u.pathname).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+    catch (err) { urlRe = '^' + String(d.url).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+    const all = await ipcRenderer.invoke('cap:cfgAll');
+    const mock = (all && all.mock) || { on: true, rules: [] };
+    const rules = (mock.rules || []).concat([{
+      on: true, urlRe, status: d.status || 200,
+      headers: headersText(d.responseHeaders, d.responseHeadersRaw),
+      body: d.body == null ? '' : String(d.body), bodyBase64: !!d.bodyBase64,
+    }]);
+    const r = await ipcRenderer.invoke('cap:mockSet', { on: true, rules });
+    if (!r || !r.ok) return toast('设为 mock 失败：' + ((r && r.error) || '未知错误'), 'err');
+    toast('已添加 mock 规则：' + urlRe, 'ok', 6000);
+    return undefined;
+  } else if (id === 'copyInit') {
+    if (!detailData || !detailData.initiator) return;
+    const lines = initiatorLines(detailData.initiator);
+    clipboard.writeText(lines.join('\n'));
+    $('status').textContent = `已复制发起者（${lines.length} 行）`;
   } else if (id === 'bodyToggle') {
     if (detailId == null) return;
     if (detailFull.has(detailId)) detailFull.delete(detailId); else detailFull.add(detailId);
@@ -1545,6 +1617,83 @@ ipcRenderer.on('cap:saveRule', (_e, s) => {
   $('status').textContent = saveRuleText(s);
   return undefined;
 });
+/* ---- Mock：按 URL 规则本地返回响应（CDP Fetch 域）---- */
+async function openMock() {
+  const got = await ipcRenderer.invoke('cap:mockGet');
+  if (!got || !got.ok) return toast('读取 Mock 规则失败', 'err');
+  const mock = got.mock || { on: false, rules: [] };
+  const hits = got.hits || {};
+  const on = document.createElement('input');
+  on.type = 'checkbox';
+  on.id = 'mockOn';
+  on.checked = !!mock.on;
+  const onWrap = document.createElement('label');
+  onWrap.className = 'lbl';
+  onWrap.appendChild(on);
+  onWrap.appendChild(document.createTextNode(' 开启（命中规则的请求本地应答；未命中一律原样放行）'));
+  const stateLine = document.createElement('div');
+  stateLine.className = 'lbl';
+  const paintHits = (h) => {
+    const ks = Object.keys(h || {});
+    stateLine.textContent = `命中：${ks.length} 条规则 / 共 ${ks.reduce((n, k) => n + (h[k] || 0), 0)} 次`;
+  };
+  paintHits(hits);
+  const { table, tbody } = makeTable(['启用', 'URL 正则', '状态', '响应头（每行 名称: 值）', '响应体', '命中', '']);
+  const rules = (mock.rules || []).map((r) => Object.assign({}, r));
+  const paintRowM = (rule) => {
+    const tr = document.createElement('tr');
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.checked = rule.on !== false;
+    cb.addEventListener('change', () => { rule.on = cb.checked; });
+    const tdCb = document.createElement('td');
+    tdCb.appendChild(cb);
+    tr.appendChild(tdCb);
+    tr.appendChild(tdInput(rule.urlRe, (inp) => { rule.urlRe = inp.value.trim(); }));
+    tr.appendChild(tdInput(rule.status, (inp) => { rule.status = Number(inp.value) || 200; }));
+    tr.appendChild(tdInput(rule.headers, (inp) => { rule.headers = inp.value; }));
+    tr.appendChild(tdInput(rule.bodyBase64 ? `[base64] ${String(rule.body || '').slice(0, 80)}` : rule.body, (inp) => {
+      rule.body = inp.value; rule.bodyBase64 = false;
+    }));
+    tr.appendChild(tdText(String(hits[rule.id] || 0)));
+    tr.appendChild(tdBtn('删除', () => { rule.__deleted = true; tr.remove(); }));
+    tbody.appendChild(tr);
+  };
+  for (const r of rules) paintRowM(r);
+  const addBtn = document.createElement('button');
+  addBtn.className = 'ghost';
+  addBtn.textContent = '新增规则';
+  addBtn.onclick = () => {
+    const r = { on: true, urlRe: '', status: 200, headers: '', body: '', bodyBase64: false };
+    rules.push(r);
+    paintRowM(r);
+  };
+  const hint = document.createElement('div');
+  hint.className = 'lbl';
+  hint.textContent = '规则按顺序匹配，第一条命中生效；响应体逐字返回，二进制记录请用详情里的「设为 mock」（带 base64 标记）。改规则或开关会重置命中计数。';
+  openModal('Mock 改写（CDP Fetch 域：命中规则的请求本地应答）', [
+    onWrap, stateLine, table, addBtn, hint,
+  ], [
+    { id: 'mockSave', label: '保存', primary: true, onClick: async () => {
+      const payload = {
+        on: on.checked,
+        rules: rules.filter((r) => !r.__deleted).map((r) => ({
+          id: r.id, on: r.on !== false, urlRe: r.urlRe || '', status: r.status,
+          headers: r.headers || '', body: r.body || '', bodyBase64: !!r.bodyBase64,
+        })),
+      };
+      const r = await ipcRenderer.invoke('cap:mockSet', payload);
+      if (!r || !r.ok) return toast('保存失败：' + ((r && r.error) || '未知错误'), 'err');
+      paintHits(r.hits);
+      toast(`Mock 已${r.on ? '开启' : '关闭'}（${r.mock.rules.length} 条规则）`, 'ok');
+      return undefined;
+    } },
+    { label: '关闭', onClick: closeModal },
+  ]);
+  return undefined;
+}
+$('mockRule').onclick = openMock;
+
 $('cfgAllTabs').onclick = async () => {
   const r = await ipcRenderer.invoke('cap:cfgAllTabs');
   if (!r || !r.ok) return toast(`部分标签应用失败：${((r && r.failed) || []).join('；')}`, 'err');

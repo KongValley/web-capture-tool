@@ -697,6 +697,14 @@ function registerIpc() {
     return Object.assign({ ok: true }, capture.autoSaveState());
   });
   ipcMain.handle('cap:saveRuleGet', () => Object.assign({ ok: true, rule: settings.values.saveRule }, capture.autoSaveState()));
+  // Mock：设置变更后给所有标签同步 CDP Fetch 域并重置命中计数
+  ipcMain.handle('cap:mockSet', async (_e, mock) => {
+    const r = await settings.applySetting('mock', mock);
+    if (!r.ok) return r;
+    await capture.syncMock();
+    return Object.assign({ ok: true, mock: settings.values.mock }, capture.mockState());
+  });
+  ipcMain.handle('cap:mockGet', () => Object.assign({ ok: true, mock: settings.values.mock }, capture.mockState()));
   ipcMain.handle('cap:pickDir', () => files.pickDirectory());
   // 抓包快照：只存本次运行内存（≤2 个），对比键为 `METHOD url`
   ipcMain.handle('cap:snapSave', () => {
@@ -789,6 +797,17 @@ function registerIpc() {
       const name = `${files.exportBaseName('postman', currentPageUrl())}.json`;
       return await files.saveTextFile({ defaultName: name, content: JSON.stringify(col, null, 2), file });
     } catch (e) { logger.log('ipc', `cap:exportPostman: ${e.message}`); return { ok: false, error: e.message }; }
+  });
+
+  ipcMain.handle('cap:exportOpenApi', async (_e, payload) => {
+    try {
+      const { file, ids } = payload || {};
+      const set = Array.isArray(ids) && ids.length ? new Set(ids) : null;
+      const list = set ? state.records.filter((r) => set.has(r.id)) : state.records;
+      const doc = format.buildOpenApi(list, { title: currentPageTitle(), url: currentPageUrl() });
+      const name = `${files.exportBaseName('openapi', currentPageUrl())}.json`;
+      return await files.saveTextFile({ defaultName: name, content: JSON.stringify(doc, null, 2), file });
+    } catch (e) { logger.log('ipc', `cap:exportOpenApi: ${e.message}`); return { ok: false, error: e.message }; }
   });
 
   /* ------------------------------------------------------------ 页面工具 */
@@ -1066,6 +1085,10 @@ app.whenReady().then(() => {
   });
   settings.registerBlocker();          // 必须在任何导航之前注册（同一 session 只能注册一个监听器）
   settings.hydrate();                  // 磁盘设置灌进内存，控件与拦截器都读同一份
+
+  // 磁盘里的 mock 规则归一（幂等），并把当前开关同步给所有标签
+  settings.applyInner('mock', settings.values.mock);
+  capture.syncMock();
 
   // 证书错误：只有显式勾选「忽略证书错误」才放行，其余保持 Chromium 默认拒绝
   app.on('certificate-error', (event, _wc, url, error, _cert, callback) => {
