@@ -4,6 +4,8 @@
 
 专为 **Windows 7 SP1 32 位** 老机器适配（Electron 22.3.27 / Chromium 108 / ia32），同时可在 Windows 10/11 直接运行，绿色免安装。
 
+> 完整操作手册（逐功能入口、操作步骤、产物格式、常用配方、故障排查）：[docs/manual.md](docs/manual.md)。本 README 只做功能一览。
+
 ---
 
 ## 功能
@@ -338,6 +340,9 @@ dev/                 开发与验证工具（随包发布，打包版 exe 也能
   selftest.js          --selftest 全链路自检
   bench.js             --bench 性能基准（压力服务器 + 面板/主进程计时）
   make-icon.js         图标生成器（零依赖，代码绘制 → build/icon*.ico）
+
+docs/                面向使用者的文档
+  manual.md            操作手册：逐功能入口 / 操作步骤 / 产物格式 / 常用配方 / 故障排查
 ```
 
 依赖方向单向：`src/` 里所有模块只 `require('./state')`，任何模块都不 require `main.js`；`ui/renderer.js` 不 require 任何项目模块（只经 IPC 与主进程通信）；`dev/` 里的工具通过 `main.js` 注入的模块干活。
@@ -351,7 +356,7 @@ dev/                 开发与验证工具（随包发布，打包版 exe 也能
 - `userData` 目录名取自 `package.json` 的 `name`：开发态（`npm start`）与打包版**同为** `%APPDATA%\web-capture-tool`，配置、Cookie、录制产物互通。
 - Cookie、localStorage 等站点数据位于 `userData` 的持久分区内，清理该分区会同时清掉登录态。
 - 抓取记录上限 5000 条/标签、单条响应体 32MB、响应体总量 256MB、WebSocket 帧 2000 条，超出后按策略截断或丢弃并给出提示。
-- 多标签只在本次运行内有效：重启后回到单标签（会话恢复只恢复记录，不恢复标签布局）。
+- 会话恢复只覆盖最近的标签布局（最多 5 个标签的 URL，在后台重新打开）与记录 / 标记 / 备注，不还原页面内容与表单状态。
 - UA / 请求头 / 限速这三项设置作用于**当前活动标签**的视图；新建标签会沿用设置，但已存在的后台标签不会跟着改。
 - 后台标签关闭了 `backgroundThrottling` 以便继续抓包与自动翻页，代价是标签越多 CPU 占用越高。
 - 页面内查找的匹配计数始终准确；高亮是否可见取决于页面视图当前是否拿到焦点（被遮挡时可能看不到高亮，这是 Chromium 的渲染策略）。
