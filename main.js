@@ -45,7 +45,7 @@ const ICON = path.join(__dirname, 'build', 'icon.ico');
 if (process.platform === 'win32') app.setAppUserModelId('com.kongvalley.web-capture-tool');
 
 // 自检 / 基准改道到临时配置，绝不碰用户真实配置；随后同步读盘（后续默认值都从这里取）
-const SANDBOX = state.selftest ? 'selftest' : state.bench ? 'bench' : '';
+const SANDBOX = state.selftest ? 'selftest' : state.bench ? 'bench' : state.shots ? 'shots' : '';
 if (SANDBOX) {
   store.useFile(path.join(os.tmpdir(), `wct-${SANDBOX}-settings`, 'settings.json'));
   logger.useFile(path.join(os.tmpdir(), `wct-${SANDBOX}-logs`, 'app.log'));
@@ -1115,7 +1115,7 @@ app.whenReady().then(() => {
   registerIpc();
   createWindow();
   watchGpu();
-  if (!state.selftest && !state.bench) sessionStore.start();   // 自检/基准自己调 save/load，不受 30s 定时器干扰
+  if (!state.selftest && !state.bench && !state.shots) sessionStore.start();   // 自检/基准/截图自己调 save/load，不受 30s 定时器干扰
   // GPU 状态需要一点时间上报，面板首帧之后再判定（首次采样后还会二次复核，见 checkGpuOnce）
   if (state.win) state.win.webContents.once('did-finish-load', () => setTimeout(checkGpuOnce, 3000));
   if (state.selftest) {
@@ -1127,6 +1127,9 @@ app.whenReady().then(() => {
   if (state.bench) {
     require('./dev/bench.js').run({ state, capture, session: sessionStore, gpu });
   }
+  if (state.shots) {
+    require('./dev/shots.js').run({ state, layout, settings, capture, session: sessionStore, files, logger });
+  }
   app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
 });
 
@@ -1135,5 +1138,5 @@ app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(
 app.on('before-quit', () => {
   sessionStore.stop();
   recorder.flushSync();                            // 录制中的会话补一条 summary（reason:'quit'）
-  if (!state.selftest && !state.bench) sessionStore.saveSync();   // 自检/基准退出时不写会话文件
+  if (!state.selftest && !state.bench && !state.shots) sessionStore.saveSync();   // 自检/基准/截图退出时不写会话文件
 });

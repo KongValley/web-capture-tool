@@ -283,6 +283,7 @@ npm run selftest        # 165 项断言：抓取 / 发起者与耗时分解 / �
 npm run selftest:sw     # 同一套断言在软件渲染下再跑一遍（等价于无显卡机器）
 npm run bench           # 性能基准：抓包 CPU / 列表渲染 / 过滤 / 排序 / 序列化 / 内存
 npm run bench:sw        # 基准跑在软件渲染下（无显卡机器上的真实数字）
+npm run shots           # 生成本手册截图到 docs/img/（本地示例站点；沙盒配置，窗口会真的弹出来）
 npm run icon            # 重新生成 build/icon.ico 与 build/icon-128.ico
 npm run pack            # 打包 = pack:dir + pack:zip → dist/web-capture-tool-win32-ia32/ 与同名 .zip
 npm run pack:dir        # 只生成免安装目录（可单独跑，配合 --icon 换 128 尺寸图标）
@@ -339,10 +340,12 @@ ui/                  面板（渲染进程，本地文件）
 dev/                 开发与验证工具（随包发布，打包版 exe 也能 --selftest / --bench）
   selftest.js          --selftest 全链路自检
   bench.js             --bench 性能基准（压力服务器 + 面板/主进程计时）
+  shots.js             --shots 手册截图（示例站点 + 面板摆位 + 整窗合成到 docs/img/）
   make-icon.js         图标生成器（零依赖，代码绘制 → build/icon*.ico）
 
 docs/                面向使用者的文档
   manual.md            操作手册：逐功能入口 / 操作步骤 / 产物格式 / 常用配方 / 故障排查
+  img/                 手册截图（由 npm run shots 生成，本地示例站点）
 ```
 
 依赖方向单向：`src/` 里所有模块只 `require('./state')`，任何模块都不 require `main.js`；`ui/renderer.js` 不 require 任何项目模块（只经 IPC 与主进程通信）；`dev/` 里的工具通过 `main.js` 注入的模块干活。
