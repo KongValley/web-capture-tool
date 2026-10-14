@@ -16,6 +16,7 @@
  *   src/           主进程内部模块：state 共享状态 / store 设置持久化 / logger 日志 / gpu 判定 /
  *                  capture 抓取 / settings 设置唯一写入口 / files 落盘 / session 会话持久化 /
  *                  extract 页面采集与提取 / picker 元素拾取 / automation 自动化 / recorder 会话录制 / format 纯函数
+ *                  bundle 离线包（当前页 + 静态资源镜像，附 JS 清单 / 抓包记录 / 加密线索）
  *   ui/            面板（渲染进程）：index.html + renderer.js，本地文件，永不加载远程内容
  *   dev/           开发与验证工具：selftest 全链路自检 / bench 性能基准 / make-icon 图标生成（随包发布，供 exe --selftest / --bench）
  * 依赖方向单向：src 内所有模块只 require('./state')，禁止任何模块 require main.js。
@@ -36,6 +37,7 @@ const settings = require('./src/settings');
 const automation = require('./src/automation');
 const format = require('./src/format');
 const files = require('./src/files');
+const bundle = require('./src/bundle');
 const recorder = require('./src/recorder');
 const picker = require('./src/picker');
 
@@ -679,6 +681,14 @@ function registerIpc() {
   });
   ipcMain.handle('cap:saveText', (_e, payload) => files.saveTextFile(payload));
   ipcMain.handle('cap:saveBodies', (_e, dir) => files.saveBodies(dir));
+  // 离线包：当前页 + 静态资源镜像成可离线打开的目录（含 JS 清单 / network.json / hints.json）
+  ipcMain.handle('cap:bundleSave', (_e, opts) => bundle.saveBundle(opts || {}));
+  ipcMain.handle('cap:openDir', (_e, dir) => {
+    const d = String(dir == null ? '' : dir);
+    if (!d) return { ok: false, error: '没有目录' };
+    shell.openPath(d).catch(() => { /* 打不开就算了，导出本身已成功 */ });
+    return { ok: true };
+  });
   // 规则落盘：设置变更后重置本次运行的计数与上限提示
   ipcMain.handle('cap:saveRuleSet', async (_e, rule) => {
     const r = await settings.applySetting('saveRule', rule);
@@ -1087,7 +1097,7 @@ app.whenReady().then(() => {
   if (state.win) state.win.webContents.once('did-finish-load', () => setTimeout(checkGpuOnce, 3000));
   if (state.selftest) {
     require('./dev/selftest.js').run({
-      state, store, gpu, capture, extract, settings, automation, format, files, logger,
+      state, store, gpu, capture, extract, settings, automation, format, files, bundle, logger,
       session: sessionStore, recorder, picker, resetActive, PARTITION,
     });
   }

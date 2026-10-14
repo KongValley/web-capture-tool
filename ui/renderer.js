@@ -2131,6 +2131,75 @@ $('saveBodies').onclick = () => ipcRenderer.invoke('cap:saveBodies').then((r) =>
   toast(`已写入 ${r.written} 个文件 → ${r.dir}（跳过 ${r.skipped} 条无响应体）`, 'ok', 7000);
 });
 
+/* ---- 离线包：当前页 + 静态资源镜像成可离线打开的目录 ---- */
+function openBundle() {
+  const dir = document.createElement('input');
+  dir.placeholder = '导出目录（留空 = 弹目录选择框）';
+  dir.style.flex = '1';
+  const pick = document.createElement('button');
+  pick.textContent = '选择…';
+  pick.onclick = async () => {
+    const r = await ipcRenderer.invoke('cap:pickDir');
+    if (r && r.ok) dir.value = r.dir;
+  };
+  const dirRow = document.createElement('div');
+  dirRow.style.display = 'flex';
+  dirRow.style.gap = '6px';
+  dirRow.appendChild(dir);
+  dirRow.appendChild(pick);
+  const mkToggle = (text, id) => {
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.id = id;
+    cb.checked = true;
+    const w = document.createElement('label');
+    w.className = 'lbl';
+    w.style.display = 'block';
+    w.appendChild(cb);
+    w.appendChild(document.createTextNode(' ' + text));
+    return { cb, w };
+  };
+  const net = mkToggle('附 network.json（本次抓包的请求头 / 请求体 / 响应头，供复现签名请求）', 'bundleNet');
+  const hint = mkToggle('附 hints.json（参数名 / 值在已存 JS 里的定位，找加密入口）', 'bundleHints');
+  const out = document.createElement('div');
+  out.className = 'lbl';
+  out.id = 'bundleOut';
+  const openDir = document.createElement('button');
+  openDir.id = 'bundleOpenDir';
+  openDir.textContent = '打开目录';
+  openDir.style.display = 'none';
+  let exported = '';
+  openDir.onclick = () => ipcRenderer.invoke('cap:openDir', exported);
+  openModal('离线包（当前页 + 静态资源，供离线复现）', [
+    labelled('导出目录', dirRow),
+    net.w,
+    hint.w,
+    out,
+    openDir,
+  ], [
+    { id: 'bundleRun', label: '导出离线包', primary: true, onClick: async () => {
+      const r = await ipcRenderer.invoke('cap:bundleSave', {
+        dir: dir.value.trim(), includeNetwork: net.cb.checked, includeHints: hint.cb.checked,
+      });
+      if (!r) return toast('离线包导出失败：无响应', 'err');
+      if (r.canceled) return void ($('status').textContent = '离线包导出已取消');
+      if (!r.ok) return toast('离线包导出失败：' + (r.error || '未知错误'), 'err');
+      exported = r.dir;
+      openDir.style.display = '';
+      dir.value = r.dir;
+      out.textContent = `已写入 ${r.files} 个文件 / ${r.bytes} 字节 → ${r.dir}`
+        + (r.missing.length ? `；缺失 ${r.missing.length} 项（见 manifest.json）` : '')
+        + `｜耗时 ${r.ms}ms；双击入口 ${r.entry} 即可离线打开`;
+      $('status').textContent = `离线包已导出 → ${r.dir}（入口 ${r.entry}）`;
+      toast(`离线包已导出：${r.files} 个文件`, 'ok', 7000);
+      return undefined;
+    } },
+    { label: '关闭', onClick: closeModal },
+  ]);
+  return undefined;
+}
+$('bundleBtn').onclick = openBundle;
+
 /* ---- 页面内执行 JS（CDP Runtime.evaluate，不受页面 CSP 限制）---- */
 const jsHistory = [];      // 仅内存的最近 10 条命令
 
