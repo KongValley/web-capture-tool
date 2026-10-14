@@ -153,7 +153,7 @@ async function run({ state, capture, session, gpu }) {
     add('  每请求主进程 CPU', (cpuMs(cpu) / BURST).toFixed(3), 'ms');
     await waitFor(() => state.records.length >= BURST + 2, 120000, '记录入内存');
     const domReady = Date.now() - t0;
-    await waitFor(async () => Number(await peval(`document.querySelectorAll('#list .row').length`)) >= BURST, 60000, '面板渲染完成');
+    await waitFor(async () => Number(await peval('rows.size')) >= BURST, 60000, '面板渲染完成');
     add('面板渲染完成（含 100ms 批）', Date.now() - t0, 'ms', `DOM 就绪 ${domReady}ms`);
 
     // ---- 本地测试服务器自身开销（对照）：net.request 直读同一批 URL，不经 CDP / 面板 ----

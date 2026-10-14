@@ -810,17 +810,18 @@ async function run({ state, store, gpu, extract, settings, automation, format, f
         document.querySelector('#bannerActions button').click();
         return true;
       })()`);
-      await waitFor(async () => (await peval('document.querySelectorAll("#list .row").length')) === restored.count && restored.count > 0,
+      await waitFor(async () => Number(await peval('rows.size')) === restored.count && restored.count > 0,
         8000, '横幅恢复列表').catch(() => {});
-      const uiRows = await peval('document.querySelectorAll("#list .row").length');
+      const memRows = await peval('rows.size');
+      const domRowsNow = await peval('document.querySelectorAll("#list .row").length');
       // 面板横幅「忽略」：删除会话文件
       await peval(`(() => { document.querySelectorAll('#bannerActions button')[1].click(); return true; })()`);
       await sleep(300);
       const discarded = await pinvoke('cap:sessionInfo');
       check('会话恢复',
         info.exists === true && restored.ok && restored.count === Math.min(info.count, 2000) && restored.records.length === restored.count
-          && uiRows === restored.count && discarded.exists === false,
-        `exists=${info.exists} 写盘 ${info.count} 条 / 恢复 ${restored.count} 条 / 横幅渲染 ${uiRows} 行 / 忽略后存在=${discarded.exists}`);
+          && memRows === restored.count && domRowsNow >= 1 && domRowsNow <= 80 && discarded.exists === false,
+        `exists=${info.exists} 写盘 ${info.count} 条 / 恢复 ${restored.count} 条 / 面板内存 ${memRows} 行（DOM ${domRowsNow}） / 忽略后存在=${discarded.exists}`);
     } catch (e) { check('会话恢复', false, e.message); }
 
     // 91 会话体积裁剪
@@ -1129,15 +1130,9 @@ async function run({ state, store, gpu, extract, settings, automation, format, f
       })()`);
       const cleaned = await peval(`(() => {
         let removed = 0;
-        for (let i = 0; i < 60; i++) {
-          const r = rows.get(991000 + i);
-          if (r) { if (r.node) { r.node.remove(); domRows--; } rows.delete(991000 + i); removed++; }
-        }
-        for (let i = 0; i < 3; i++) {
-          const r = rows.get(990001 + i);
-          if (r) { if (r.node) { r.node.remove(); domRows--; } rows.delete(990001 + i); removed++; }
-        }
-        updateCounts(); updateListNote(); updateListNew();
+        for (let i = 0; i < 60; i++) if (rows.has(991000 + i)) { dropRow(991000 + i); removed++; }
+        for (let i = 0; i < 3; i++) if (rows.has(990001 + i)) { dropRow(990001 + i); removed++; }
+        applySort(); updateListNew();
         return removed;
       })()`);
       check('列表跟随与未读提示',
@@ -1146,18 +1141,25 @@ async function run({ state, store, gpu, extract, settings, automation, format, f
         `可滚动=${follow.scrollable} 未读按钮=${JSON.stringify(follow.btn)} 点击后 top=${clickedNew.top} 清理=${cleaned}`);
     } catch (e) { check('列表跟随与未读提示', false, e.message); }
 
-    // 108 大列表渲染上限
+    // 108 列表虚拟滚动（去掉了 3000 行渲染上限：DOM 只保留窗口内的行）
     try {
       const cap108 = await peval(`(() => {
         for (let i = 0; i < 3006; i++) appendRecord({ id: 992000 + i, method: 'GET', url: 'http://cap/' + i, type: 'XHR', status: 200, size: 1, duration: 1, time: new Date().toISOString() });
+        applySort();
         const note = document.getElementById('listNote');
-        return { max: LIST_MAX_ROWS, dom: document.querySelectorAll('#list .row').length, size: rows.size, note: note.hidden ? '' : note.textContent };
+        const inner = document.getElementById('listInner');
+        return {
+          dom: document.querySelectorAll('#list .row').length,
+          size: rows.size,
+          inner: Math.round(Number((inner.style.height || '0px').replace('px', ''))),
+          note: note.hidden ? '' : note.textContent,
+        };
       })()`);
       await peval(`ipcRenderer.invoke('cap:list').then((d) => { refreshActiveList(d); return true; })`);
-      check('大列表渲染上限',
-        cap108.max === 3000 && cap108.dom <= 3000 && cap108.size >= 3006 && /已隐藏更早 \d+ 条/.test(cap108.note),
-        `上限=${cap108.max} DOM=${cap108.dom} 内存=${cap108.size} 提示=${JSON.stringify(cap108.note)}`);
-    } catch (e) { check('大列表渲染上限', false, e.message); }
+      check('列表虚拟滚动',
+        cap108.dom > 0 && cap108.dom <= 80 && cap108.size >= 3006 && cap108.inner === cap108.size * 26 && cap108.note === '',
+        `DOM=${cap108.dom} 内存=${cap108.size} 内层高=${cap108.inner}px 提示=${JSON.stringify(cap108.note)}`);
+    } catch (e) { check('列表虚拟滚动', false, e.message); }
 
     // 109 关闭标签可撤销
     try {
@@ -1223,7 +1225,11 @@ async function run({ state, store, gpu, extract, settings, automation, format, f
       await sleep(1500);
       const tabsAfter112 = (await pinvoke('cap:tabList')).length;
       const l112 = await pinvoke('cap:list');
-      const domRestored = await peval(`!!document.querySelector('#list .row[data-restored="1"]')`);
+      const domRestored = await peval(`(() => {
+        document.getElementById('list').scrollTop = 1e9;   // 虚拟滚动：恢复的记录在尾部窗口里
+        renderWindow();
+        return !!document.querySelector('#list .row[data-restored="1"]');
+      })()`);
       check('会话恢复标签布局与来源标记',
         Array.isArray(sess.tabs) && sess.tabs.length === Math.min(realTabs, 5) && restored112.ok
           && tabsAfter112 === tabsBefore112 + sess.tabs.length
@@ -1411,8 +1417,7 @@ async function run({ state, store, gpu, extract, settings, automation, format, f
       await peval(`(() => { const f = document.getElementById('filter'); f.value = 'body:"ok":true'; f.dispatchEvent(new Event('input', { bubbles: true })); return true; })()`);
       await sleep(900);
       const ui121 = await peval(`(() => {
-        let scan = 0;
-        for (const r of rows.values()) if (r.node && r.node.style.display !== 'none') scan++;
+        const scan = [...rows.values()].filter((r) => matches(r.rec)).length;   // 内存口径（虚拟滚动下 DOM 只是窗口切片）
         return {
           n: document.getElementById('nReq').textContent,
           note: document.getElementById('listNote').hidden ? '' : document.getElementById('listNote').textContent,
@@ -1581,15 +1586,14 @@ async function run({ state, store, gpu, extract, settings, automation, format, f
       await peval(`ipcRenderer.invoke('cap:list').then((d) => { refreshActiveList(d); return true; })`);
       await sleep(300);
       const ui131 = await peval(`(() => {
-        const rowsAll = [...rows.values()];
-        const scan = rowsAll.filter((r) => r.node && r.node.style.display !== 'none').length;
+        const scan = [...rows.values()].filter((r) => matches(r.rec)).length;
         applyBatch({ records: [{ id: 991001, method: 'GET', url: 'http://batch/probe', type: 'XHR', status: 200, size: 1, duration: 1, time: new Date().toISOString() }] });
         const appended = rows.has(991001);
         applyBatch({ drops: [991001], updates: [{ id: 991001, method: 'GET', url: 'http://batch/probe', type: 'XHR', status: 500, size: 1, duration: 1, time: new Date().toISOString() }] });
         return { memory: rows.size, scan, nReq: Number(document.getElementById('nReq').textContent), dom: document.querySelectorAll('#list .row').length, appended, revived: rows.has(991001) };
       })()`);
       check('抓包事件批处理',
-        ui131.memory === l131.records.length && ui131.dom === ui131.memory && ui131.nReq === ui131.scan
+        ui131.memory === l131.records.length && ui131.dom > 0 && ui131.dom <= 80 && ui131.nReq === ui131.scan
           && ui131.appended === true && ui131.revived === false,
         `主进程 ${l131.records.length} 条 / 面板内存 ${ui131.memory} / DOM ${ui131.dom} / nReq=${ui131.nReq}（扫描 ${ui131.scan}）放入=${ui131.appended} drop 后更新复活=${ui131.revived}`);
     } catch (e) { check('抓包事件批处理', false, e.message); }
@@ -1601,8 +1605,7 @@ async function run({ state, store, gpu, extract, settings, automation, format, f
         const d = await ipcRenderer.invoke('cap:list');
         refreshActiveList(d);
         const firstAfter = document.querySelector('#list .row');
-        let scan = 0;
-        for (const r of rows.values()) if (r.node && r.node.style.display !== 'none') scan++;
+        const scan = document.querySelectorAll('#list .row').length;
         return {
           same: first === firstAfter,
           n: Number(document.getElementById('nReq').textContent),
@@ -1612,8 +1615,8 @@ async function run({ state, store, gpu, extract, settings, automation, format, f
         };
       })()`);
       check('计数与差量同步',
-        sync132.same && sync132.n === sync132.scan && sync132.total === sync132.size && sync132.scan >= 1,
-        `首行节点保持=${sync132.same} nReq=${sync132.n}（扫描 ${sync132.scan}）count=${sync132.total}=${sync132.size}`);
+        sync132.same && sync132.n === sync132.total && sync132.total === sync132.size && sync132.scan >= 1 && sync132.scan <= 80,
+        `首行节点保持=${sync132.same} nReq=${sync132.n}（窗口 ${sync132.scan} 行）count=${sync132.total}=${sync132.size}`);
     } catch (e) { check('计数与差量同步', false, e.message); }
 
     // 133 录制动作带元素标签链与类型（jsonl / .md 时间线 / 面板实时条目 / cap:recRead 投影 四条通路）
@@ -1707,7 +1710,7 @@ async function run({ state, store, gpu, extract, settings, automation, format, f
         return { hit, dom, mem, after: rows.size };
       })()`);
       check('导出/复制按内存过滤',
-        cap136.hit === 3006 && cap136.dom <= 3000 && cap136.mem >= 3006,
+        cap136.hit === 3006 && cap136.dom <= 80 && cap136.mem >= 3006,
         `命中=${cap136.hit} DOM 行=${cap136.dom} 内存=${cap136.mem} 清理后内存=${cap136.after}`);
     } catch (e) { check('导出/复制按内存过滤', false, e.message); }
 
@@ -1825,7 +1828,7 @@ async function run({ state, store, gpu, extract, settings, automation, format, f
       const rec144 = [...state.records].reverse().find((r) => r.body && r.body.includes('"ok":true'));
       const rawMark = '"ok":true';
       const prettyMark = '"ok": true';
-      await peval(`(() => { const row = document.querySelector('#list .row[data-id="${rec144.id}"]'); if (row) row.click(); return true; })()`);
+      await peval('select(' + rec144.id + ')');            // 虚拟滚动：用 select 把它滚进窗口（不再按 DOM 行点）
       await waitFor(async () => await peval(`!!document.getElementById('bodyPretty')`), 8000, '美化按钮').catch(() => {});
       const hasBtn144 = await peval(`!!document.getElementById('bodyPretty')`);
       const before144 = await peval(`document.getElementById('detail').textContent.includes(${JSON.stringify(rawMark)})`);
@@ -1934,28 +1937,28 @@ async function run({ state, store, gpu, extract, settings, automation, format, f
           : r149.error);
     } catch (e) { check('翻页 + 提取合并', false, e.message); }
 
-    // 150 规则落盘（命中写文件、CSS 不落、计数与 note）
+    // 150 规则落盘（站点目录树镜像：命中写文件、CSS 不落、计数与 note）
     try {
       const dir150 = path.join(outDir, 'auto');
+      const rel150 = ['site', `127.0.0.1_${port}`, 'api', 'data.json'];
+      const relText150 = rel150.join('/');
+      const file150 = path.join(dir150, ...rel150);
       const set150 = await pinvoke('cap:saveRuleSet', { on: true, urlRe: '/api/data', mimes: 'json', types: 'all', dir: dir150 });
       await reloadAndWait(state.view.webContents);
-      let files150 = [];
       try {
-        await waitFor(() => {
-          files150 = fs.readdirSync(dir150);
-          return files150.length > 0;
-        }, 8000, '落盘文件');
+        await waitFor(() => fs.existsSync(file150), 8000, '落盘文件');
       } catch (e) { /* 下面按实际情况判定 */ }
-      const json150 = files150.find((n) => n.endsWith('.json'));
-      const body150 = json150 ? fs.readFileSync(path.join(dir150, json150), 'utf8') : '';
+      const exists150 = fs.existsSync(file150);
+      const body150 = exists150 ? fs.readFileSync(file150, 'utf8') : '';
       const got150 = await pinvoke('cap:saveRuleGet');
       const list150 = (await pinvoke('cap:list')).records;
       const rec150 = list150.find((r) => String(r.url).endsWith('/api/data') && String(r.note || '').includes('已落盘'));
-      const noCss150 = !files150.some((n) => n.endsWith('.css'));
+      const noCss150 = !fs.existsSync(path.join(dir150, 'site', `127.0.0.1_${port}`, 'style.css'));
       check('规则落盘（命中 / 未命中 / 计数）',
-        set150.ok && files150.length >= 1 && !!json150 && body150.includes('"ok":true') && noCss150
-          && got150.ok && got150.n >= 1 && got150.rule.on === true && !!rec150,
-        `文件=${files150.join(',')} 计数=${got150.n} 大小=${got150.bytes}B 无 css=${noCss150} note=${rec150 ? rec150.note : '无'}`);
+        set150.ok && exists150 && body150.includes('"ok":true') && noCss150
+          && got150.ok && got150.n >= 1 && got150.rule.on === true
+          && !!rec150 && String(rec150.note).includes(relText150),
+        `文件=${relText150} 存在=${exists150} 计数=${got150.n} 大小=${got150.bytes}B 无 css=${noCss150} note=${rec150 ? rec150.note : '无'}`);
       await pinvoke('cap:saveRuleSet', { on: false, urlRe: '', mimes: '', types: 'all', dir: '' });
     } catch (e) { check('规则落盘（命中 / 未命中 / 计数）', false, e.message); }
 
@@ -2024,7 +2027,10 @@ async function run({ state, store, gpu, extract, settings, automation, format, f
         const sel = document.getElementById('sortBy');
         sel.value = 'size';
         sel.dispatchEvent(new Event('change', { bubbles: true }));
-        const maxSize = Math.max(...[...rows.values()].map((r) => r.rec.size || 0));
+        const shown = [...rows.values()].filter((r) => matches(r.rec));   // 排序只覆盖当前显示的记录
+        const maxSize = Math.max(...shown.map((r) => r.rec.size || 0));
+        document.getElementById('list').scrollTop = 0;      // 虚拟滚动：先滚到顶部，DOM 首行才是排序后的第一行
+        renderWindow();
         const top = document.querySelector('#list .row');
         const topSize = top ? ((rows.get(Number(top.dataset.id)) || {}).rec || {}).size || 0 : -1;
         const stillOldest = [...rows.keys()][0] === oldest;
@@ -2044,13 +2050,17 @@ async function run({ state, store, gpu, extract, settings, automation, format, f
         const sel = document.getElementById('sortBy');
         sel.value = 'domain';
         sel.dispatchEvent(new Event('change', { bubbles: true }));
-        const hosts = new Set();
+        const hosts = new Map();
         for (const r of rows.values()) {
-          if (!r.node || !r.visible) continue;
-          try { hosts.add(new URL(r.rec.url).host); } catch (e) { hosts.add('(无法解析)'); }
+          if (!matches(r.rec)) continue;
+          let h = '(无法解析)';
+          try { h = new URL(r.rec.url).host; } catch (e) { /* 保持默认 */ }
+          hosts.set(h, (hosts.get(h) || 0) + 1);
         }
         const grps = [...document.querySelectorAll('#list .grp')].map((g) => g.textContent);
-        const ok = grps.length === hosts.size && [...hosts].every((h) => grps.some((t) => t.includes(h)));
+        const ok = grps.length >= 1
+          && grps.every((t) => [...hosts.keys()].some((h) => t.startsWith(h + ' · ')))
+          && grps.every((t) => { const h = t.split(' · ')[0]; return t.includes(h + ' · ' + hosts.get(h) + ' 条'); });
         sel.value = 'time';
         sel.dispatchEvent(new Event('change', { bubbles: true }));
         const after = document.querySelectorAll('#list .grp').length;
@@ -2121,8 +2131,8 @@ async function run({ state, store, gpu, extract, settings, automation, format, f
       const css = cssRef ? bundleRead(cssRef.local) : '';
       const imgBytes = imgRef ? fs.readFileSync(path.join(bundleDir, ...String(imgRef.local).split('/'))) : Buffer.alloc(0);
       // 纯函数不变量：查询串哈希命名、目录 URL 的 index 命名、CSS 里 url(…) 的重写
-      const namingOk = bundle.localPathOf('http://h/a.js?x=1', 'application/javascript', false) === `site/h/a_q_${crypto.createHash('sha1').update('x=1').digest('hex').slice(0, 8)}.js`
-        && bundle.localPathOf('http://h/dir/', 'text/css', false) === 'site/h/dir/index.css'
+      const namingOk = files.localPathOf('http://h/a.js?x=1', 'application/javascript', false) === `site/h/a_q_${crypto.createHash('sha1').update('x=1').digest('hex').slice(0, 8)}.js`
+        && files.localPathOf('http://h/dir/', 'text/css', false) === 'site/h/dir/index.css'
         && bundle.rewriteRefs('body{background:url(/img.png)}', 'http://h/style.css', new Map([['http://h/img.png', 'site/h/img.png']]), 'site/h/style.css') === 'body{background:url(img.png)}';
       check('离线包引用重写与字节一致',
         !html.includes('href="/style.css"') && !html.includes('src="/img.png"') && /href="[^"]*style\.css"/.test(html)
@@ -2168,6 +2178,70 @@ async function run({ state, store, gpu, extract, settings, automation, format, f
           && probe.exists && probe.open && probe.closed,
         `POST 记录=${postInNet}；ping 命中=${ping ? ping.hits.length : 0}（${ping && ping.hits[0] ? `${ping.hits[0].file}:${ping.hits[0].line}` : '无'}）；按钮=${probe.exists} 模态=${probe.open}`);
     } catch (e) { check('离线包 network 与 hints', false, e.message); }
+
+    // 162 详情显示请求发起者（CDP initiator 调用栈：哪个脚本哪一行发的请求）
+    try {
+      const get162 = state.records.find((r) => r.method === 'GET' && r.url === base + '/api/data');
+      let has162 = false;
+      if (get162) {
+        await peval('select(' + get162.id + ')');
+        await waitFor(async () => (await peval(`document.getElementById('detail').textContent`)).includes('发起者'), 8000, '详情发起者').catch(() => {});
+        has162 = (await peval(`document.getElementById('detail').textContent`)).includes('发起者');
+      }
+      const frames162 = get162 && get162.initiator ? (get162.initiator.stack || []).length : 0;
+      check('详情显示请求发起者',
+        !!(get162 && get162.initiator && get162.initiator.type && frames162 >= 1 && has162),
+        get162 && get162.initiator ? `type=${get162.initiator.type} 帧=${frames162} 详情含段=${has162}` : '无 initiator');
+    } catch (e) { check('详情显示请求发起者', false, e.message); }
+
+    // 163 请求耗时分解（CDP response.timing → DNS / 连接 / TLS / 发送 / 等待 / 下载）
+    try {
+      const post163 = state.records.find((r) => r.method === 'POST' && r.postData === 'ping=1');
+      const tp163 = post163 ? capture.fullRecord(post163).timingParts : null;
+      let has163 = false;
+      if (post163) {
+        await peval('select(' + post163.id + ')');
+        await waitFor(async () => (await peval(`document.getElementById('detail').textContent`)).includes('耗时分解'), 8000, '详情耗时分解').catch(() => {});
+        has163 = (await peval(`document.getElementById('detail').textContent`)).includes('耗时分解');
+      }
+      const keys163 = ['dns', 'connect', 'tls', 'send', 'wait', 'download'];
+      check('请求耗时分解',
+        !!(post163 && post163.timing && typeof post163.timing.receiveHeadersEnd === 'number' && tp163
+          && keys163.every((k) => typeof tp163[k] === 'number' && tp163[k] >= 0) && has163),
+        tp163 ? `receiveHeadersEnd=${post163.timing.receiveHeadersEnd} 等待=${tp163.wait}ms 下载=${tp163.download}ms 详情含段=${has163}` : '无 timing');
+    } catch (e) { check('请求耗时分解', false, e.message); }
+
+    // 164 OpenAPI 3 导出（同源 2xx 记录 → 接口文档；夹具的 POST ping=1 落在表单编码分支）
+    try {
+      const file164 = path.join(outDir, 'openapi.json');
+      const oa164 = await pinvoke('cap:exportOpenApi', { file: file164 });
+      const doc164 = JSON.parse(fs.readFileSync(file164, 'utf8'));
+      const post164 = doc164.paths['/api/data'] && doc164.paths['/api/data'].post;
+      const form164 = post164 && post164.requestBody && post164.requestBody.content['application/x-www-form-urlencoded'];
+      check('OpenAPI 3 导出',
+        !!(oa164 && oa164.ok && doc164.openapi === '3.0.3' && doc164.servers[0] && doc164.servers[0].url === base
+          && post164 && form164 && form164.example.ping === '1'),
+        `paths=${Object.keys(doc164.paths).length} 服务器=${doc164.servers[0] && doc164.servers[0].url} 表单示例=${form164 ? JSON.stringify(form164.example) : '无'}`);
+    } catch (e) { check('OpenAPI 3 导出', false, e.message); }
+
+    // 165 Mock 命中与透传（CDP Fetch 域：命中规则本地应答，未命中原样走服务器）
+    try {
+      const m165 = await pinvoke('cap:mockSet', {
+        on: true,
+        rules: [{ on: true, urlRe: '^' + base + '/api/needle', status: 201, headers: 'X-Mock: 1', body: '{"mocked":true}', bodyBase64: false }],
+      });
+      const got165 = await state.view.webContents.executeJavaScript(
+        "Promise.all([fetch('/api/needle').then(async (r) => ({ status: r.status, ok: r.ok, type: r.type, mock: r.headers.get('x-mock'), text: await r.text() })).catch((e) => ({ err: String(e) })), fetch('/api/data').then((r) => r.json()).catch(() => null)])", true);
+      const ruleId165 = m165 && m165.mock && m165.mock.rules[0] ? m165.mock.rules[0].id : '';
+      const st165 = await pinvoke('cap:mockGet');
+      const off165 = await pinvoke('cap:mockSet', { on: false, rules: [] });
+      const needle = got165[0] || {};
+      const pass = got165[1];
+      check('Mock 命中与透传',
+        !!(m165 && m165.ok && needle.status === 201 && needle.mock === '1' && /"mocked":true/.test(String(needle.text))
+          && pass && pass.ok === true && (st165.hits[ruleId165] || 0) >= 1 && off165 && off165.ok && off165.on === false),
+        `needle=${JSON.stringify(needle).slice(0, 220)} 透传=${pass && pass.ok} 命中=${st165 && st165.hits[ruleId165]} 关闭后开关=${off165 && off165.on}`);
+    } catch (e) { check('Mock 命中与透传', false, e.message); }
   } catch (e) {
     check('自检执行', false, `${e.message} | status=${state.status} attached=${wc.debugger.isAttached()}`);
   }
