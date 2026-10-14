@@ -11,27 +11,33 @@
  *       Network.* 事件拿全部请求/响应头/响应体/重定向/失败；Runtime.evaluate 取页面数据。
  *       CDP 不受页面 CSP 限制，且不需要在页面里注入脚本。
  *
- * 模块：state.js 共享状态 / capture.js 抓取 / extract.js 页面提取 / 其余见各文件头。
- * 依赖方向单向：所有模块 require('./state')，禁止任何模块 require main.js。
+ * 模块（目录即模块）：
+ *   main.js        本文件：主进程装配层（唯一入口，package.json 的 main）
+ *   src/           主进程内部模块：state 共享状态 / store 设置持久化 / logger 日志 / gpu 判定 /
+ *                  capture 抓取 / settings 设置唯一写入口 / files 落盘 / session 会话持久化 /
+ *                  extract 页面采集与提取 / picker 元素拾取 / automation 自动化 / recorder 会话录制 / format 纯函数
+ *   ui/            面板（渲染进程）：index.html + renderer.js，本地文件，永不加载远程内容
+ *   dev/           开发与验证工具：selftest 全链路自检 / bench 性能基准 / make-icon 图标生成（随包发布，供 exe --selftest / --bench）
+ * 依赖方向单向：src 内所有模块只 require('./state')，禁止任何模块 require main.js。
  */
 const { app, BrowserWindow, BrowserView, ipcMain, session, screen, shell, Menu, net } = require('electron');
 const path = require('node:path');
 const os = require('node:os');
 const fs = require('node:fs');
 
-const { PARTITION, TOOLBAR_H, state, send, setStatus, normalizeUrl, syncActive, resetActive } = require('./state');
-const store = require('./store');
-const logger = require('./logger');
-const sessionStore = require('./session');
-const gpu = require('./gpu');
-const capture = require('./capture');
-const extract = require('./extract');
-const settings = require('./settings');
-const automation = require('./automation');
-const format = require('./format');
-const files = require('./files');
-const recorder = require('./recorder');
-const picker = require('./picker');
+const { PARTITION, TOOLBAR_H, state, send, setStatus, normalizeUrl, syncActive, resetActive } = require('./src/state');
+const store = require('./src/store');
+const logger = require('./src/logger');
+const sessionStore = require('./src/session');
+const gpu = require('./src/gpu');
+const capture = require('./src/capture');
+const extract = require('./src/extract');
+const settings = require('./src/settings');
+const automation = require('./src/automation');
+const format = require('./src/format');
+const files = require('./src/files');
+const recorder = require('./src/recorder');
+const picker = require('./src/picker');
 
 const ICON = path.join(__dirname, 'build', 'icon.ico');
 if (process.platform === 'win32') app.setAppUserModelId('com.kongvalley.web-capture-tool');
@@ -324,7 +330,7 @@ function createWindow() {
     },
   }));
   state.win = win;
-  win.loadFile(path.join(__dirname, 'index.html'));
+  win.loadFile(path.join(__dirname, 'ui', 'index.html'));
   // 窗口创建时的 setBounds 早于窗口真正显示，Chromium 会把它落在 0 高度的视口上；
   // 面板加载完成 = 窗口已显示，此时重排一次，页面视口才拿到真实高度。
   win.webContents.once('did-finish-load', layout);
@@ -1080,13 +1086,13 @@ app.whenReady().then(() => {
   // GPU 状态需要一点时间上报，面板首帧之后再判定（首次采样后还会二次复核，见 checkGpuOnce）
   if (state.win) state.win.webContents.once('did-finish-load', () => setTimeout(checkGpuOnce, 3000));
   if (state.selftest) {
-    require('./selftest.js').run({
+    require('./dev/selftest.js').run({
       state, store, gpu, capture, extract, settings, automation, format, files, logger,
       session: sessionStore, recorder, picker, resetActive, PARTITION,
     });
   }
   if (state.bench) {
-    require('./bench.js').run({ state, capture, session: sessionStore, gpu });
+    require('./dev/bench.js').run({ state, capture, session: sessionStore, gpu });
   }
   app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
 });

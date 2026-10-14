@@ -307,29 +307,39 @@ MIT License，见仓库根目录 [LICENSE](./LICENSE)（Copyright © 2026 KongVa
 
 ## 目录结构
 
+目录即模块，根目录只留入口：
+
 ```
-main.js         主进程装配：窗口 / 多标签视图 / IPC / 启动
-state.js        共享状态与常量；多标签的「活动标签镜像」与 syncActive()
-capture.js      CDP 抓取：Network.* 事件 → 标签内记录，请求重放，规则落盘钩子与计数
-settings.js     抓取设置唯一写入口（applySetting）+ 拦截器与请求间隔节流
-automation.js   自动滚动 / 自动翻页 / 翻页+提取合并任务（runTask）
-extract.js      页面侧采集：HTML/Storage/CSS+XPath 提取/页面清单
-format.js       纯函数：请求头合并与解析 / cURL / CSV / HAR / 统计概览 / 快照对比 / 转代码 / Postman / Markdown
-files.js        落盘：保存对话框与目录选择、文本与二进制写入、响应体批量导出、规则落盘单条写入
-store.js        设置持久化（userData/settings.json）
-session.js      会话持久化（userData/sessions/last.json）
-recorder.js     会话录制：交互注入 + 事件流 JSONL + .md 时间线摘要；录制列表 / 重放 / 回放脚本
-picker.js       元素拾取器：页面高亮与点击回传，选择器算法复用 recorder.SELECTOR_SRC
-logger.js       诊断日志（userData/logs/app.log）
-gpu.js          GPU 状态判定
-make-icon.js    图标生成器（零依赖，代码绘制）
-index.html      面板界面与样式（深色 token 化）
-renderer.js     面板逻辑（标签栏/列表/详情/模态框/快捷键/轻提示）
-selftest.js     --selftest 全链路自检
-bench.js        --bench 性能基准（压力服务器 + 面板/主进程计时）
+main.js              主进程装配：窗口 / 多标签视图 / IPC / 启动（唯一入口）
+
+src/                 主进程内部模块
+  state.js             共享状态与常量；多标签的「活动标签镜像」与 syncActive()
+  store.js             设置持久化（userData/settings.json）
+  logger.js            诊断日志（userData/logs/app.log）
+  gpu.js               GPU 状态判定
+  settings.js          抓取设置唯一写入口（applySetting）+ 拦截器与请求间隔节流
+  capture.js           CDP 抓取：Network.* 事件 → 标签内记录，请求重放，规则落盘钩子与计数
+  files.js             落盘：保存对话框与目录选择、文本与二进制写入、响应体批量导出、规则落盘单条写入
+  session.js           会话持久化（userData/sessions/last.json）
+  extract.js           页面侧采集：HTML/Storage/CSS+XPath 提取/页面清单
+  picker.js            元素拾取器：页面高亮与点击回传，选择器算法复用 recorder.SELECTOR_SRC
+  automation.js        自动滚动 / 自动翻页 / 翻页+提取合并任务（runTask）
+  recorder.js          会话录制：交互注入 + 事件流 JSONL + .md 时间线摘要；录制列表 / 重放 / 回放脚本
+  format.js            纯函数：请求头合并与解析 / cURL / CSV / HAR / 统计概览 / 快照对比 / 转代码 / Postman / Markdown
+
+ui/                  面板（渲染进程，本地文件）
+  index.html           面板界面与样式（深色 token 化）
+  renderer.js          面板逻辑（标签栏/列表/详情/模态框/快捷键/轻提示）
+
+dev/                 开发与验证工具（随包发布，打包版 exe 也能 --selftest / --bench）
+  selftest.js          --selftest 全链路自检
+  bench.js             --bench 性能基准（压力服务器 + 面板/主进程计时）
+  make-icon.js         图标生成器（零依赖，代码绘制 → build/icon*.ico）
 ```
 
-模块依赖单向：所有模块只 `require('./state')`，禁止反向依赖 `main.js`。
+依赖方向单向：`src/` 里所有模块只 `require('./state')`，任何模块都不 require `main.js`；`ui/renderer.js` 不 require 任何项目模块（只经 IPC 与主进程通信）；`dev/` 里的工具通过 `main.js` 注入的模块干活。
+
+打包与测试用到的路径：入口 `main.js`（`package.json` 的 `main`）、面板 `ui/index.html`、图标 `build/icon.ico`，自检/基准在打包版里从 `dev/` 加载。
 
 ---
 

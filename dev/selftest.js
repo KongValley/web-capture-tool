@@ -189,7 +189,7 @@ async function run({ state, store, gpu, extract, settings, automation, format, f
 
   // ---------------- 56-58 图标 ----------------
   try {
-    const ico = readIco(path.join(__dirname, 'build', 'icon.ico'));
+    const ico = readIco(path.join(__dirname, '..', 'build', 'icon.ico'));
     const structOk = ico.reserved === 0 && ico.type === 1 && ico.count === 7
       && ico.entries.every((e) => e.bits === 32 && e.off + e.size <= ico.buf.length);
     check('图标文件结构', structOk, `${ico.count} 个条目，${ico.buf.length} 字节`);

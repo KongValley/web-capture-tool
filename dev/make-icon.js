@@ -155,7 +155,7 @@ function inspect(buf, expectSizes) {
 }
 
 function write(name, sizes) {
-  const dir = path.join(__dirname, 'build');
+  const dir = path.join(__dirname, '..', 'build');       // dev/ 下：图标产物仍在仓库根的 build/
   fs.mkdirSync(dir, { recursive: true });
   const file = path.join(dir, name);
   const buf = buildIco(sizes);
