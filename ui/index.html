@@ -211,9 +211,10 @@
   }
   .empty { color: var(--muted); padding: 16px; text-align: center; position: absolute; left: 0; right: 0; top: 0; }
 
-  /* 共用模态框 */
+  /* 共用模态框：只覆盖面板。原生页面视图是独立合成层、永远盖在窗口内容之上，
+     全窗口的弹窗会有一半被页面挡住，所以这里按面板宽度收口（--panel-w 由 applyPanelWidth 维护） */
   #modal {
-    position: fixed; inset: 0; background: #0009; z-index: 50;
+    position: fixed; top: 0; right: 0; bottom: 0; width: var(--panel-w, 520px); background: #0009; z-index: 50;
     display: flex; align-items: center; justify-content: center;
     backdrop-filter: blur(2px);
   }
@@ -221,7 +222,7 @@
   body.soft #modal { backdrop-filter: none; background: #000b; }
   body.soft #modalBox, body.soft #ctxMenu, body.soft .toast { box-shadow: none; }
   #modalBox {
-    width: min(960px, 92vw); max-height: 86vh; background: var(--panel);
+    width: min(960px, 92%); max-height: 86vh; background: var(--panel);
     border: 1px solid var(--line); border-radius: var(--radius-lg);
     box-shadow: var(--shadow); display: flex; flex-direction: column;
   }

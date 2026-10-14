@@ -30,7 +30,10 @@ const detailPretty = new Set();           // 记录「响应体已美化 JSON」
 
 const PANEL_MIN = 320, PANEL_MAX = 1000;
 let dragging = false, dragRaf = 0;
-const applyPanelWidth = (w) => { $('panel').style.width = w + 'px'; };
+const applyPanelWidth = (w) => {
+  $('panel').style.width = w + 'px';
+  document.documentElement.style.setProperty('--panel-w', w + 'px');   // 弹窗遮罩按面板宽度收口
+};
 const readPanelWidth = () => Math.round($('panel').getBoundingClientRect().width);
 
 // mousedown/mousemove/mouseup（合成事件在自检里可用；Pointer Events 的 setPointerCapture 不能）
