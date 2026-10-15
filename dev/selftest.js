@@ -2468,6 +2468,27 @@ async function run({ state, store, gpu, extract, settings, automation, format, f
       `第一=${sa176.ok} 第二=${sb176.skipped ? 'skipped(互斥)' : 'ok'} 落盘=${onDisk176.records.length} 条 tmp 残留=${tmp176}`);
   } catch (e) { check('会话写盘原子且可重叠', false, e.message); }
 
+  // 177 工具栏自适应换行（窗口变窄 → 按钮折行，页面视图从工具栏实际底部开始）
+  try {
+    const size0 = state.win.getContentSize();
+    const measure = () => peval(`(() => {
+      const t = document.getElementById('toolbar3').getBoundingClientRect();
+      return { h3: Math.round(t.height), top: Math.round(t.top), bottom: Math.round(document.getElementById('tabstrip').getBoundingClientRect().bottom) };
+    })()`);
+    state.win.setContentSize(1000, size0[1]);
+    await sleep(700);                 // ResizeObserver → cap:toolbarH → layout
+    const narrow = await measure();
+    const yNarrow = state.view.getBounds().y, thNarrow = state.toolbarH;
+    state.win.setContentSize(size0[0], size0[1]);
+    await sleep(700);
+    const wide = await measure();
+    const yWide = state.view.getBounds().y, thWide = state.toolbarH;
+    check('工具栏自适应换行',
+      narrow.h3 > 44 && narrow.bottom === thNarrow && yNarrow === thNarrow
+        && wide.bottom === thWide && yWide === thWide && narrow.h3 > wide.h3,
+      `1000px 工具栏高=${narrow.h3} 上报=${thNarrow} 视图y=${yNarrow}｜${size0[0]}px 工具栏高=${wide.h3} 上报=${thWide} 视图y=${yWide}`);
+  } catch (e) { check('工具栏自适应换行', false, e.message); }
+
   // ---- 编号不回退：这三项会改活动标签的状态（清空 / 恢复 / 切标签），放在套件末尾 ----
 
   // 169 清空后编号不回退（撞号会让新记录既不显示、详情又取到旧记录）
