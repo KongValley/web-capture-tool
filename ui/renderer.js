@@ -332,6 +332,20 @@ Object.defineProperty(el.list, 'scrollTop', {
 });
 el.list.addEventListener('scroll', () => { invalidateBottom(); renderWindow(); }, { passive: true });
 
+let renderPending = false;
+// 批处理里逐条 renderWindow/updateCounts 的开销 = 批大小 × 窗口行数：合并到微任务，下一次 JS 任务前落地
+// （用户动作与断言看到的仍是最终一致状态；applySort 的同步渲染保持不变，作为收口路径）
+function scheduleRender() {
+  if (renderPending) return;
+  renderPending = true;
+  Promise.resolve().then(() => {
+    renderPending = false;
+    renderWindow();
+    updateCounts();
+    updateListNote();
+  });
+}
+
 function appendRecord(rec) {
   if (rows.has(rec.id)) return;
   rows.set(rec.id, { rec });
@@ -343,9 +357,7 @@ function appendRecord(rec) {
   if (empty) empty.remove();
   if (listAtBottom()) scheduleScrollToBottom();
   else { listNew++; updateListNew(); }
-  renderWindow();
-  updateCounts();
-  updateListNote();
+  scheduleRender();
   if (view === 'wf') scheduleWaterfall();
 }
 
@@ -357,9 +369,8 @@ function updateRecord(rec) {
   if (matches(rec)) visibleCount++;
   orderDirty = true;
   scheduleOrder();                        // 100ms 合并：排序键 / 分组计数 / 过滤命中都可能变
-  renderWindow();
+  scheduleRender();
   if (selected === rec.id) scheduleDetailRender(rec.id);
-  updateCounts();
   if (view === 'wf') scheduleWaterfall();
 }
 
@@ -391,10 +402,18 @@ function scheduleOrder() {
 }
 
 // 顺序表 = 过滤命中（matches）的记录，按当前排序 / 分组排列；渲染只按它取窗口
+const hostCache = new WeakMap();   // 域名分组的 new URL() 解析结果：100ms 重建一次全表，不能再对每条记录重复解析（记录对象更新时缓存自然失效）
 function applySort() {
   if (orderTimer) { clearTimeout(orderTimer); orderTimer = null; }
   const mode = el.sort.value;
-  const hostOf = (rec) => { try { return new URL(rec.url).host; } catch (e) { return '(无法解析)'; } };
+  const hostOf = (rec) => {
+    let h = hostCache.get(rec);
+    if (h === undefined) {
+      try { h = new URL(rec.url).host; } catch (e) { h = '(无法解析)'; }
+      hostCache.set(rec, h);
+    }
+    return h;
+  };
   const cmp = {
     size: (a, b) => (b.rec.size || 0) - (a.rec.size || 0),
     duration: (a, b) => (b.rec.duration || 0) - (a.rec.duration || 0),
@@ -662,6 +681,9 @@ function syncTabs() {
 /* -------------------------------------------------------------- 瀑布图 */
 
 let wfTimer = null;
+let wfScrollPending = false;
+const WF_ROW_H = 18;   // .wfrow 的高度（index.html），窗口化的行距依据
+const WF_PAD = 6;      // 视口上下各多画几行，滚动时不至于露白
 
 // 抓包事件密集时按 300ms 合并重画（与详情同一节奏）
 function scheduleWaterfall() {
@@ -672,12 +694,25 @@ function scheduleWaterfall() {
   }, 300);
 }
 
-// 时间轴：t0 = 最早一条的开始，span = 最晚结束 - t0；每条按开始时间偏移、按时长定宽
+// 滚动时按帧重画可见切片（rAF 合并，300ms 的抓包节奏对滚动太慢）
+$('wf').addEventListener('scroll', () => {
+  if (view !== 'wf' || wfScrollPending) return;
+  wfScrollPending = true;
+  requestAnimationFrame(() => {
+    wfScrollPending = false;
+    if (view === 'wf') renderWaterfall();
+  });
+}, { passive: true });
+
+// 时间轴：t0 = 最早一条的开始，span = 最晚结束 - t0；每条按开始时间偏移、按时长定宽。
+// 只画可见切片（5000 条全量建 DOM 是每 300ms 1.5 万节点），上下留白用 padding 撑出总高度。
 function renderWaterfall() {
-  const all = [...rows.values()].map((v) => v.rec);
-  const list = all.filter((r) => matches(r) && r.time && r.duration != null);
+  const list = [];
+  for (const v of rows.values()) {
+    const r = v.rec;
+    if (matches(r) && r.time && r.duration != null) list.push(r);
+  }
   const box = $('wf');
-  box.innerHTML = '';
   $('nWf').textContent = String(list.length);
   if (!list.length) {
     box.innerHTML = '<div class="empty">暂无可绘制的请求（需要已完成的响应）</div>';
@@ -685,9 +720,23 @@ function renderWaterfall() {
     $('wfScale').textContent = '';
     return;
   }
-  const t0 = Math.min(...list.map((r) => Date.parse(r.time)));
-  const span = Math.max(1, Math.max(...list.map((r) => Date.parse(r.time) + (r.duration || 0))) - t0);
+  let t0 = Infinity, tEnd = -Infinity;      // 单遍统计时间轴，不再建多个全长临时数组
   for (const r of list) {
+    const s = Date.parse(r.time);
+    if (s < t0) t0 = s;
+    const e = s + (r.duration || 0);
+    if (e > tEnd) tEnd = e;
+  }
+  const span = Math.max(1, tEnd - t0);
+  const vh = box.clientHeight || 600;
+  const from = Math.max(0, Math.floor(box.scrollTop / WF_ROW_H) - WF_PAD);
+  const to = Math.min(list.length, from + Math.ceil(vh / WF_ROW_H) + WF_PAD * 2);
+  box.innerHTML = '';
+  const wrap = document.createElement('div');
+  wrap.style.paddingTop = `${from * WF_ROW_H}px`;
+  wrap.style.paddingBottom = `${(list.length - to) * WF_ROW_H}px`;
+  for (let i = from; i < to; i++) {
+    const r = list[i];
     const start = Date.parse(r.time);
     const row = document.createElement('div');
     row.className = 'wfrow';
@@ -702,9 +751,10 @@ function renderWaterfall() {
     row.appendChild(name);
     row.appendChild(bar);
     row.onclick = () => select(r.id);          // 与列表一致：切回列表并展开该条详情
-    box.appendChild(row);
+    wrap.appendChild(row);
   }
-  $('wfInfo').textContent = `${list.length} 条 · 命中 ${list.length}/${all.length} · 跨度 ${Math.round(span)}ms`;
+  box.appendChild(wrap);
+  $('wfInfo').textContent = `${list.length} 条 · 命中 ${list.length}/${rows.size} · 跨度 ${Math.round(span)}ms`;
   $('wfScale').textContent = `起点 ${new Date(t0).toLocaleTimeString()}`;
 }
 
@@ -855,6 +905,7 @@ function wsMatch(frame) {
 }
 
 const MAX_WS_DISPLAY = 2000;      // 与主进程 MAX_WS_FRAMES 一致：面板 DOM 只保留最近这么多帧
+let wsScrollPending = false;      // 「滚到底」按任务合并：一批几十帧时不再每帧读一次 scrollHeight 强制布局
 
 function appendWs(frame) {
   if ($('wsPause').checked) return;                 // 暂停只影响显示，数据仍在主进程
@@ -866,7 +917,13 @@ function appendWs(frame) {
   el.ws.appendChild(div);
   while (el.ws.children.length > MAX_WS_DISPLAY) el.ws.removeChild(el.ws.firstChild);
   $('nWs').textContent = el.ws.children.length;
-  if (view === 'ws') el.ws.scrollTop = el.ws.scrollHeight;
+  if (view === 'ws' && !wsScrollPending) {
+    wsScrollPending = true;
+    Promise.resolve().then(() => {
+      wsScrollPending = false;
+      el.ws.scrollTop = el.ws.scrollHeight;
+    });
+  }
 }
 
 // 过滤/恢复暂停时按主进程的当前标签帧整体重画

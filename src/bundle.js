@@ -116,18 +116,22 @@ function buildHints(records, jsTexts) {
       }
     }
   }
+  // 关键词可达上百个：脚本行只切一遍（原实现对每个关键词把所有脚本重新 split('\n')，几十 MB 文本会卡分钟级）
+  const scanned = [];
+  let total = 0;
+  for (const f of jsTexts) {
+    if (f.text.length > MAX_HINT_FILE) continue;
+    if (total + f.text.length > MAX_HINT_TOTAL) break;
+    total += f.text.length;
+    scanned.push({ file: f.file, lines: f.text.split('\n') });
+  }
   const search = (keyword) => {
     const hits = [];
-    let total = 0;
-    for (const f of jsTexts) {
-      if (hits.length >= HINT_HITS) break;
-      if (f.text.length > MAX_HINT_FILE) continue;
-      if (total + f.text.length > MAX_HINT_TOTAL) break;
-      total += f.text.length;
-      const lines = f.text.split('\n');
-      for (let i = 0; i < lines.length && hits.length < HINT_HITS; i++) {
-        if (lines[i].includes(keyword)) hits.push({ file: f.file, line: i + 1, text: lines[i].trim().slice(0, HINT_TEXT) });
+    for (const f of scanned) {
+      for (let i = 0; i < f.lines.length && hits.length < HINT_HITS; i++) {
+        if (f.lines[i].includes(keyword)) hits.push({ file: f.file, line: i + 1, text: f.lines[i].trim().slice(0, HINT_TEXT) });
       }
+      if (hits.length >= HINT_HITS) break;
     }
     return hits;
   };

@@ -99,10 +99,16 @@ const PANEL_BENCH = `(() => {
     applyBatch({ records: [], updates: recs, drops: [], ws: [] });
   });
 
-  // 4) 过滤（输入事件 → 全列表可见性重算）
+  // 合成行至此清掉，再铺一份固定规模的合成列表：后面各项（过滤/列预设/排序/分组）都在
+  // 「真实记录 + 3000 条合成」这个确定规模上测，不再背着累积到 4000+ 行的背景数据
+  for (const [id] of [...rows]) if (id >= 880000) dropRow(id);
+  { const b = base; base += 3000; for (let i = 0; i < 3000; i++) appendRecord(mk(b + i, i)); }
+  out.listSize = rows.size;
+
+  // 4) 过滤（输入事件 → 全列表可见性重算）：只计一次 input 的耗时，清空不计时
   const f = document.getElementById('filter');
-  // 命中数必须在过滤「生效时」读，否则清空后再读 nReq 拿到的恒是总行数
-  out.filter = bench(() => { f.value = 'path/1'; f.dispatchEvent(new Event('input', { bubbles: true })); out.filtered = Number(document.getElementById('nReq').textContent); f.value = ''; f.dispatchEvent(new Event('input', { bubbles: true })); });
+  out.filter = bench(() => { f.value = 'path/1'; f.dispatchEvent(new Event('input', { bubbles: true })); out.filtered = Number(document.getElementById('nReq').textContent); });
+  f.value = ''; f.dispatchEvent(new Event('input', { bubbles: true }));
 
   // 5) 列预设切换（全列表重画）
   const col = document.getElementById('colSet');
@@ -113,15 +119,14 @@ const PANEL_BENCH = `(() => {
   out.sort = bench(() => { sort.value = 'size'; applySort(); sort.value = 'time'; applySort(); }, 1);
   out.group = bench(() => { sort.value = 'domain'; applySort(); sort.value = 'time'; applySort(); }, 1);
 
-  // 清理合成行，计数回到真实记录
-  for (const [id, r] of [...rows]) if (id >= 880000) dropRow(id);
+  for (const [id] of [...rows]) if (id >= 880000) dropRow(id);   // 收尾：清掉合成行，计数回到真实记录
   out.rows = rows.size;
   out.dom = document.querySelectorAll('#list .row').length;
   out.heapMB = performance.memory ? Math.round(performance.memory.usedJSHeapSize / 1048576 * 10) / 10 : -1;
   return out;
 })()`;
 
-async function run({ state, capture, session, gpu }) {
+async function run({ state, session, gpu }) {
   const add = (name, value, unit, extra = '') => console.log(`${name.padEnd(30, ' ')} ${String(value).padStart(9, ' ')} ${unit}${extra ? '   ' + extra : ''}`);
 
   const { server, hits } = await startServer();
@@ -141,14 +146,15 @@ async function run({ state, capture, session, gpu }) {
     await wc.loadURL(base + '/');
     await sleep(500);
 
-    // ---- 主进程：突发请求的 CPU 与墙钟 ----
+    // ---- 主进程：突发请求的 CPU 与墙钟（从页面第一个请求发出后计时，不含页面加载 / 首连 / 解析）----
+    await wc.loadURL(`${base}/burst?n=${BURST}`);
+    await waitFor(() => hits['/api/data'] > 0, 60000, '首个突发请求');
     const cpu0 = process.cpuUsage();
     const t0 = Date.now();
-    await wc.loadURL(`${base}/burst?n=${BURST}`);
     await waitFor(() => hits['/api/data'] >= BURST, 120000, '突发请求到达服务器');
     const cpu = process.cpuUsage(cpu0);
     const wall = Date.now() - t0;
-    add('突发请求（墙钟）', wall, 'ms', `${BURST} 个请求`);
+    add('突发请求（墙钟）', wall, 'ms', `${BURST} 个请求（不含页面加载）`);
     add('突发请求（主进程 CPU）', cpuMs(cpu), 'ms');
     add('  每请求主进程 CPU', (cpuMs(cpu) / BURST).toFixed(3), 'ms');
     await waitFor(() => state.records.length >= BURST + 2, 120000, '记录入内存');
@@ -171,19 +177,20 @@ async function run({ state, capture, session, gpu }) {
 
     // ---- 面板渲染热路径 ----
     const p = await peval(PANEL_BENCH);
-    add('追加 3000 行', p.append3000, 'ms', '逐条 appendRecord');
+    add('追加 3000 行', p.append3000, 'ms', '逐条 appendRecord（含真实记录背景）');
     add('批处理追加 1000 行', p.batch1000, 'ms', 'applyBatch');
     add('1000 条更新', p.update1000, 'ms');
-    add('过滤（输入事件）', p.filter, 'ms', `命中 ${p.filtered} 行`);
-    add('切换列预设（重画）', p.colSet, 'ms');
-    add('按大小排序（重排）', p.sort, 'ms');
-    add('域名分组（重排）', p.group, 'ms');
+    add('过滤（输入事件）', p.filter, 'ms', `${p.listSize} 行 · 命中 ${p.filtered} 行`);
+    add('切换列预设（重画）', p.colSet, 'ms', `${p.listSize} 行`);
+    add('按大小排序（重排）', p.sort, 'ms', `${p.listSize} 行`);
+    add('域名分组（重排）', p.group, 'ms', `${p.listSize} 行`);
     add('面板内存', p.heapMB, 'MB', `行 ${p.rows} / DOM ${p.dom}`);
 
-    // ---- 会话序列化（同步 JSON 成本，30s 定时器每次都要付）----
+    // ---- 会话序列化（真实路径：snapshot 截断 + 分片 toJson；不含落盘；分片会让出事件循环）----
+    const snap = session.snapshot();
     const s0 = Date.now();
-    const json = JSON.stringify(state.records.map(capture.fullRecord));
-    add('会话序列化（同步 JSON）', Date.now() - s0, 'ms', `${(json.length / 1048576).toFixed(1)}MB / ${state.records.length} 条`);
+    const text = await session.toJson(snap);
+    add('会话序列化（分片）', Date.now() - s0, 'ms', `${(text.length / 1048576).toFixed(1)}MB / ${snap.records.length} 条`);
     const s1 = Date.now();
     const saved = await session.save();
     add('会话写盘（含磁盘）', Date.now() - s1, 'ms', saved.ok ? path.basename(saved.file) : saved.error);

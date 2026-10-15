@@ -77,6 +77,8 @@ app.on('render-process-gone', (_e, _wc, d) => logger.log('render-gone', `${(d &&
 const forcedSoftware = process.argv.includes('--software-rendering');
 state.softwareMode = !!(boot.app.softwareRendering || forcedSoftware);
 if (state.softwareMode) app.disableHardwareAcceleration();
+// 基准模式：performance.memory 默认是量化值，开精确内存信息后面板内存的数字才有 0.1MB 精度
+if (state.bench) app.commandLine.appendSwitch('enable-precise-memory-info');
 
 /* ------------------------------------------------------------------ 视图 */
 
