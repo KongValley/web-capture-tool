@@ -774,6 +774,11 @@ function registerIpc() {
     return { ok: true, text, file: logger.filePath(), count: text ? text.split('\n').length : 0 };
   });
   ipcMain.handle('cap:ws', () => ({ ok: true, frames: state.wsFrames }));
+  // WS「清空显示」连主进程一起清：只清 DOM 的话切标签/改过滤又会把帧捞回来
+  ipcMain.handle('cap:wsClear', () => {
+    if (state.activeTab) { state.activeTab.wsFrames.length = 0; syncActive(); }
+    return { ok: true };
+  });
   ipcMain.handle('cap:openLog', () => {
     shell.showItemInFolder(logger.filePath());
     return { ok: true };

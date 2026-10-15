@@ -70,6 +70,7 @@ function fullRecord(r) {
     timing: r.timing || null, timingParts: format.timingParts(r.timing, r.duration),
     bodyBase64: r.bodyBase64, bodyError: r.bodyError, body: r.body,
     star: !!r.star, comment: r.comment || '',
+    note: r.note || '',
     restored: !!r.restored,
   };
 }
@@ -121,6 +122,11 @@ function onRequestWillBeSent(tab, ev) {
     const gone = tab.records.shift();
     tab.byId.delete(gone.cdpId);
     queueBatch(tab, 'drop', gone.id);
+    if (!tab.capNote) {   // 首次丢最旧记录时提示一次（文档承诺「超出后给出提示」）
+      tab.capNote = true;
+      setStatus(`已达记录上限 ${MAX_RECORDS} 条，最早的记录开始被丢弃`);
+      logger.log('cap', `记录上限：已达 ${MAX_RECORDS} 条，开始丢弃最早记录`);
+    }
   }
   queueBatch(tab, 'record', summarize(rec));
   recorder.onRequest(tab, rec);
@@ -306,7 +312,14 @@ function onLoadingFailed(tab, ev) {
 
 function pushWs(tab, frame) {
   tab.wsFrames.push(frame);
-  if (tab.wsFrames.length > MAX_WS_FRAMES) tab.wsFrames.shift();
+  if (tab.wsFrames.length > MAX_WS_FRAMES) {
+    tab.wsFrames.shift();
+    if (!tab.wsNote) {   // 首次丢最旧帧时提示一次
+      tab.wsNote = true;
+      setStatus(`WebSocket 帧已达上限 ${MAX_WS_FRAMES}，最早的帧开始被丢弃`);
+      logger.log('cap', `WS 帧上限：已达 ${MAX_WS_FRAMES}，开始丢弃最早帧`);
+    }
+  }
   queueBatch(tab, 'ws', frame);
   recorder.onWs(tab, frame);
 }

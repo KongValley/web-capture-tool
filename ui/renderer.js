@@ -242,13 +242,16 @@ function paintRow(node, rec) {
   if (p.restored !== restored) { p.restored = restored; node.dataset.restored = restored; }
   const star = rec.star ? '1' : '';
   if (p.star !== star) { p.star = star; node.dataset.star = star; }
+  const note = rec.note ? '1' : '';
+  if (p.note !== note) { p.note = note; node.dataset.note = note; }
   const s = node.children[1];
   const sText = rec.status || (rec.failed ? '×' : '…');
   if (p.sText !== sText) { p.sText = sText; s.textContent = sText; }
   const sCls = 's ' + statusClass(rec.status);
   if (p.sCls !== sCls) { p.sCls = sCls; s.className = sCls; }
   const url = rec.url || '';
-  if (p.url !== url) { p.url = url; node.children[2].textContent = url; node.title = url; }
+  const title = rec.note ? `${url}\n备注：${rec.note}` : url;
+  if (p.url !== url || p.title !== title) { p.url = url; p.title = title; node.children[2].textContent = url; node.title = title; }
   const t = node.children[3];
   const tText = mode === 't' ? String(rec.time || '').slice(11, 19) : (rec.duration != null ? rec.duration + 'ms' : (rec.type || ''));
   if (p.tText !== tText) { p.tText = tText; t.textContent = tText; }
@@ -588,6 +591,7 @@ function renderDetail(id) {
 <span class="kv">时间    </span>${esc(d.time)}</pre>` +
       initiatorBlock(d) +
       timingBlock(d) +
+      (d.note ? `<h3>备注</h3><pre>${esc(d.note)}</pre>` : '') +
       (d.restored ? '<h3>来源</h3><pre class="muted">上次会话恢复（不是本次抓取）</pre>' : '') +
       (d.failed ? `<h3>失败</h3><pre class="s4">${esc(d.failed.errorText)}${d.failed.blockedReason ? ' · ' + esc(d.failed.blockedReason) : ''}</pre>` : '') +
       (d.redirects.length ? `<h3>重定向链</h3><pre>${d.redirects.map((x) => `${x.status} ${esc(x.url)}\n   → ${esc(x.location)}`).join('\n')}</pre>` : '') +
@@ -1945,7 +1949,8 @@ $('harvest').onclick = async () => {
   const hv = await ipcRenderer.invoke('cap:harvest');
   if (!hv || !hv.ok) return toast('提取失败：' + ((hv && hv.error) || '未知错误'), 'err');
   const stat = document.createElement('div');
-  stat.textContent = `链接 ${hv.links.length} · 图片 ${hv.images.length} · 表单 ${hv.forms.length} · 表格 ${hv.tables.length}`;
+  const cap = (n, total) => `${n}${hv.totals && hv.totals[total] > n ? `/${hv.totals[total]}（已截断）` : ''}`;
+  stat.textContent = `链接 ${cap(hv.links.length, 'links')} · 图片 ${cap(hv.images.length, 'images')} · 表单 ${cap(hv.forms.length, 'forms')} · 表格 ${cap(hv.tables.length, 'tables')}`;
   const table = dataTable(['序号', '行数', '列数', '表头'], hv.tables.map((t) => ({
     序号: t.index + 1, 行数: t.rows.length, 列数: (t.headers || []).length, 表头: (t.headers || []).join(' | '),
   })));
@@ -1967,8 +1972,8 @@ async function openStats() {
   head.className = 'lbl';
   head.textContent = `共 ${s.total} 条 · 合计 ${humanSize(s.totalBytes)}`;
   const byDomain = dataTable(['域名', '条数', '大小'], s.byDomain.map((d) => ({ 域名: d.host, 条数: d.count, 大小: humanSize(d.bytes) })));
-  const byType = dataTable(['类型', '条数'], s.byType.map((d) => ({ 类型: d.type, 条数: d.count })));
-  const byStatus = dataTable(['状态', '条数'], s.byStatus.map((d) => ({ 状态: d.cls, 条数: d.count })));
+  const byType = dataTable(['类型', '条数', '大小'], s.byType.map((d) => ({ 类型: d.type, 条数: d.count, 大小: humanSize(d.bytes) })));
+  const byStatus = dataTable(['状态', '条数', '大小'], s.byStatus.map((d) => ({ 状态: d.cls, 条数: d.count, 大小: humanSize(d.bytes) })));
   const slowest = dataTable(['方法', '耗时', 'URL'], s.slowest.map((d) => ({ 方法: d.method, 耗时: `${d.ms}ms`, URL: d.url })));
   const largest = dataTable(['方法', '大小', 'URL'], s.largest.map((d) => ({ 方法: d.method, 大小: humanSize(d.size), URL: d.url })));
   openModal('统计概览', [
@@ -2311,10 +2316,12 @@ $('wsPause').onchange = () => {
   if ($('wsPause').checked) return;
   ipcRenderer.invoke('cap:ws').then((r) => rebuildWs((r && r.frames) || []));
 };
-$('wsClear').onclick = () => {
+$('wsClear').onclick = async () => {
+  const r = await ipcRenderer.invoke('cap:wsClear');
+  if (!r || !r.ok) return toast('清空失败：' + ((r && r.error) || '未知错误'), 'err');
   el.ws.innerHTML = '';
   $('nWs').textContent = '0';
-  $('wsNote').textContent = '已清空显示（数据仍在，切标签会重新载入）';
+  $('wsNote').textContent = '已清空当前标签的帧（主进程同步清空）';
 };
 
 /* ---- 响应体存盘 ---- */

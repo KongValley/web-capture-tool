@@ -180,17 +180,23 @@ function buildStats(records) {
     d.bytes += r.encodedDataLength || 0;
     byDomain.set(host, d);
     const t = r.type || '(未知)';
-    byType.set(t, (byType.get(t) || 0) + 1);
+    const td = byType.get(t) || { count: 0, bytes: 0 };
+    td.count++;
+    td.bytes += r.encodedDataLength || 0;
+    byType.set(t, td);
     const cls = STATUS_CLASS(r.status);
-    byStatus.set(cls, (byStatus.get(cls) || 0) + 1);
+    const sd = byStatus.get(cls) || { count: 0, bytes: 0 };
+    sd.count++;
+    sd.bytes += r.encodedDataLength || 0;
+    byStatus.set(cls, sd);
   }
   const top = (arr, cmp) => arr.slice().sort(cmp).slice(0, 10);
   return {
     total: list.length,
     totalBytes: list.reduce((n, r) => n + (r.encodedDataLength || 0), 0),
     byDomain: top([...byDomain.values()], (a, b) => b.bytes - a.bytes || b.count - a.count),
-    byType: [...byType.entries()].map(([type, count]) => ({ type, count })).sort((a, b) => b.count - a.count),
-    byStatus: [...byStatus.entries()].map(([cls, count]) => ({ cls, count })).sort((a, b) => b.count - a.count),
+    byType: [...byType.entries()].map(([type, d]) => ({ type, count: d.count, bytes: d.bytes })).sort((a, b) => b.count - a.count),
+    byStatus: [...byStatus.entries()].map(([cls, d]) => ({ cls, count: d.count, bytes: d.bytes })).sort((a, b) => b.count - a.count),
     slowest: top(list.filter((r) => r.duration != null), (a, b) => b.duration - a.duration)
       .map((r) => ({ method: r.method, url: r.url, ms: r.duration })),
     largest: top(list, (a, b) => (b.encodedDataLength || 0) - (a.encodedDataLength || 0))

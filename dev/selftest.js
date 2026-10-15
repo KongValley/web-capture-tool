@@ -1378,7 +1378,10 @@ async function run({ state, store, gpu, extract, settings, automation, format, f
         appendWs({ kind: 'recv', payload: 'probe-frame', time: Date.now() });
         return { before, after: document.getElementById('ws').children.length };
       })()`);
-      const cleared = await peval(`(() => { document.getElementById('wsClear').click(); return document.getElementById('ws').children.length; })()`);
+      // 「清空显示」连主进程帧一起清（按钮名副其实）：点击后等 DOM 归零，主进程帧也应同时为 0
+      await peval(`(() => { document.getElementById('wsClear').click(); return true; })()`);
+      await waitFor(() => peval(`document.getElementById('ws').children.length === 0`), 5000, 'WS 清空生效');
+      const cleared = await peval(`document.getElementById('ws').children.length`);
       const frames116 = await pinvoke('cap:ws');
       await peval(`(() => {
         document.getElementById('wsPause').checked = false;
@@ -1389,8 +1392,8 @@ async function run({ state, store, gpu, extract, settings, automation, format, f
       })()`);
       await sleep(400);
       check('WebSocket 视图过滤/暂停/清空',
-        w1.n >= 1 && w1.all && paused.before === paused.after && cleared === 0 && frames116.ok && frames116.frames.length > 0,
-        `过滤后 ${w1.n} 行全命中=${w1.all} 暂停不动=${paused.before === paused.after} 清空后=${cleared} 主进程帧=${frames116.frames.length}`);
+        w1.n >= 1 && w1.all && paused.before === paused.after && cleared === 0 && frames116.ok && frames116.frames.length === 0,
+        `过滤后 ${w1.n} 行全命中=${w1.all} 暂停不动=${paused.before === paused.after} 清空后 DOM=${cleared} 主进程帧=${frames116.frames.length}`);
     } catch (e) { check('WebSocket 视图过滤/暂停/清空', false, e.message); }
 
     // 116b WebSocket 视图 DOM 上限（面板与主进程一致保留最近 2000 帧）

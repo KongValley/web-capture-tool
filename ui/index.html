@@ -173,6 +173,7 @@
   .row .u { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; direction: rtl; text-align: left; }
   .row[data-restored="1"] .u::before { content: '⟲ '; color: var(--warn); }
   .row[data-star="1"] .m::before { content: '★'; color: var(--warn); margin-right: 2px; }
+  .row[data-note="1"] { box-shadow: inset 2px 0 0 var(--warn); }   /* 有备注（下载/已落盘/无响应体等）：左侧色条标记 */
   .row .t { width: 62px; flex: none; color: var(--muted); text-align: right; }
   .row .z { width: 96px; flex: none; color: var(--muted); text-align: right; overflow: hidden; text-overflow: ellipsis; }
   #list[data-cols="d"] .z, #list[data-cols="t"] .z { display: none; }

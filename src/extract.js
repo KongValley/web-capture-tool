@@ -142,6 +142,8 @@ const HARVEST_EXPR = `(() => {
     url: location.href, title: document.title,
     links: uniqLinks.slice(0, 2000), images: images.slice(0, 1000),
     forms: forms.slice(0, 200), tables: tables.slice(0, 50),
+    // 截断前的总数：面板据此提示「已截断」，不再让用户以为页面就这么点内容
+    totals: { links: uniqLinks.length, images: images.length, forms: forms.length, tables: tables.length },
   };
 })()`;
 
