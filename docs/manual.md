@@ -536,7 +536,7 @@ fetch @ http://site/js/app.min.js:1024:87
 |---|---|
 | `npm start` | 开发态启动 |
 | `npm run check` | 零依赖语法闸门：`node --check` 全量扫 main.js / src / dev / ui |
-| `npm run selftest` | 全链路自检（195 项断言；配置/日志/会话/**浏览器持久分区**都改道到系统临时目录，不碰真实数据与登录态） |
+| `npm run selftest` | 全链路自检（197 项断言；配置/日志/会话/**浏览器持久分区**都改道到系统临时目录，不碰真实数据与登录态） |
 | `npm run selftest:sw` | 同一套断言在软件渲染下再跑一遍（等价无显卡机器） |
 | `npm run bench` / `npm run bench:sw` | 性能基准（压力服务器 + 面板/主进程计时） |
 | `npm run shots` | 重新生成本手册的截图到 `docs/img/`（起本地示例站点，配置/日志/会话同样改道临时目录） |

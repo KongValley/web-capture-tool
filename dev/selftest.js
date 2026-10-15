@@ -2793,6 +2793,39 @@ async function run({ state, store, gpu, extract, settings, automation, format, f
       `capNote=${hit190} 日志命中=${log190.includes('开始丢弃最早记录')} 导航=${nav190 && nav190.ok} 条数=${under190} 服务端首页命中=${hits['/'] || 0}`);
   } catch (e) { check('记录上限提示', false, e.message); }
 
+  // 191 忙态防重复：导出离线包进行中按钮禁用（长任务不可撤销/怕连点）
+  try {
+    const busyDir191 = path.join(outDir, 'bundle-busy');
+    await peval(`(() => { document.getElementById('bundleBtn').click(); return true; })()`);
+    await sleep(300);
+    const busy191 = await peval(`(() => {
+      const dir = document.querySelector('#modalBody input');
+      if (dir) dir.value = ${JSON.stringify(busyDir191)};
+      const btn = document.getElementById('bundleRun');
+      if (!btn) return { hasBtn: false };
+      btn.click();
+      return { hasBtn: true, hasDir: !!dir, during: btn.disabled };
+    })()`);
+    await waitFor(() => peval(`document.getElementById('bundleRun').disabled === false`), 60000, '离线包导出完成').catch(() => {});
+    const done191 = await peval(`document.getElementById('bundleRun').disabled`);
+    await peval(`closeModal()`);
+    check('导出离线包忙态（防连点）', busy191.hasBtn && busy191.hasDir && busy191.during === true && done191 === false,
+      `进行中禁用=${busy191.during} 完成后恢复=${done191 === false}`);
+  } catch (e) { check('导出离线包忙态（防连点）', false, e.message); }
+
+  // 192 模态打开时方向键不穿透（Esc 仍可关模态）
+  try {
+    const before192 = await peval(`({ sel: selected, view })`);
+    await peval(`(() => { openModal('守卫测试', [], []); return true; })()`);
+    await sleep(100);
+    await peval(`(() => { for (let i = 0; i < 3; i++) window.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown' })); return true; })()`);
+    await peval(`(() => { window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' })); return true; })()`);
+    const after192 = await peval(`({ sel: selected, view, modalHidden: document.getElementById('modal').hidden })`);
+    check('模态打开时方向键不穿透',
+      before192.sel === after192.sel && before192.view === after192.view && after192.modalHidden === true,
+      `选中 ${before192.sel}→${after192.sel} 视图 ${before192.view}→${after192.view} Esc 关模态=${after192.modalHidden}`);
+  } catch (e) { check('模态打开时方向键不穿透', false, e.message); }
+
   // ---- 编号不回退：这三项会改活动标签的状态（清空 / 恢复 / 切标签），放在套件末尾 ----
 
   // 169 清空后编号不回退（撞号会让新记录既不显示、详情又取到旧记录）

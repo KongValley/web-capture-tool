@@ -299,7 +299,7 @@ WCT_BENCH_N=1200 npm run bench   # 换负载（默认 800 个并发请求）
 ```bash
 npm start               # 开发态直接跑（Electron 22 + ia32 运行时）
 npm run check           # 零依赖语法闸门：node --check 全量扫 main.js / src / dev / ui
-npm run selftest        # 195 项断言：抓取 / 发起者与耗时分解 / 提取（CSS+XPath）/ 翻页合并与任务预设 / 规则落盘 / Mock 改写 / OpenAPI 导出 / 自动化 / 存盘 / 离线包 / 持久化 / 图标 / UI / 排序分组与虚拟滚动 / 瀑布窗口化 / 渲染合并 / 快照对比 / 录制与重放 / 多标签 / 分析导出 / 页面工具 / 性能 / 软件渲染降级 / 下载 / 代理 / 详情转义与导航守卫 / 视图互斥 / 编号不回退 / 沙盒隔离 / 落盘不覆盖 / 退出收尾 / 会话原子写 / 窗口恢复 / 备注可见 / 上限提示 / 权限策略
+npm run selftest        # 197 项断言：抓取 / 发起者与耗时分解 / 提取（CSS+XPath）/ 翻页合并与任务预设 / 规则落盘 / Mock 改写 / OpenAPI 导出 / 自动化 / 存盘 / 离线包 / 持久化 / 图标 / UI / 排序分组与虚拟滚动 / 瀑布窗口化 / 渲染合并 / 快照对比 / 录制与重放 / 多标签 / 分析导出 / 页面工具 / 性能 / 软件渲染降级 / 下载 / 代理 / 详情转义与导航守卫 / 视图互斥 / 编号不回退 / 沙盒隔离 / 落盘不覆盖 / 退出收尾 / 会话原子写 / 窗口恢复 / 备注可见 / 上限提示 / 权限策略
 npm run selftest:sw     # 同一套断言在软件渲染下再跑一遍（等价于无显卡机器）
 npm run bench           # 性能基准：抓包 CPU / 列表渲染 / 过滤 / 排序 / 序列化 / 内存
 npm run bench:sw        # 基准跑在软件渲染下（无显卡机器上的真实数字）
@@ -315,7 +315,7 @@ npm run pack:zip        # 只把目录压成 zip
 **打包版也能自检与跑基准**（老机器上不用装 Node/npm，直接把 zip 解压后执行）：
 
 ```bash
-web-capture-tool.exe --selftest   # 195 项断言（改道 wct-selftest-*，不碰你的配置与登录态）
+web-capture-tool.exe --selftest   # 197 项断言（改道 wct-selftest-*，不碰你的配置与登录态）
 web-capture-tool.exe --bench      # 性能基准（改道 wct-bench-*，打印该机器自己的数字）
 web-capture-tool.exe --bench --software-rendering   # 基准跑在软件渲染下
 ```
