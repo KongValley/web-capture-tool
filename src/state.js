@@ -62,14 +62,14 @@ function send(channel, payload) {
   if (win && !win.isDestroyed()) win.webContents.send(channel, payload);
 }
 
-// 清空活动标签的抓取状态（面板「清空」按钮），镜像同步更新
+// 清空活动标签的抓包状态（面板「清空」按钮），镜像同步更新
 function resetActive() {
   const t = state.activeTab;
   if (!t) return state;
   t.records.length = 0;
   t.byId.clear();
   t.wsFrames.length = 0;
-  t.seq = 0;
+  // seq 不清零：记录编号必须单调不回退，否则新记录会与面板/详情里残留的旧 id 撞号
   t.storedBytes = 0;
   return syncActive();
 }

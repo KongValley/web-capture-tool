@@ -128,7 +128,8 @@
   .tab.on { background: var(--bg); border-color: var(--accent); }
   #findbar { display: flex; align-items: center; gap: 6px; padding: 6px; border-bottom: 1px solid var(--line); }
   #findText { flex: 1; min-width: 40px; }
-  #list { flex: 1; overflow: auto; scrollbar-gutter: stable; }
+  #list { flex: 1; overflow: auto; scrollbar-gutter: stable; display: none; }
+  #list.on { display: block; }
   /* 虚拟滚动：行与分组标题绝对定位（top = 序号 × 26px），#listInner 只提供总高度 */
   #listInner { position: relative; width: 100%; }
   .grp {

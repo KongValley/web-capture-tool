@@ -26,9 +26,10 @@ function trimInitiator(i) {
 // 单次运行最多落盘这么多文件 / 字节（切换规则即重置）
 const MAX_AUTO_SAVE_FILES = 2000;
 const MAX_AUTO_SAVE_BYTES = 512 * 1024 * 1024;
-const autoSave = { n: 0, bytes: 0, blocked: '' };
+const MAX_PENDING_EXTRA = 500;          // 等待 requestWillBeSent 的次要头缓存上限（超出的直接丢，不让内存无界增长）
+const autoSave = { n: 0, bytes: 0, blocked: '', chain: null };
 
-function resetAutoSave() { autoSave.n = 0; autoSave.bytes = 0; autoSave.blocked = ''; return { ok: true }; }
+function resetAutoSave() { autoSave.n = 0; autoSave.bytes = 0; autoSave.blocked = ''; autoSave.chain = null; return { ok: true }; }
 function autoSaveState() { return { n: autoSave.n, bytes: autoSave.bytes, blocked: autoSave.blocked }; }
 
 // 规则匹配：URL 正则 × 类型 × MIME 关键字
@@ -75,6 +76,9 @@ function fullRecord(r) {
 
 function onRequestWillBeSent(tab, ev) {
   const { requestId, request, timestamp, wallTime, type, redirectResponse, initiator } = ev;
+  // pendingExtra 无条件消费：暂停 / 仅记录 XHR 时本条不会建记录，留着就是只增不减的泄漏
+  const extra = tab.pendingExtra.get(requestId);
+  tab.pendingExtra.delete(requestId);
   if (!tab.enabled) return;
   if (settings.values.recordOnly && type !== 'XHR' && type !== 'Fetch') return;
   const prev = tab.byId.get(requestId);
@@ -98,8 +102,6 @@ function onRequestWillBeSent(tab, ev) {
     recorder.onRequest(tab, prev, true);
     return;
   }
-  const extra = tab.pendingExtra.get(requestId);
-  tab.pendingExtra.delete(requestId);
   const rec = {
     id: ++tab.seq, cdpId: requestId, method: request.method, url: request.url,
     type: type || '', time: wallTime ? new Date(wallTime * 1000).toISOString() : new Date().toISOString(),
@@ -276,7 +278,9 @@ async function onLoadingFinished(tab, ev) {
         rec.note = autoSave.blocked;
       }
     } else {
-      files.saveAutoBody(rec, rule.dir)
+      // 串行落盘：并发响应可能命中同一站点路径，串行化后 uniquePathUnder 的「先查存在再写」不会互相插队
+      autoSave.chain = (autoSave.chain || Promise.resolve())
+        .then(() => files.saveAutoBody(rec, rule.dir))
         .then((name) => {
           autoSave.n++;
           autoSave.bytes += rec.bodyBase64 ? Math.round(rec.body.length * 3 / 4) : Buffer.byteLength(rec.body);
@@ -323,7 +327,9 @@ async function attachCapture(tab) {
         if (params.headers) {
           const rec = tab.byId.get(params.requestId);
           if (rec) { rec.requestHeadersRaw = params.headers; queueBatch(tab, 'update', summarize(rec)); }
-          else tab.pendingExtra.set(params.requestId, { headers: params.headers });
+          // 实测 extraInfo 常在 requestWillBeSent 之后到达：暂停抓取时那条记录根本不会建，
+          // 缓存下来就成了只增不减的泄漏（上限只兜得住 500 条）。所以抓取关着时直接不存。
+          else if (tab.enabled && tab.pendingExtra.size < MAX_PENDING_EXTRA) tab.pendingExtra.set(params.requestId, { headers: params.headers });
         }
         break;
       case 'Network.responseReceived': onResponseReceived(tab, params); break;

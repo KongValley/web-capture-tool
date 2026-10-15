@@ -312,19 +312,20 @@ function stop(reason = 'manual') {
   return { ok: true, file: r.file, mdFile: r.mdFile, entries: r.n, durationMs, counts: Object.assign({}, r.counts), reason };
 }
 
-// 退出路径：同步刷盘 + 补一条 summary + 生成 .md（关窗也留下可读摘要）
-function flushSync() {
+// 退出路径：等在飞写入落定 + 补一条 summary + 生成 .md（关窗也留下可读摘要）。
+// 先等 writing 归位再 drainSync(true)：否则在飞的那次 appendFile 与本次同步写会互相让路，summary 随进程一起消失。
+async function flushAsync(reason = 'quit') {
   if (!rec) return { ok: true };
   const r = rec;
   if (r.active) {
     r.stopping = true;
-    r.reason = 'quit';
+    r.reason = reason;
     const now = Date.now();
-    flush();
-    drainSync();
-    push({ k: 'summary', stoppedAt: new Date(now).toISOString(), reason: 'quit', entries: r.n + 1, durationMs: now - r.startedAt, counts: Object.assign({}, r.counts) });
-    flush();
-    drainSync();
+    const t0 = Date.now();
+    while (writing && writingFile === r.file && Date.now() - t0 < 1000) await new Promise((res) => setTimeout(res, 20));
+    drainSync(true);
+    push({ k: 'summary', stoppedAt: new Date(now).toISOString(), reason, entries: r.n + 1, durationMs: now - r.startedAt, counts: Object.assign({}, r.counts) });
+    drainSync(true);
     r.active = false;
     r.stopping = false;
     try {
@@ -337,6 +338,13 @@ function flushSync() {
   if (r.timer) { clearInterval(r.timer); r.timer = null; }
   lastFilePath = r.file;
   lastInfo = { file: r.file, mdFile: r.mdFile };
+  return { ok: true };
+}
+
+// 同步优先包装：无在飞写入时 flushAsync 会一路同步跑完（async 函数在第一个 await 之前不返回），
+// 与原来的同步语义等价；调用方需要「确保已落盘」时用 await flushAsync()
+function flushSync() {
+  flushAsync('quit');
   return { ok: true };
 }
 
@@ -594,10 +602,11 @@ function takeShot(tab, entry) {
   const file = path.join(dirPath(), name);
   tab.wc.capturePage()
     .then((image) => fs.promises.writeFile(file, image.toPNG()))
-    .then(() => { if (rec && rec.active) push({ k: 'shot', tab: tab.id, sel: entry.sel || '', file: name }); })
+    // rec === r：截图是异步的，回填时若已经「停止 → 重新开始录制」，不能把旧录制的截图记进新录制
+    .then(() => { if (rec === r && r.active) push({ k: 'shot', tab: tab.id, sel: entry.sel || '', file: name }); })
     .catch((e) => {
       logger.log('rec', `截图失败：${e.message}`);
-      if (rec && rec.active) note(`截图失败：${e.message}`);
+      if (rec === r && r.active) note(`截图失败：${e.message}`);
     });
 }
 
@@ -982,7 +991,7 @@ function stopReplay() {
 module.exports = {
   VERSION, DIRNAME, BINDING, MAX_ENTRIES, MAX_BODY_WRITE, MAX_TOTAL_BODY_WRITE, MAX_POST_WRITE,
   MAX_WS_WRITE, MAX_SHOTS, FLUSH_MS, FLUSH_BYTES, MD_MAX_LINES,
-  dirPath, useDir, isRecording, lastFile, lastInfo: () => Object.assign({}, lastInfo), status, start, stop, stopWhenIdle, flushSync,
+  dirPath, useDir, isRecording, lastFile, lastInfo: () => Object.assign({}, lastInfo), status, start, stop, stopWhenIdle, flushSync, flushAsync,
   chainLabel,
   arm, disarm, RECORD_SCRIPT, SELECTOR_SRC, XPATH_SRC,
   onBinding, onRequest, onResponse, onBody, onFail, onWs, onNav, onPage, onNote: note,

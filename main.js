@@ -47,6 +47,11 @@ if (process.platform === 'win32') app.setAppUserModelId('com.kongvalley.web-capt
 // 自检 / 基准改道到临时配置，绝不碰用户真实配置；随后同步读盘（后续默认值都从这里取）
 const SANDBOX = state.selftest ? 'selftest' : state.bench ? 'bench' : state.shots ? 'shots' : '';
 if (SANDBOX) {
+  // userData 必须一起改道：Chromium 持久分区（PARTITION='persist:capture' 的 Cookie / localStorage / 缓存）
+  // 就在它下面，而自检会执行 cap:wipe 清数据——不改道就会清掉用户真实的登录态
+  const sbUserData = path.join(os.tmpdir(), `wct-${SANDBOX}`);
+  try { fs.rmSync(sbUserData, { recursive: true, force: true }); } catch (e) { /* 删不掉就按现状追加 */ }
+  app.setPath('userData', sbUserData);
   store.useFile(path.join(os.tmpdir(), `wct-${SANDBOX}-settings`, 'settings.json'));
   logger.useFile(path.join(os.tmpdir(), `wct-${SANDBOX}-logs`, 'app.log'));
   sessionStore.useFile(path.join(os.tmpdir(), `wct-${SANDBOX}-session`, 'last.json'));
@@ -120,6 +125,7 @@ function offerSoftware(reason, persist = true) {
     store.setApp('softwareRendering', true);
     store.flush();
     state.softwareMode = true;     // 避免重复提示；重启后由配置生效
+    send('cap:gpu', Object.assign({ softwareMode: state.softwareMode }, gpu.describe()));   // 面板立刻关掉模糊/阴影等合成开销
   }
   send('cap:banner', {
     text: persist ? `${reason}，已切换为软件渲染（重启后生效）` : `${reason}，建议在「设置」里开启软件渲染`,
@@ -289,13 +295,14 @@ function closeTab(id) {
   if (idx < 0) return { ok: false, error: '标签不存在' };
   const tab = state.tabs[idx];
   const wasActive = state.activeTab === tab;
-  // 撤销快照：零拷贝持有该标签自己的数组（标签对象随后被丢弃，视图另行销毁）
+  // 撤销快照：数组要复制一份——视图销毁前的在途 CDP 事件还会往 tab.records 里追加，
+  // 持有活引用会让「撤销」恢复到比关闭那一刻更多的记录
   lastClosed = {
     at: Date.now(),
     title: tab.title || tab.url || '',
     snapshot: {
       title: tab.title, url: tab.url,
-      records: tab.records, byId: tab.byId, pendingExtra: tab.pendingExtra,
+      records: tab.records.slice(), byId: tab.byId, pendingExtra: tab.pendingExtra,
       wsFrames: tab.wsFrames, seq: tab.seq, storedBytes: tab.storedBytes, enabled: tab.enabled,
     },
   };
@@ -306,6 +313,7 @@ function closeTab(id) {
     if (next) activateTab(next);
   }
   try {
+    recorder.disarm(tab.wc).catch(() => {});   // 先摘掉录制注入：armed 里不留已销毁的 webContents（否则渲染进程回收不掉）
     // BrowserView 的 webContents：close() 只是走 window.close() 流程，实测不会销毁（渲染进程会残留），
     // destroy() 在 Electron 22 运行时存在且真正释放；类型定义里没有，所以做存在性兜底。
     if (typeof tab.wc.destroy === 'function') tab.wc.destroy();
@@ -313,7 +321,8 @@ function closeTab(id) {
   } catch (e) { logger.log('tab', `关闭标签失败：${e.message}`); }
   if (!state.tabs.length) newTab();          // 最后一个标签关掉后回到全新标签
   send('cap:tabs', tabsPayload());
-  return { ok: true, id, title: lastClosed.title, undoMs: TAB_UNDO_MS };
+  // records 是撤销快照里的条数：面板拿它对齐（关闭那一刻的基准，之后抓包不再往这个标签写）
+  return { ok: true, id, title: lastClosed.title, undoMs: TAB_UNDO_MS, records: lastClosed.snapshot.records.length };
 }
 
 function createWindow() {
@@ -333,6 +342,9 @@ function createWindow() {
   }));
   state.win = win;
   win.loadFile(path.join(__dirname, 'ui', 'index.html'));
+  // 面板只加载本地 index.html，永不导航到远程页：拦住详情内容里被注入的 <a>/<meta refresh> 把带 Node 权限的窗口带走
+  win.webContents.on('will-navigate', (e) => e.preventDefault());
+  win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
   // 窗口创建时的 setBounds 早于窗口真正显示，Chromium 会把它落在 0 高度的视口上；
   // 面板加载完成 = 窗口已显示，此时重排一次，页面视口才拿到真实高度。
   win.webContents.once('did-finish-load', layout);
@@ -609,6 +621,9 @@ function registerIpc() {
     }
     store.setSettings(settings.values);
     store.flush();
+    // 导入的 mock 规则与落盘规则要立刻生效：否则内存/磁盘是开的，CDP Fetch 域没挂 → 规则静默失效到重启
+    await capture.syncMock();
+    capture.resetAutoSave();
     return { ok: true, applied: applied.length, skipped, failed };
   });
   ipcMain.handle('cap:cfgAllTabs', () => settings.applyToAllTabs());
@@ -988,7 +1003,10 @@ function registerIpc() {
       state.records.push(rec);
       if (rec.cdpId) state.byId.set(rec.cdpId, rec);
     }
-    state.seq = state.records.reduce((m, x) => Math.max(m, x.id || 0), 0);
+    // 编号续接：把恢复进来的最大 id 回写到活动标签的 seq，否则下一次抓包从 1 重来会与恢复的记录撞号
+    const maxId = state.records.reduce((m, x) => Math.max(m, x.id || 0), 0);
+    if (state.activeTab) state.activeTab.seq = Math.max(state.activeTab.seq, maxId);
+    syncActive();
     for (const f of r.wsFrames) state.wsFrames.push(f);
     // 标签布局：记录灌进当前活动标签（列表立刻可用），保存的标签在后台整体重建，不抢当前标签
     const savedTabs = Array.isArray(r.tabs) ? r.tabs : [];
@@ -1069,7 +1087,14 @@ app.whenReady().then(() => {
   // 省下窗口顶部一整行；对应快捷键改由面板 onKey + cap:reload/cap:devtools/cap:fullscreen 提供
   // （文本框的 Ctrl+C/V/X/A/Z 是 Chromium 原生编辑命令，与菜单无关，仍然可用）。
   Menu.setApplicationMenu(null);
-  session.fromPartition(PARTITION).setPermissionRequestHandler((_wc, _perm, cb) => cb(true));
+  // 页面权限：只放行抓包浏览器自身需要的项；摄像头 / 麦克风 / 定位 / 通知 / MIDI 等一律拒绝并提示
+  const ALLOWED_PERMS = new Set(['fullscreen', 'clipboard-sanitized-write', 'pointerLock', 'window-placement']);
+  session.fromPartition(PARTITION).setPermissionRequestHandler((_wc, perm, cb) => {
+    if (ALLOWED_PERMS.has(perm)) return cb(true);
+    logger.log('perm', `已拒绝页面权限请求：${perm}`);
+    send('cap:perm', { perm });
+    return cb(false);
+  });
 
   // 下载没有任何 UI 反馈，这里补上：状态栏/toast 提示 + 给它对应的抓包记录补一条 note
   session.fromPartition(PARTITION).on('will-download', (_e, item) => {
@@ -1128,15 +1153,26 @@ app.whenReady().then(() => {
     require('./dev/bench.js').run({ state, capture, session: sessionStore, gpu });
   }
   if (state.shots) {
-    require('./dev/shots.js').run({ state, layout, settings, capture, session: sessionStore, files, logger });
+    require('./dev/shots.js').run({ state, layout, settings, capture, session: sessionStore, toolbarH: TOOLBAR_H });
   }
   app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
 });
 
 app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
 
-app.on('before-quit', () => {
+// 退出收尾必须等异步写入落定，所以拦一次 before-quit 改成可等待的异步收尾。
+// app.exit() 不再触发 before-quit，quitting 同时防重入。
+let quitting = false;
+app.on('before-quit', (e) => {
+  if (quitting) return;
+  quitting = true;
+  e.preventDefault();
   sessionStore.stop();
-  recorder.flushSync();                            // 录制中的会话补一条 summary（reason:'quit'）
-  if (!state.selftest && !state.bench && !state.shots) sessionStore.saveSync();   // 自检/基准/截图退出时不写会话文件
+  recorder.flushAsync('quit')                      // 录制中的会话补一条 summary（reason:'quit'）
+    .catch((err) => logger.log('rec', `退出收尾失败：${err.message}`))
+    .finally(() => {
+      if (!state.selftest && !state.bench && !state.shots) sessionStore.saveSync();   // 自检/基准/截图退出时不写会话文件
+      store.flush();                               // 设置写盘有 300ms 防抖：关窗前最后一次改动不能丢
+      app.exit(0);
+    });
 });

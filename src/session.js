@@ -23,6 +23,7 @@ let overrideFile = null;
 let file = null;
 let timer = null;
 let lastCount = -1;
+let saving = false;          // 异步写在飞标志：超大会话的分片序列化可能超过 30s 间隔，重叠写会互相覆盖
 
 function filePath() {
   return file || overrideFile || path.join(app.getPath('userData'), 'sessions', 'last.json');
@@ -90,27 +91,36 @@ async function toJson(data) {
 }
 
 async function save() {
+  if (saving) return { ok: true, skipped: true };    // 上一次还没落定：跳过这次，别让两次写互相插队
+  saving = true;
   try {
     const data = snapshot();
     const text = await toJson(data);
     const p = filePath();
     await fs.promises.mkdir(path.dirname(p), { recursive: true });
-    await fs.promises.writeFile(p, text);
+    const tmp = `${p}.tmp`;
+    await fs.promises.writeFile(tmp, text);
+    await fs.promises.rename(tmp, p);                // 原子替换：崩在写一半也不会留下半个会话文件
     lastCount = data.records.length;
     return { ok: true, file: p, count: data.records.length };
   } catch (e) {
     logger.log('session', `保存失败：${e.message}`);
     return { ok: false, error: e.message };
+  } finally {
+    saving = false;
   }
 }
 
-// 退出路径用：同步写，进程随时可能消失（这里不能分片让出事件循环）
+// 退出路径用：同步写，进程随时可能消失（这里不能分片让出事件循环）。
+// 临时名与异步写的 .tmp 分开：两者可能在同一时刻写同一个目录，抢同一个 tmp 会互相 rename 掉。
 function saveSync() {
   try {
     const data = snapshot();
     const p = filePath();
     fs.mkdirSync(path.dirname(p), { recursive: true });
-    fs.writeFileSync(p, `${headOf(data)},"records":[${data.records.map((r) => JSON.stringify(r)).join(',')}]}`);
+    const tmp = `${p}.sync.tmp`;
+    fs.writeFileSync(tmp, `${headOf(data)},"records":[${data.records.map((r) => JSON.stringify(r)).join(',')}]}`);
+    fs.renameSync(tmp, p);
     lastCount = data.records.length;
     return { ok: true, file: p, count: data.records.length };
   } catch (e) {

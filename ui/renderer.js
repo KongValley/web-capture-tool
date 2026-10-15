@@ -42,19 +42,24 @@ $('splitter').addEventListener('mousedown', (e) => {
   $('splitter').classList.add('on');
   e.preventDefault();
 });
+const endDrag = () => {
+  if (!dragging) return;
+  dragging = false;
+  $('splitter').classList.remove('on');
+  ipcRenderer.invoke('cap:panelWidth', readPanelWidth());   // 收尾：主进程按最终宽度摆放视图并落盘
+};
 window.addEventListener('mousemove', (e) => {
   if (!dragging) return;
+  // 拖到左侧原生视图上时 mouseup 收不到（BrowserView 是独立合成层，事件不进面板窗口）：
+  // 用「按键还在吗」兜底，否则 dragging 会一直卡着，鼠标一回到面板就继续改宽度
+  if (!e.buttons) { endDrag(); return; }
   const w = Math.max(PANEL_MIN, Math.min(PANEL_MAX, window.innerWidth - e.clientX));
   applyPanelWidth(w);
   if (dragRaf) return;
   dragRaf = requestAnimationFrame(() => { dragRaf = 0; ipcRenderer.invoke('cap:panelWidth', readPanelWidth()); });
 });
-window.addEventListener('mouseup', () => {
-  if (!dragging) return;
-  dragging = false;
-  $('splitter').classList.remove('on');
-  ipcRenderer.invoke('cap:panelWidth', readPanelWidth());   // 收尾：主进程按最终宽度摆放视图并落盘
-});
+window.addEventListener('mouseup', endDrag);
+window.addEventListener('blur', endDrag);
 
 /* ------------------------------------------------------------- 列表渲染 */
 
@@ -481,9 +486,10 @@ function filteredIds() {
 
 /* ------------------------------------------------------------- 详情渲染 */
 
-const esc = (s) => String(s == null ? '' : s);
-// HTML 属性值转义（详情面板里的输入框 value=...）；页面文本本身按既有做法不转义
-const escAttr = (s) => esc(s).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
+// HTML 文本转义：详情面板里所有抓取内容都必须过它（URL/头/请求体/响应体/失败原因都来自页面，天然含尖括号）
+const esc = (s) => String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+// 属性值转义（详情面板里的输入框 value=...）：在 esc 之后再补引号
+const escAttr = (s) => esc(s).replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 
 // 原始头优先去重后的「名称: 值」行（列表展示与复制共用一份实现）
 function headersLines(headers, raw) {
@@ -560,6 +566,7 @@ function renderDetail(id) {
   el.detail.classList.add('on');
   if (!entry) { el.detail.innerHTML = '<div class="empty">记录已被清理</div>'; return; }
   ipcRenderer.invoke('cap:detail', id).then((d) => {
+    if (detailId !== id) return;    // 在途响应已过期（清空 / 切标签 / 又选了别的行）：不能回填成幽灵详情
     if (!d) { el.detail.innerHTML = '<div class="empty">未找到记录 #' + esc(id) + '</div>'; return; }
     detailData = d;
     el.detail.innerHTML =
@@ -580,6 +587,15 @@ function renderDetail(id) {
       headersBlock('响应头（原始，含 Set-Cookie）', d.responseHeaders, d.responseHeadersRaw) +
       bodyBlock(d);
   });
+}
+
+// 收起详情与选中（清空 / 会话恢复 / 切标签共用）：记录 id 只在单个标签内唯一，
+// 切标签后旧 id 很可能落在新标签的另一条记录上，继续留着会「复制到错的那条」
+function clearDetail() {
+  selected = null;
+  detailId = null;
+  detailData = null;
+  el.detail.innerHTML = '';
 }
 
 function select(id) {
@@ -749,12 +765,7 @@ function refreshActiveList(d) {
   toggleState = d.enabled;
   $('toggle').textContent = d.enabled ? '暂停' : '继续';
   $('status').textContent = d.status;
-  if (selected != null && !keep.has(selected)) {       // 选中的记录没了才收起详情
-    selected = null;
-    detailId = null;
-    detailData = null;
-    el.detail.innerHTML = '';
-  }
+  clearDetail();       // 整表重刷（切标签 / 会话恢复）一律收起详情：id 只在标签内唯一，旧选中没有意义
   updateCounts();
   syncTabs();
 }
@@ -823,6 +834,8 @@ function wsMatch(frame) {
   return wsText(frame).toLowerCase().includes(f);
 }
 
+const MAX_WS_DISPLAY = 2000;      // 与主进程 MAX_WS_FRAMES 一致：面板 DOM 只保留最近这么多帧
+
 function appendWs(frame) {
   if ($('wsPause').checked) return;                 // 暂停只影响显示，数据仍在主进程
   if (!wsMatch(frame)) return;
@@ -831,6 +844,7 @@ function appendWs(frame) {
   const div = document.createElement('div');
   div.textContent = wsText(frame);
   el.ws.appendChild(div);
+  while (el.ws.children.length > MAX_WS_DISPLAY) el.ws.removeChild(el.ws.firstChild);
   $('nWs').textContent = el.ws.children.length;
   if (view === 'ws') el.ws.scrollTop = el.ws.scrollHeight;
 }
@@ -1287,10 +1301,7 @@ $('fwd').onclick = () => ipcRenderer.invoke('cap:forward');
 $('reload').onclick = () => ipcRenderer.invoke('cap:reload');
 $('clear').onclick = () => ipcRenderer.invoke('cap:clear').then(() => {
   resetListDom();
-  el.detail.innerHTML = '';
-  selected = null;
-  detailId = null;
-  detailData = null;
+  clearDetail();
   if (view === 'wf') renderWaterfall();
 });
 $('toggle').onclick = () => ipcRenderer.invoke('cap:setEnabled', !toggleState).then((v) => {
@@ -2596,10 +2607,7 @@ async function bannerAction(id) {
     const r = await ipcRenderer.invoke('cap:sessionRestore');
     if (!r || !r.ok) return toast('恢复失败：' + ((r && r.error) || '未知错误'), 'err');
     resetListDom();
-    el.detail.innerHTML = '';
-    selected = null;
-    detailId = null;
-    detailData = null;
+    clearDetail();
     r.records.forEach(appendRecord);
     (r.wsFrames || []).forEach(appendWs);
     updateCounts();
@@ -2615,6 +2623,8 @@ async function bannerAction(id) {
 }
 
 ipcRenderer.on('cap:banner', (_e, b) => showBanner(b.text, b.actions));
+ipcRenderer.on('cap:perm', (_e, d) => { if (d && d.perm) toast(`已拒绝页面权限请求：${d.perm}`, 'warn', 6000); });
+ipcRenderer.on('cap:gpu', (_e, g) => document.body.classList.toggle('soft', !!(g && g.softwareMode)));
 
 async function navigate(input) {
   const r = await ipcRenderer.invoke('cap:navigate', input);
@@ -2705,23 +2715,14 @@ $('listNew').onclick = () => {
 window.addEventListener('click', hideContextMenu);
 window.addEventListener('blur', hideContextMenu);
 ipcRenderer.on('cap:tabs', (_e, d) => renderTabs(d && d.tabs, d && d.activeTabId));
-ipcRenderer.on('cap:tabChanged', async () => refreshActiveList(await ipcRenderer.invoke('cap:list')));
+ipcRenderer.on('cap:tabChanged', async () => { clearDetail(); refreshActiveList(await ipcRenderer.invoke('cap:list')); });
 
 /* -------------------------------------------------------------- 初始化 */
 
 let toggleState = true;
-(async () => {
-  const d = await ipcRenderer.invoke('cap:list');
-  // 无显卡 / 软件渲染：关掉全屏模糊与阴影这类合成开销（老机器上最贵的一项）
-  ipcRenderer.invoke('cap:gpuStatus').then((g) => {
-    if (g && g.softwareMode) document.body.classList.add('soft');
-  }).catch(() => {});
-  // 按持久化宽度摆放面板（主进程已按同一数值摆放原生视图；不要再回传，否则会反向覆盖）
-  applyPanelWidth(Math.max(PANEL_MIN, Math.min(PANEL_MAX, d.panelWidth || 520)));
-  refreshActiveList(d);
-
-  // 回填爬虫设置控件
-  const cfgAll = await ipcRenderer.invoke('cap:cfgAll');
+// 设置控件回填（启动时与「导入设置」成功后共用一份）：导入后控件要跟磁盘走，不能停在旧值
+function fillCfgControls(cfgAll) {
+  if (!cfgAll) return;
   $('blockMode').value = cfgAll.blockMode;
   $('blockKeywords').value = cfgAll.blockKeywords;
   $('recordOnly').checked = !!cfgAll.recordOnly;
@@ -2739,6 +2740,19 @@ let toggleState = true;
     if (preset) $('uaSel').value = preset;
     else { $('uaSel').value = 'custom'; $('uaCustom').hidden = false; $('uaCustom').value = cfgAll.ua; }
   }
+}
+
+(async () => {
+  const d = await ipcRenderer.invoke('cap:list');
+  // 无显卡 / 软件渲染：关掉全屏模糊与阴影这类合成开销（老机器上最贵的一项）
+  ipcRenderer.invoke('cap:gpuStatus').then((g) => {
+    if (g && g.softwareMode) document.body.classList.add('soft');
+  }).catch(() => {});
+  // 按持久化宽度摆放面板（主进程已按同一数值摆放原生视图；不要再回传，否则会反向覆盖）
+  applyPanelWidth(Math.max(PANEL_MIN, Math.min(PANEL_MAX, d.panelWidth || 520)));
+  refreshActiveList(d);
+
+  fillCfgControls(await ipcRenderer.invoke('cap:cfgAll'));
 
   // 上次会话可恢复 → 横幅提示
   const si = await ipcRenderer.invoke('cap:sessionInfo');
