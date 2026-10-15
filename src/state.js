@@ -88,7 +88,18 @@ function normalizeUrl(input) {
   return `https://${s}`;
 }
 
+const WINDOW_DEFAULTS = { width: 1440, height: 900, minWidth: 900, minHeight: 600 };  // 首启/缺省窗口参数
+// 合并启动窗口参数：保存的尺寸与位置优先（x/y 必须是有限数才采纳，null 交给系统），其余用缺省值
+function windowInitOptions(saved) {
+  const w = saved && typeof saved === 'object' ? saved : {};
+  const out = Object.assign({}, WINDOW_DEFAULTS);
+  if (Number.isFinite(w.width)) out.width = Math.round(w.width);
+  if (Number.isFinite(w.height)) out.height = Math.round(w.height);
+  if (Number.isFinite(w.x) && Number.isFinite(w.y)) { out.x = Math.round(w.x); out.y = Math.round(w.y); }
+  return out;
+}
+
 module.exports = {
   PARTITION, TOOLBAR_H, MAX_RECORDS, MAX_BODY, MAX_TOTAL_BODY, MAX_WS_FRAMES,
-  state, send, setStatus, normalizeUrl, syncActive, resetActive,
+  state, send, setStatus, normalizeUrl, syncActive, resetActive, windowInitOptions, WINDOW_DEFAULTS,
 };

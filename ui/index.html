@@ -20,6 +20,7 @@
   body {
     background: var(--bg); color: var(--fg); overflow: hidden;
     font: 13px/1.5 "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+    display: flex; flex-direction: column;
   }
   [hidden] { display: none !important; }
   ::selection { background: var(--accent-dim); }
@@ -100,7 +101,10 @@
   #status { color: var(--muted); font-size: 12px; max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
   #count { color: var(--accent); font-variant-numeric: tabular-nums; font-weight: 600; }
 
-  #body { height: calc(100% - 164px); display: flex; }
+  /* 工具栏 + 标签栏不参与伸缩；内容区吃掉剩余高度（工具栏换行变高时底部不再被裁） */
+  #toolbar, #toolbar2, #toolbar3, #tabstrip { flex: none; }
+
+  #body { flex: 1; min-height: 0; display: flex; }
   #pageArea { flex: 1; min-width: 0; }
   #panel {
     width: 520px; flex: none; display: flex; flex-direction: column; position: relative;

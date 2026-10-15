@@ -44,11 +44,13 @@ function clampInt(v, min, max, dflt) {
 function normalizeWindow(w) {
   const d = DEFAULTS.app.window;
   if (!w || typeof w !== 'object') return { width: d.width, height: d.height, x: null, y: null };
+  // null/空串不能被 Number() 吞成 0（Number(null) === 0），否则没拖过窗口的机器重启会跳到屏幕左上角
+  const fin = (v) => (v === null || v === undefined || v === '' ? null : (Number.isFinite(Number(v)) ? Math.round(Number(v)) : null));
   return {
     width: clampInt(w.width, 900, 10000, d.width),
     height: clampInt(w.height, 600, 10000, d.height),
-    x: Number.isFinite(Number(w.x)) ? Math.round(Number(w.x)) : null,
-    y: Number.isFinite(Number(w.y)) ? Math.round(Number(w.y)) : null,
+    x: fin(w.x),
+    y: fin(w.y),
   };
 }
 

@@ -26,7 +26,7 @@ const path = require('node:path');
 const os = require('node:os');
 const fs = require('node:fs');
 
-const { PARTITION, TOOLBAR_H, state, send, setStatus, normalizeUrl, syncActive, resetActive } = require('./src/state');
+const { PARTITION, TOOLBAR_H, state, send, setStatus, normalizeUrl, syncActive, resetActive, windowInitOptions } = require('./src/state');
 const store = require('./src/store');
 const logger = require('./src/logger');
 const sessionStore = require('./src/session');
@@ -163,6 +163,7 @@ function watchGpu() {
 let tabSeq = 0;
 const TAB_UNDO_MS = 10000;   // 关闭标签后的可撤销窗口
 let lastClosed = null;       // { at, title, snapshot }
+let lastClosedTimer = null;  // 撤销窗口到期即释放快照（快照持有整个标签的响应体，不再点撤销就不该常驻）
 
 function tabList() {
   return state.tabs.map((t) => ({
@@ -306,6 +307,8 @@ function closeTab(id) {
       wsFrames: tab.wsFrames, seq: tab.seq, storedBytes: tab.storedBytes, enabled: tab.enabled,
     },
   };
+  clearTimeout(lastClosedTimer);
+  lastClosedTimer = setTimeout(() => { lastClosed = null; }, TAB_UNDO_MS + 500);
   state.tabs.splice(idx, 1);
   // 先把窗口切到相邻标签，再销毁旧视图（避免窗口短暂挂着一个已销毁的 BrowserView）
   if (wasActive) {
@@ -326,8 +329,8 @@ function closeTab(id) {
 }
 
 function createWindow() {
-  const win = new BrowserWindow(Object.assign(windowOptions(), {
-    width: 1440, height: 900, minWidth: 900, minHeight: 600,
+  // 缺省尺寸在 windowInitOptions 里兜底；保存的尺寸/位置优先（此前 Object.assign 顺序反了，尺寸永远 1440×900）
+  const win = new BrowserWindow(Object.assign(windowInitOptions(windowOptions()), {
     show: true,   // 自检也需要真实视口：隐藏窗口的视口高度为 0，滚动/自动加载无法生效
     backgroundColor: '#1b1d21',
     title: '网页抓取工具',
@@ -1041,7 +1044,7 @@ function registerIpc() {
   ipcMain.handle('cap:tabClose', (_e, id) => closeTab(id));
   ipcMain.handle('cap:tabUndo', () => {
     if (!lastClosed) return { ok: false, error: '没有可撤销的关闭' };
-    if (Date.now() - lastClosed.at > TAB_UNDO_MS) { lastClosed = null; return { ok: false, error: '撤销已过期' }; }
+    if (Date.now() - lastClosed.at > TAB_UNDO_MS) { clearTimeout(lastClosedTimer); lastClosed = null; return { ok: false, error: '撤销已过期' }; }
     const snap = lastClosed.snapshot;
     const tab = newTab(snap.url || 'about:blank');
     if (!tab) return { ok: false, error: '窗口未就绪' };
@@ -1051,6 +1054,7 @@ function registerIpc() {
     });
     syncActive();
     send('cap:tabChanged', { id: tab.id });
+    clearTimeout(lastClosedTimer);
     lastClosed = null;
     return { ok: true, id: tab.id, records: tab.records.length };
   });
@@ -1075,7 +1079,12 @@ function registerIpc() {
 
   /* ------------------------------------------------------ 应用级（重启/GPU）*/
 
-  ipcMain.handle('cap:restart', () => {
+  ipcMain.handle('cap:restart', async () => {
+    // app.exit() 不触发 before-quit：这里手动走一遍退出收尾（录制 summary/.md、在飞会话写、设置防抖）
+    sessionStore.stop();
+    await recorder.flushAsync('quit').catch((err) => logger.log('rec', `重启收尾失败：${err.message}`));
+    await sessionStore.whenIdle();
+    if (!state.selftest && !state.bench && !state.shots) sessionStore.saveSync();
     store.flush();
     // 先让 IPC 回复送达，再重启（立刻 relaunch 会丢回复）
     setTimeout(() => { app.relaunch(); app.exit(0); }, 200);
@@ -1174,11 +1183,14 @@ app.on('before-quit', (e) => {
   quitting = true;
   e.preventDefault();
   sessionStore.stop();
-  recorder.flushAsync('quit')                      // 录制中的会话补一条 summary（reason:'quit'）
-    .catch((err) => logger.log('rec', `退出收尾失败：${err.message}`))
-    .finally(() => {
-      if (!state.selftest && !state.bench && !state.shots) sessionStore.saveSync();   // 自检/基准/截图退出时不写会话文件
-      store.flush();                               // 设置写盘有 300ms 防抖：关窗前最后一次改动不能丢
-      app.exit(0);
-    });
+  // 两件异步收尾都等到位再同步写盘：录制补 summary；在飞的异步会话写先落定，
+  // 否则它的 rename 可能晚于 saveSync，把新会话覆盖成更早的快照
+  Promise.all([
+    recorder.flushAsync('quit').catch((err) => logger.log('rec', `退出收尾失败：${err.message}`)),
+    sessionStore.whenIdle(),
+  ]).then(() => {
+    if (!state.selftest && !state.bench && !state.shots) sessionStore.saveSync();   // 自检/基准/截图退出时不写会话文件
+    store.flush();                               // 设置写盘有 300ms 防抖：关窗前最后一次改动不能丢
+    app.exit(0);
+  });
 });

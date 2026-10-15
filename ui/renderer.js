@@ -196,7 +196,10 @@ function resetListDom() {
   invalidateBottom();
   el.ws.innerHTML = '';
   $('nWs').textContent = '0';
+  detailFull.clear();          // 展开/美化态按 id 记录：id 只在标签内唯一，清空/切标签后必须作废
+  detailPretty.clear();
   updateListNew();
+  resetBodySearch();
   updateListNote();
   updateCounts();
 }
@@ -261,13 +264,19 @@ function updateListNew() {
 }
 
 function updateListNote() {
-  if (bodyHits) {                                  // body: 生效期间优先显示命中数
-    $('listNote').hidden = false;
-    $('listNote').textContent = `响应体命中 ${bodyHits.size} 条`;
+  const n = $('listNote');
+  if (bodyQuery && !bodyHits) {                    // 命中集还没回来：明确「搜索中」，不再让空列表冒充「没匹配」
+    n.hidden = false;
+    n.textContent = '响应体搜索中…';
     return;
   }
-  $('listNote').hidden = true;
-  $('listNote').textContent = '';
+  if (bodyHits) {                                  // body: 生效期间优先显示命中数
+    n.hidden = false;
+    n.textContent = `响应体命中 ${bodyHits.size} 条`;
+    return;
+  }
+  n.hidden = true;
+  n.textContent = '';
 }
 
 /* 列表跟随滚动：「是否在底部」不再每行都去读 scrollHeight。
@@ -592,6 +601,9 @@ function renderDetail(id) {
 // 收起详情与选中（清空 / 会话恢复 / 切标签共用）：记录 id 只在单个标签内唯一，
 // 切标签后旧 id 很可能落在新标签的另一条记录上，继续留着会「复制到错的那条」
 function clearDetail() {
+  clearTimeout(detailTimer);       // 在途的 200ms 刷新必须一起取消：否则清空/切标签后详情会「复活」，还可能渲染到新标签同 id 的记录
+  detailTimer = null;
+  detailDirty = false;
   selected = null;
   detailId = null;
   detailData = null;
@@ -608,6 +620,9 @@ function select(id) {
     if (prevNode) prevNode.classList.remove('sel');
   }
   selected = id;
+  // 先切回列表再滚动/渲染：列表 display:none 时 clientHeight 为 0，滚动会被夹到 0、窗口也算不出目标行
+  view = 'list';
+  syncTabs();
   const idx = order.findIndex((e) => e.t === 'row' && e.id === id);
   if (idx >= 0 && !live.has(idx)) {            // 目标不在窗口里：先滚到它附近
     el.list.scrollTop = Math.max(0, idx * ROW_H - Math.round(el.list.clientHeight / 2));
@@ -615,8 +630,6 @@ function select(id) {
   renderWindow();
   const node = idx >= 0 ? live.get(idx) : null;
   if (node) node.classList.add('sel');
-  view = 'list';
-  syncTabs();
   renderDetail(id);
 }
 
@@ -766,6 +779,9 @@ function refreshActiveList(d) {
   $('toggle').textContent = d.enabled ? '暂停' : '继续';
   $('status').textContent = d.status;
   clearDetail();       // 整表重刷（切标签 / 会话恢复）一律收起详情：id 只在标签内唯一，旧选中没有意义
+  resetBodySearch();   // 命中集同样只在单标签内有效：切标签后按新标签重算
+  detailFull.clear();  // 展开/美化态同理作废，否则新标签同 id 记录会误显示「已展开全文」
+  detailPretty.clear();
   updateCounts();
   syncTabs();
 }
@@ -1170,24 +1186,29 @@ async function openReplayModal() {
   out.hidden = true;
 
   const send = async () => {
+    const btn = $('replaySend');
     out.hidden = false;
     out.textContent = '重放中…';
     $('status').textContent = '重放中…';
-    const r = await ipcRenderer.invoke('cap:replay', detailId, {
-      method: methodIn.value.trim(), url: urlIn.value.trim(),
-      headers: headersTa.value, body: bodyTa.value,
-    });
-    const text = r.ok
-      ? `${r.status} ${r.statusText}  ${r.tookMs}ms${r.truncated ? '（响应体已截断到 1MB）' : ''}\n${JSON.stringify(r.headers, null, 2)}\n\n${r.body}`
-      : '重放失败：' + r.error;
-    out.textContent = text;
-    $('status').textContent = r.ok ? `重放完成：${r.status}` : '重放失败';
-    const h = document.createElement('h3');
-    h.textContent = '重放结果';
-    const pre = document.createElement('pre');
-    pre.textContent = text;
-    el.detail.appendChild(h);
-    el.detail.appendChild(pre);
+    btn.disabled = true;
+    try {
+      const r = await ipcRenderer.invoke('cap:replay', detailId, {
+        method: methodIn.value.trim(), url: urlIn.value.trim(),
+        headers: headersTa.value, body: bodyTa.value,
+      });
+      if (!r || !r.ok) {
+        out.textContent = '重放失败：' + ((r && r.error) || '主进程没有返回结果');
+        $('status').textContent = '重放失败';
+        return;
+      }
+      out.textContent = `${r.status} ${r.statusText}  ${r.tookMs}ms${r.truncated ? '（响应体已截断到 1MB）' : ''}\n${JSON.stringify(r.headers, null, 2)}\n\n${r.body}`;
+      $('status').textContent = `重放完成：${r.status}`;
+    } catch (e) {
+      out.textContent = '重放失败：' + e.message;
+      $('status').textContent = '重放失败';
+    } finally {
+      btn.disabled = false;
+    }
   };
 
   openModal('重放请求', [
@@ -1269,6 +1290,7 @@ function onKey(e) {
     if (document.activeElement && document.activeElement.blur) document.activeElement.blur();
     return;
   }
+  if (!$('modal').hidden) return;   // 模态打开时其余快捷键一律不穿透：方向键不再改到背后列表的选中/视图/详情
   if (typing) return;
   if (e.key === 'ArrowDown' || e.key === 'ArrowUp') { e.preventDefault(); stepSelection(e.key === 'ArrowDown' ? 1 : -1); }
 }
@@ -2177,9 +2199,18 @@ function openReplayRecording(file) {
   openModal('重放录制', [labelled('倍速', speed), wrap, wrapNav, out], [
     { id: 'recReplayStart', label: '开始', primary: true, onClick: async () => {
       out.textContent = '重放中…';
+      const btn = $('recReplayStart');
+      btn.disabled = true;
       ipcRenderer.on('cap:replayProgress', progress);
-      const r = await ipcRenderer.invoke('cap:recReplay', { file, speed: Number(speed.value), stopOnError: stopOnErr.checked, withNav: withNav.checked });
-      ipcRenderer.removeListener('cap:replayProgress', progress);
+      let r = null;
+      try {
+        r = await ipcRenderer.invoke('cap:recReplay', { file, speed: Number(speed.value), stopOnError: stopOnErr.checked, withNav: withNav.checked });
+      } catch (e) {
+        r = { ok: false, error: e.message };
+      } finally {
+        ipcRenderer.removeListener('cap:replayProgress', progress);   // 失败也要摘：残留监听会写到已关闭弹窗的节点上
+        btn.disabled = false;
+      }
       if (!r || !r.ok) {
         out.textContent = '重放失败：' + ((r && r.error) || '未知错误');
         return toast('重放失败：' + ((r && r.error) || '未知错误'), 'err');
@@ -2341,20 +2372,29 @@ function openBundle() {
     openDir,
   ], [
     { id: 'bundleRun', label: '导出离线包', primary: true, onClick: async () => {
-      const r = await ipcRenderer.invoke('cap:bundleSave', {
-        dir: dir.value.trim(), includeNetwork: net.cb.checked, includeHints: hint.cb.checked,
-      });
-      if (!r) return toast('离线包导出失败：无响应', 'err');
-      if (r.canceled) return void ($('status').textContent = '离线包导出已取消');
-      if (!r.ok) return toast('离线包导出失败：' + (r.error || '未知错误'), 'err');
-      exported = r.dir;
-      openDir.style.display = '';
-      dir.value = r.dir;
-      out.textContent = `已写入 ${r.files} 个文件 / ${r.bytes} 字节 → ${r.dir}`
-        + (r.missing.length ? `；缺失 ${r.missing.length} 项（见 manifest.json）` : '')
-        + `｜耗时 ${r.ms}ms；双击入口 ${r.entry} 即可离线打开`;
-      $('status').textContent = `离线包已导出 → ${r.dir}（入口 ${r.entry}）`;
-      toast(`离线包已导出：${r.files} 个文件`, 'ok', 7000);
+      const btn = $('bundleRun');
+      btn.disabled = true;
+      out.textContent = '导出中…';
+      try {
+        const r = await ipcRenderer.invoke('cap:bundleSave', {
+          dir: dir.value.trim(), includeNetwork: net.cb.checked, includeHints: hint.cb.checked,
+        });
+        if (!r) return toast('离线包导出失败：无响应', 'err');
+        if (r.canceled) return void ($('status').textContent = '离线包导出已取消');
+        if (!r.ok) return toast('离线包导出失败：' + (r.error || '未知错误'), 'err');
+        exported = r.dir;
+        openDir.style.display = '';
+        dir.value = r.dir;
+        out.textContent = `已写入 ${r.files} 个文件 / ${r.bytes} 字节 → ${r.dir}`
+          + (r.missing.length ? `；缺失 ${r.missing.length} 项（见 manifest.json）` : '')
+          + `｜耗时 ${r.ms}ms；双击入口 ${r.entry} 即可离线打开`;
+        $('status').textContent = `离线包已导出 → ${r.dir}（入口 ${r.entry}）`;
+        toast(`离线包已导出：${r.files} 个文件`, 'ok', 7000);
+      } catch (e) {
+        toast('离线包导出失败：' + e.message, 'err');
+      } finally {
+        btn.disabled = false;
+      }
       return undefined;
     } },
     { label: '关闭', onClick: closeModal },
@@ -2439,10 +2479,18 @@ $('wipeBtn').onclick = () => {
     { id: 'wipeRun', label: '确认清理', primary: true, onClick: async () => {
       const targets = [...boxes.entries()].filter(([, cb]) => cb.checked).map(([id]) => id);
       if (!targets.length) return toast('没有选择任何清理目标', 'warn');
-      const r = await ipcRenderer.invoke('cap:wipe', { targets });
-      if (!r) return toast('清理失败：主进程没有返回结果', 'err');
-      const tail = (r.failed || []).length ? `；失败 ${r.failed.join('；')}` : '';
-      toast(`已清理：${(r.done || []).join('、')}${tail}`, r.ok ? 'ok' : 'warn', 6000);
+      const btn = $('wipeRun');
+      btn.disabled = true;                                    // 清理不可撤销：禁用按钮防连点触发两次
+      try {
+        const r = await ipcRenderer.invoke('cap:wipe', { targets });
+        if (!r) return toast('清理失败：主进程没有返回结果', 'err');
+        const tail = (r.failed || []).length ? `；失败 ${r.failed.join('；')}` : '';
+        toast(`已清理：${(r.done || []).join('、')}${tail}`, r.ok ? 'ok' : 'warn', 6000);
+      } catch (e) {
+        toast('清理失败：' + e.message, 'err');
+      } finally {
+        btn.disabled = false;
+      }
       return undefined;
     } },
     { label: '取消', onClick: closeModal },
@@ -2652,11 +2700,20 @@ async function runBodySearch() {
   const r = await ipcRenderer.invoke('cap:searchBody', bodyQuery);
   if (!r || !r.ok) {
     bodyQuery = '';                                        // 失败即放弃该关键词，与原实现一致
+    bodyHits = null;
+    updateListNote();
     return toast('响应体搜索失败：' + ((r && r.error) || '未知错误'), 'err');
   }
   bodyHits = new Set(r.ids);
   updateListNote();
   reapplyFilter();
+}
+
+// 命中集只在单个标签内有效：切标签 / 清空后作废，并按当前关键词对新标签重算
+function resetBodySearch() {
+  bodyHits = null;
+  if (bodyQuery) runBodySearch();
+  updateListNote();
 }
 
 let bodyRefreshTimer = null;

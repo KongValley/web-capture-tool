@@ -35,6 +35,7 @@ let lastFilePath = '';
 let lastInfo = { file: '', mdFile: '' };          // 最近一次录制的产物路径（面板「打开摘要」用）
 let rec = null;                                   // 当前（或最近一次）录制
 const armed = new Map();                          // wc.id -> { identifier, wc }
+const pendingShots = new Set();                   // 在飞的截图写链：停止录制前等它们落定，否则 shot 行被「已停止」丢弃
 
 /* -------------------------------------------------------------- 路径与状态 */
 
@@ -118,6 +119,14 @@ function drainSync(force = false) {
 
 // 面板「停止录制」用：等异步写入排空再返回，调用方拿到的一定是完整文件
 async function stopWhenIdle(reason = 'manual') {
+  // 先等在飞的截图落定再 stop：stop 会把 active 置 false，之后的 push({k:'shot'}) 会被丢弃
+  if (pendingShots.size) {
+    const done = await Promise.race([
+      Promise.allSettled([...pendingShots]),
+      new Promise((res) => setTimeout(() => res('timeout'), 2000)),   // 老机器 capturePage 超过 2s 就放弃等待
+    ]);
+    if (done === 'timeout') logger.log('rec', '停止时仍有截图在写，已跳过等待');
+  }
   const r = stop(reason);
   const t0 = Date.now();
   while (writing && Date.now() - t0 < 1000) await new Promise((res) => setTimeout(res, 20));
@@ -204,6 +213,7 @@ function queuePanelItem(item) {
   if (!rec || !rec.active) return;
   if (!['action', 'req', 'res', 'nav', 'page'].includes(item.k)) return;
   panelQueue.push(item);
+  if (panelQueue.length > 2000) panelQueue.splice(0, panelQueue.length - 2000);   // 面板追不上时丢最旧，内存不随录制时长增长
   if (panelTimer) return;
   panelTimer = setTimeout(() => {
     panelTimer = null;
@@ -600,7 +610,7 @@ function takeShot(tab, entry) {
   r.shotCount++;
   const name = `${r.base}-click-${String(r.shotCount).padStart(3, '0')}.png`;
   const file = path.join(dirPath(), name);
-  tab.wc.capturePage()
+  const p = tab.wc.capturePage()
     .then((image) => fs.promises.writeFile(file, image.toPNG()))
     // rec === r：截图是异步的，回填时若已经「停止 → 重新开始录制」，不能把旧录制的截图记进新录制
     .then(() => { if (rec === r && r.active) push({ k: 'shot', tab: tab.id, sel: entry.sel || '', file: name }); })
@@ -608,6 +618,8 @@ function takeShot(tab, entry) {
       logger.log('rec', `截图失败：${e.message}`);
       if (rec === r && r.active) note(`截图失败：${e.message}`);
     });
+  pendingShots.add(p);
+  p.finally(() => pendingShots.delete(p));
 }
 
 function headersToObject(record) {

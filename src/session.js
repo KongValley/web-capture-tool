@@ -22,8 +22,8 @@ const CHUNK = 200;                        // 分片序列化：每 200 条让出
 let overrideFile = null;
 let file = null;
 let timer = null;
-let lastCount = -1;
 let saving = false;          // 异步写在飞标志：超大会话的分片序列化可能超过 30s 间隔，重叠写会互相覆盖
+let savingP = null;          // 在飞的异步写 Promise（whenIdle 用）
 
 function filePath() {
   return file || overrideFile || path.join(app.getPath('userData'), 'sessions', 'last.json');
@@ -93,22 +93,31 @@ async function toJson(data) {
 async function save() {
   if (saving) return { ok: true, skipped: true };    // 上一次还没落定：跳过这次，别让两次写互相插队
   saving = true;
-  try {
-    const data = snapshot();
-    const text = await toJson(data);
-    const p = filePath();
-    await fs.promises.mkdir(path.dirname(p), { recursive: true });
-    const tmp = `${p}.tmp`;
-    await fs.promises.writeFile(tmp, text);
-    await fs.promises.rename(tmp, p);                // 原子替换：崩在写一半也不会留下半个会话文件
-    lastCount = data.records.length;
-    return { ok: true, file: p, count: data.records.length };
-  } catch (e) {
-    logger.log('session', `保存失败：${e.message}`);
-    return { ok: false, error: e.message };
-  } finally {
-    saving = false;
-  }
+  savingP = (async () => {
+    try {
+      const data = snapshot();
+      const text = await toJson(data);
+      const p = filePath();
+      await fs.promises.mkdir(path.dirname(p), { recursive: true });
+      const tmp = `${p}.tmp`;
+      await fs.promises.writeFile(tmp, text);
+      await fs.promises.rename(tmp, p);                // 原子替换：崩在写一半也不会留下半个会话文件
+      return { ok: true, file: p, count: data.records.length };
+    } catch (e) {
+      logger.log('session', `保存失败：${e.message}`);
+      return { ok: false, error: e.message };
+    } finally {
+      saving = false;
+      savingP = null;
+    }
+  })();
+  return savingP;
+}
+
+// 等当前在飞的异步写落定：退出/重启路径先 await 再 saveSync，
+// 否则旧写的 rename 可能落在 saveSync 之后，把新会话覆盖成更早的快照
+function whenIdle() {
+  return savingP ? savingP.then(() => {}, () => {}) : Promise.resolve();
 }
 
 // 退出路径用：同步写，进程随时可能消失（这里不能分片让出事件循环）。
@@ -121,7 +130,6 @@ function saveSync() {
     const tmp = `${p}.sync.tmp`;
     fs.writeFileSync(tmp, `${headOf(data)},"records":[${data.records.map((r) => JSON.stringify(r)).join(',')}]}`);
     fs.renameSync(tmp, p);
-    lastCount = data.records.length;
     return { ok: true, file: p, count: data.records.length };
   } catch (e) {
     logger.log('session', `保存失败：${e.message}`);
@@ -197,12 +205,15 @@ function discard() {
 }
 
 // 只在记录条数变化时写盘；自检不启动定时器（自己调 save/load）
+// 水位只在本轮真的写了盘才推进：save() 被跳过（上一次还在飞）或失败时重置，下个周期重试
 function start() {
   stop();
+  let lastSeen = -1;
   timer = setInterval(() => {
-    if (state.records.length === lastCount) return;
-    lastCount = state.records.length;
-    save();
+    const n = state.records.length;
+    if (n === lastSeen) return;
+    lastSeen = n;
+    save().then((r) => { if (!r || !r.ok || r.skipped) lastSeen = -1; });
   }, SAVE_INTERVAL_MS);
 }
 
@@ -212,5 +223,5 @@ function stop() {
 
 module.exports = {
   VERSION, MAX_RECORDS, MAX_BYTES, MAX_WS, MAX_AGE_MS,
-  filePath, useFile, snapshot, save, saveSync, load, info, discard, start, stop,
+  filePath, useFile, snapshot, toJson, save, saveSync, whenIdle, load, info, discard, start, stop,
 };
