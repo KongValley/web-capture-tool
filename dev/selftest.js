@@ -208,6 +208,25 @@ async function run({ state, store, gpu, extract, settings, automation, format, f
   const outDir = path.join(os.tmpdir(), `wct-selftest-out-${Date.now()}`);
   fs.mkdirSync(outDir, { recursive: true });
 
+  // 系统剪贴板是全局资源：并发跑两条自检时两边会互相覆盖。用到剪贴板的断言统一走这把文件锁串行化
+  // （等 15 秒；锁文件可能是崩溃残留，抢不到就清掉重来一次）
+  const withClipboard = async (fn) => {
+    const lock = path.join(os.tmpdir(), 'wct-selftest-clipboard.lock');
+    let fd = null;
+    const t0 = Date.now();
+    while (Date.now() - t0 < 15000) {
+      try { fd = fs.openSync(lock, 'wx'); break; } catch (e) { await sleep(100); }
+    }
+    if (fd === null) {
+      try { fs.rmSync(lock, { force: true }); fd = fs.openSync(lock, 'wx'); } catch (e) { fd = null; }
+    }
+    try {
+      return await fn();
+    } finally {
+      if (fd !== null) { try { fs.closeSync(fd); } catch (e) { /* 忽略 */ } try { fs.rmSync(lock, { force: true }); } catch (e) { /* 忽略 */ } }
+    }
+  };
+
   check('目标架构 ia32（Win7 32 位目标）', process.arch === 'ia32',
     `electron=${process.versions.electron} chromium=${process.versions.chrome} node=${process.versions.node} arch=${process.arch}`);
 
@@ -454,11 +473,12 @@ async function run({ state, store, gpu, extract, settings, automation, format, f
     raiseWin();
     let sc = await automation.autoRun({ mode: 'scroll', rounds: 5 });
     let extraCount = await extract.evalPage('document.querySelectorAll(".extra").length');
-    if (!extraCount) {                                   // 窗口被遮挡时第一轮可能没派发滚动事件，置顶后重试一次
+    // 窗口被遮挡 / 合成被节流时滚动事件可能丢：置顶后重试（最多 3 次，每次给 4 秒有界等待）
+    for (let i = 0; i < 3 && !extraCount; i++) {
       raiseWin();
       await sleep(400);
       sc = await automation.autoRun({ mode: 'scroll', rounds: 5 });
-      extraCount = await extract.evalPage('document.querySelectorAll(".extra").length');
+      extraCount = await waitFor(() => extract.evalPage('document.querySelectorAll(".extra").length'), 4000, '无限加载追加').catch(() => 0);
     }
     const scrollDiag = await extract.evalPage('JSON.stringify({h: document.documentElement.scrollHeight, ih: window.innerHeight, y: Math.round(window.scrollY)})');
     check('自动滚动触发无限加载', sc.ok && extraCount >= 1,
@@ -1184,13 +1204,18 @@ async function run({ state, store, gpu, extract, settings, automation, format, f
       await peval(`(() => { const row = document.querySelector('#list .row'); if (row) row.click(); return !!row; })()`);
       await sleep(400);
       const hasBtns = await peval(`['copyUrl', 'copyRespHeaders', 'copyBody'].every((id) => !!document.getElementById(id))`);
-      await peval(`(() => { const b = document.getElementById('copyUrl'); if (b) b.click(); return true; })()`);
-      await sleep(300);
-      const clipUrl = electronClipboard.readText();
-      const statusText = await peval(`document.getElementById('status').textContent`);
-      await peval(`(() => { const s = document.getElementById('status'); s.textContent = 'probe-status'; s.click(); return true; })()`);
-      await sleep(300);
-      const clipStatus = electronClipboard.readText();
+      const pair105 = await withClipboard(async () => {
+        await peval(`(() => { const b = document.getElementById('copyUrl'); if (b) b.click(); return true; })()`);
+        await sleep(300);
+        const url = electronClipboard.readText();
+        const statusText = await peval(`document.getElementById('status').textContent`);
+        await peval(`(() => { const s = document.getElementById('status'); s.textContent = 'probe-status'; s.click(); return true; })()`);
+        await sleep(300);
+        return { url, statusText, status: electronClipboard.readText() };
+      });
+      const clipUrl = pair105.url;
+      const statusText = pair105.statusText;
+      const clipStatus = pair105.status;
       check('详情复制按钮与状态栏复制',
         hasBtns && clipUrl.startsWith('http') && statusText.includes('已复制') && clipStatus === 'probe-status',
         `按钮=${hasBtns} 剪贴板=${clipUrl.slice(0, 40)} 状态=${statusText}`);
@@ -1264,21 +1289,25 @@ async function run({ state, store, gpu, extract, settings, automation, format, f
 
     // 110 右键菜单（标签 / 记录行）
     try {
-      const menus = await peval(`(() => {
-        const chip = document.querySelector('#tabList .tabchip');
-        chip.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, clientX: 30, clientY: 60 }));
-        const tabItems = [...document.querySelectorAll('#ctxMenu .ctx-item')].map((b) => b.textContent);
-        hideContextMenu();
-        const row = document.querySelector('#list .row');
-        row.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, clientX: 30, clientY: 120 }));
-        const rowItems = [...document.querySelectorAll('#ctxMenu .ctx-item')].map((b) => b.textContent);
-        const url = rows.get(Number(row.dataset.id)).rec.url;
-        const copyBtn = [...document.querySelectorAll('#ctxMenu .ctx-item')].find((b) => b.textContent === '复制 URL');
-        if (copyBtn) copyBtn.click();
-        return { tabItems, rowItems, url };
-      })()`);
-      await sleep(300);
-      const clip110 = electronClipboard.readText();
+      const wm110 = await withClipboard(async () => {
+        const menus = await peval(`(() => {
+          const chip = document.querySelector('#tabList .tabchip');
+          chip.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, clientX: 30, clientY: 60 }));
+          const tabItems = [...document.querySelectorAll('#ctxMenu .ctx-item')].map((b) => b.textContent);
+          hideContextMenu();
+          const row = document.querySelector('#list .row');
+          row.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, clientX: 30, clientY: 120 }));
+          const rowItems = [...document.querySelectorAll('#ctxMenu .ctx-item')].map((b) => b.textContent);
+          const url = rows.get(Number(row.dataset.id)).rec.url;
+          const copyBtn = [...document.querySelectorAll('#ctxMenu .ctx-item')].find((b) => b.textContent === '复制 URL');
+          if (copyBtn) copyBtn.click();
+          return { tabItems, rowItems, url };
+        })()`);
+        await sleep(300);
+        return { menus, clip: electronClipboard.readText() };
+      });
+      const menus = wm110.menus;
+      const clip110 = wm110.clip;
       const need = (arr, label) => arr.includes(label);
       check('右键菜单（标签 / 记录行）',
         need(menus.tabItems, '复制 URL') && need(menus.tabItems, '重新加载') && need(menus.tabItems, '关闭其他') && need(menus.tabItems, '关闭')
@@ -1358,16 +1387,20 @@ async function run({ state, store, gpu, extract, settings, automation, format, f
       const r114 = await pinvoke('cap:recStart', { shots: false });
       await sleep(300);
       await extract.evalPage(`(() => { document.body.dispatchEvent(new MouseEvent('click', { bubbles: true, clientX: 5, clientY: 5 })); return true; })()`);
-      await sleep(1000);
-      const p114 = await peval(`(() => {
+      const read114 = () => peval(`(() => {
         const kids = [...document.querySelectorAll('#recItems > div')];
         return {
           hidden: document.getElementById('recPanel').hidden,
           n: kids.length,
-          hasClick: kids.some((k) => k.textContent.includes('点击')),
-          first: (kids[0] || {}).textContent || '',
+          hasClick: kids.some((d) => d.textContent.includes('点击')),
+          first: kids.length ? kids[0].textContent : '',
         };
       })()`);
+      // 浮层只留最近 20 条：并发/繁忙时点击条目可能很快被挤出窗口，等它出现再断言（不再固定等 1s）
+      const p114 = await waitFor(async () => {
+        const p = await read114();
+        return p.hasClick && p.n >= 1 ? p : null;
+      }, 8000, '浮层出现点击条目').catch(() => null) || await read114();
       await pinvoke('cap:recStop');
       check('录制中最近条目浮层', r114.ok && p114.hidden === false && p114.n >= 1 && p114.hasClick,
         `可见=${!p114.hidden} 行数=${p114.n} 含点击=${p114.hasClick} 首行=${JSON.stringify(p114.first.slice(0, 60))}`);
@@ -1645,14 +1678,16 @@ async function run({ state, store, gpu, extract, settings, automation, format, f
       const p128 = await pinvoke('cap:pickStart');
       await sleep(300);
       const armed128 = await extract.evalPage('!!window.__wctPickArmed');
-      await extract.evalPage(`(() => {
-        const el = document.querySelector('#pw');
-        el.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: 20, clientY: 20 }));
-        el.dispatchEvent(new MouseEvent('click', { bubbles: true }));
-        return true;
-      })()`);
-      await sleep(700);
-      const clip128 = electronClipboard.readText();
+      const clip128 = await withClipboard(async () => {
+        await extract.evalPage(`(() => {
+          const el = document.querySelector('#pw');
+          el.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: 20, clientY: 20 }));
+          el.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+          return true;
+        })()`);
+        await sleep(700);
+        return electronClipboard.readText();
+      });
       const cancel128 = await pinvoke('cap:pickCancel');
       const off128 = await extract.evalPage('!!window.__wctPickArmed');
       check('元素拾取', p128.ok && armed128 === true && clip128 === '#pw' && cancel128.ok && off128 === false,
@@ -1797,15 +1832,19 @@ async function run({ state, store, gpu, extract, settings, automation, format, f
       await sleep(900);
       await extract.evalPage(`(() => { document.querySelector('a[href="/a"]').dispatchEvent(new MouseEvent('click', { bubbles: true })); return true; })()`);
       await sleep(800);
-      const title135 = await peval(`(() => {
-        const items = [...document.querySelectorAll('#recItems > div')];
-        const hit = items.reverse().find((d) => d.onclick);
-        if (!hit) return '';
-        hit.click();
-        return hit.title;
-      })()`);
-      await sleep(300);
-      const clip135 = electronClipboard.readText();
+      const t135 = await withClipboard(async () => {
+        const title = await peval(`(() => {
+          const items = [...document.querySelectorAll('#recItems > div')];
+          const hit = items.reverse().find((d) => d.onclick);
+          if (!hit) return '';
+          hit.click();
+          return hit.title;
+        })()`);
+        await sleep(300);
+        return { title, clip: electronClipboard.readText() };
+      });
+      const title135 = t135.title;
+      const clip135 = t135.clip;
       const st135b = await pinvoke('cap:recStop');
       const sels135 = st135b.ok ? readRec(st135b.file).filter((l) => l.k === 'action' && l.a === 'click').map((l) => l.sel) : [];
       check('录制条目复制选择器',
