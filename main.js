@@ -45,20 +45,29 @@ const ICON = path.join(__dirname, 'build', 'icon.ico');
 if (process.platform === 'win32') app.setAppUserModelId('com.kongvalley.web-capture-tool');
 
 // 自检 / 基准改道到临时配置，绝不碰用户真实配置；随后同步读盘（后续默认值都从这里取）
+// 目录按 PID 区分：并发跑两条自检（或 selftest + shots）不再互相删 Chromium profile
 const SANDBOX = state.selftest ? 'selftest' : state.bench ? 'bench' : state.shots ? 'shots' : '';
+let sandboxDirs = null;
 if (SANDBOX) {
   // userData 必须一起改道：Chromium 持久分区（PARTITION='persist:capture' 的 Cookie / localStorage / 缓存）
   // 就在它下面，而自检会执行 cap:wipe 清数据——不改道就会清掉用户真实的登录态
-  const sbUserData = path.join(os.tmpdir(), `wct-${SANDBOX}`);
+  const tag = `wct-${SANDBOX}-${process.pid}`;
+  const sbUserData = path.join(os.tmpdir(), tag);
   try { fs.rmSync(sbUserData, { recursive: true, force: true }); } catch (e) { /* 删不掉就按现状追加 */ }
   app.setPath('userData', sbUserData);
-  store.useFile(path.join(os.tmpdir(), `wct-${SANDBOX}-settings`, 'settings.json'));
-  logger.useFile(path.join(os.tmpdir(), `wct-${SANDBOX}-logs`, 'app.log'));
-  sessionStore.useFile(path.join(os.tmpdir(), `wct-${SANDBOX}-session`, 'last.json'));
-  recorder.useDir(path.join(os.tmpdir(), `wct-${SANDBOX}-rec`));
-  const dlDir = path.join(os.tmpdir(), `wct-${SANDBOX}-dl`);     // 触发的下载落这里，不碰真实下载目录
+  const settingsFile = path.join(os.tmpdir(), `${tag}-settings`, 'settings.json');
+  const logsFile = path.join(os.tmpdir(), `${tag}-logs`, 'app.log');
+  const sessionFile = path.join(os.tmpdir(), `${tag}-session`, 'last.json');
+  const recDir = path.join(os.tmpdir(), `${tag}-rec`);
+  store.useFile(settingsFile);
+  logger.useFile(logsFile);
+  sessionStore.useFile(sessionFile);
+  recorder.useDir(recDir);
+  const dlDir = path.join(os.tmpdir(), `${tag}-dl`);             // 触发的下载落这里，不碰真实下载目录
+  try { fs.rmSync(dlDir, { recursive: true, force: true }); } catch (e) { /* 删不掉就按现状追加 */ }   // 清上一次运行的残留下载
   fs.mkdirSync(dlDir, { recursive: true });
   app.setPath('downloads', dlDir);
+  sandboxDirs = [sbUserData, path.dirname(settingsFile), path.dirname(logsFile), path.dirname(sessionFile), recDir, dlDir];
 }
 const boot = store.load();
 state.panelWidth = boot.app.panelWidth;
@@ -1168,7 +1177,7 @@ app.whenReady().then(() => {
   if (state.selftest) {
     require('./dev/selftest.js').run({
       state, store, gpu, capture, extract, settings, automation, format, files, bundle, logger,
-      session: sessionStore, recorder, picker, resetActive, PARTITION,
+      session: sessionStore, recorder, picker, resetActive, PARTITION, windowInitOptions, sandboxDirs,
     });
   }
   if (state.bench) {

@@ -159,6 +159,12 @@ function make(inj) {
     fs.mkdirSync(OUT, { recursive: true });
     fs.writeFileSync(path.join(OUT, `${name}.png`), png);
     const sz = img.getSize();
+    // 窗口被遮挡时 capturePage 会给空图：低于 8KB 基本可判为空白，标红并让脚本以失败退出
+    if (png.length < 8192) {
+      console.error(`  ${name}.png   ${sz.width}×${sz.height}   ${(png.length / 1024).toFixed(0)} KB   疑似空白图！`);
+      process.exitCode = 1;
+      return;
+    }
     console.log(`  ${name}.png   ${sz.width}×${sz.height}   ${(png.length / 1024).toFixed(0)} KB`);
   }
 
@@ -197,6 +203,11 @@ function make(inj) {
     const png = img.toPNG();
     fs.mkdirSync(OUT, { recursive: true });
     fs.writeFileSync(path.join(OUT, `${name}.png`), png);
+    if (png.length < 8192) {
+      console.error(`  ${name}.png   ${W}×${H}   ${(png.length / 1024).toFixed(0)} KB   疑似空白图！`);
+      process.exitCode = 1;
+      return;
+    }
     console.log(`  ${name}.png   ${W}×${H}   ${(png.length / 1024).toFixed(0)} KB   （整窗合成）`);
   }
   const modalVisible = () => peval("!document.getElementById('modal').hidden");

@@ -5,8 +5,12 @@
   "license": "MIT",
   "description": "Electron 网页登录 + 抓取工具：请求/响应体、Cookie、Storage、HTML 导出；适配 Windows 7 SP1 32 位",
   "main": "main.js",
+  "engines": {
+    "node": ">=22.12"
+  },
   "scripts": {
     "start": "electron .",
+    "check": "node -e \"const{readdirSync}=require('fs');const{execFileSync}=require('child_process');for(const d of ['.','src','dev','ui'])for(const f of readdirSync(d))if(f.endsWith('.js'))execFileSync(process.execPath,['--check',d+'/'+f],{stdio:'inherit'})\"",
     "selftest": "electron . --selftest",
     "selftest:sw": "electron . --selftest --software-rendering",
     "bench": "electron . --bench",
