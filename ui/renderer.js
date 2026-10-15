@@ -1361,7 +1361,7 @@ window.addEventListener('keydown', onKey);
 
 function saveText(content, defaultName) {
   return ipcRenderer.invoke('cap:saveText', { defaultName, content }).then((r) => {
-    if (r && r.ok) $('status').textContent = '已保存：' + r.file;
+    if (r && r.ok) setStatusText('已保存：' + r.file, 3000);
     else if (r && r.canceled) $('status').textContent = '已取消保存';
     else if (r && r.error) toast('保存失败：' + r.error, 'err');
   });
@@ -1369,7 +1369,7 @@ function saveText(content, defaultName) {
 
 function exportResult(p) {
   p.then((r) => {
-    if (r && r.ok) $('status').textContent = '已保存：' + r.file;
+    if (r && r.ok) setStatusText('已保存：' + r.file, 3000);
     else if (r && r.canceled) $('status').textContent = '已取消保存';
     else if (r && r.error) toast('导出失败：' + r.error, 'err');
   });
@@ -1438,7 +1438,7 @@ el.detail.addEventListener('click', async (e) => {
     const r = await ipcRenderer.invoke('cap:format', 'curl', detailId);
     if (!r.ok) return toast(r.error, 'err');
     clipboard.writeText(r.text);
-    $('status').textContent = '已复制 cURL 到剪贴板';
+    setStatusText('已复制 cURL 到剪贴板', 3000);
   } else if (id === 'replayReq') {
     openReplayModal();
   } else if (id === 'codeBtn') {
@@ -1461,7 +1461,7 @@ el.detail.addEventListener('click', async (e) => {
       ? `[base64 ${detailData.body ? detailData.body.length : 0} 字符，已省略]`
       : String(detailData.body == null ? '' : detailData.body);
     clipboard.writeText(text);
-    $('status').textContent = `已复制${id === 'copyUrl' ? ' URL' : id === 'copyRespHeaders' ? '响应头' : '响应体'}（${text.length} 字符）`;
+    setStatusText(`已复制${id === 'copyUrl' ? ' URL' : id === 'copyRespHeaders' ? '响应头' : '响应体'}（${text.length} 字符）`, 3000);
   } else if (id === 'mockRec') {
     const d = detailData;
     if (!d) return;
@@ -1483,7 +1483,7 @@ el.detail.addEventListener('click', async (e) => {
     if (!detailData || !detailData.initiator) return;
     const lines = initiatorLines(detailData.initiator);
     clipboard.writeText(lines.join('\n'));
-    $('status').textContent = `已复制发起者（${lines.length} 行）`;
+    setStatusText(`已复制发起者（${lines.length} 行）`, 3000);
   } else if (id === 'bodyToggle') {
     if (detailId == null) return;
     if (detailFull.has(detailId)) detailFull.delete(detailId); else detailFull.add(detailId);
@@ -1605,8 +1605,8 @@ const UA_PRESETS = {
 function cfg(key, value) {
   return ipcRenderer.invoke('cap:cfg', { key, value }).then((r) => {
     if (!r || !r.ok) { toast('设置失败：' + ((r && r.error) || '未知错误'), 'err'); return r; }
-    if (r.needReload) $('status').textContent = '已应用（刷新页面后生效）';
-    if (r.needRestart) $('status').textContent = '已应用（重启后生效）';
+    if (r.needReload) setStatusText('已应用（刷新页面后生效）', 3000);
+    if (r.needRestart) setStatusText('已应用（重启后生效）', 3000);
     return r;
   });
 }
@@ -1620,7 +1620,7 @@ $('proxy').addEventListener('change', () => cfg('proxy', $('proxy').value));
 $('proxyTest').onclick = async () => {
   const r = await ipcRenderer.invoke('cap:proxyTest', {});
   if (r && r.ok) {
-    $('status').textContent = `代理连通：${r.proxy} → ${r.status}（${r.tookMs}ms）`;
+    setStatusText(`代理连通：${r.proxy} → ${r.status}（${r.tookMs}ms）`, 3000);
     toast(`代理连通：${r.proxy} → ${r.status}（${r.tookMs}ms）`, 'ok', 6000);
     return undefined;
   }
@@ -2197,7 +2197,7 @@ async function recStop() {
   resetRecorderUi('');
   const r = await ipcRenderer.invoke('cap:recStop');
   if (!r || !r.ok) return toast('停止录制失败：' + ((r && r.error) || '未知错误'), 'err');
-  $('status').textContent = `录制完成：${r.mdFile}`;      // 路径常驻状态栏（可点复制）
+  setStatusText(`录制完成：${r.mdFile}`, 3000);      // 路径常驻状态栏（可点复制），3 秒内不被导航状态顶掉
   toast(`录制完成：${r.entries} 条 → ${r.mdFile}`, 'ok', 8000);
   return undefined;
 }
@@ -2452,7 +2452,7 @@ function openBundle() {
         out.textContent = `已写入 ${r.files} 个文件 / ${r.bytes} 字节 → ${r.dir}`
           + (r.missing.length ? `；缺失 ${r.missing.length} 项（见 manifest.json）` : '')
           + `｜耗时 ${r.ms}ms；双击入口 ${r.entry} 即可离线打开`;
-        $('status').textContent = `离线包已导出 → ${r.dir}（入口 ${r.entry}）`;
+        setStatusText(`离线包已导出 → ${r.dir}（入口 ${r.entry}）`, 3000);
         toast(`离线包已导出：${r.files} 个文件`, 'ok', 7000);
       } catch (e) {
         toast('离线包导出失败：' + e.message, 'err');
@@ -2805,7 +2805,17 @@ function applyBatch(b) {
   if (bodyQuery && (b && (b.records || []).length)) scheduleBodyRefresh();   // body: 命中随新记录刷新
 }
 ipcRenderer.on('cap:batch', (_e, b) => applyBatch(b));
-ipcRenderer.on('cap:status', (_e, s) => { $('status').textContent = s; });
+// 状态栏同时是保存路径 / 复制回执的出口：本地确认消息带 3 秒保护期，
+// 页面导航等高频 cap:status 推送不会立刻把它们顶掉（此前「已保存/录制完成」常被瞬间覆盖，路径无从复制）
+let statusHoldUntil = 0;
+function setStatusText(text, holdMs = 0) {
+  $('status').textContent = text;
+  if (holdMs > 0) statusHoldUntil = Date.now() + holdMs;
+}
+ipcRenderer.on('cap:status', (_e, s) => {
+  if (Date.now() < statusHoldUntil) return;
+  $('status').textContent = s;
+});
 ipcRenderer.on('cap:download', (_e, d) => {
   if (!d) return;
   if (d.state === 'start') {

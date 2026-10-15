@@ -117,6 +117,7 @@ function onRequestWillBeSent(tab, ev) {
     star: false, comment: '',
   };
   tab.byId.set(requestId, rec);
+  applyPendingNote(rec);              // 下载等旁路事件可能先于本记录到达：把挂起的备注补上
   tab.records.push(rec);
   if (tab.records.length > MAX_RECORDS) {
     const gone = tab.records.shift();
@@ -455,15 +456,33 @@ function replay(id, overrides = {}) {
   });
 }
 
-// 旁路事件（下载完成等）：给活动标签里匹配 url 的记录补一条 note 并推给面板
+// 旁路事件（下载完成等）：给活动标签里匹配 url 的记录补一条 note 并推给面板。
+// 匹配不到时把备注挂起（CDP 可能比 will-download 晚报这条请求），等该 URL 的记录建出来时补上；
+// 挂起表最多 20 条，超出丢最旧，避免长期运行无界增长。
+const pendingNotes = new Map();   // url -> note
 function markNote(url, note) {
   const tab = state.activeTab;
   if (!tab) return false;
-  const rec = [...tab.records].reverse().find((r) => r.url === url && !r.note);
-  if (!rec) return false;
-  rec.note = String(note).slice(0, 200);
+  const key = String(url);
+  const text = String(note).slice(0, 200);
+  const rec = [...tab.records].reverse().find((r) => r.url === key && !r.note);
+  if (!rec) {
+    pendingNotes.set(key, text);
+    if (pendingNotes.size > 20) pendingNotes.delete(pendingNotes.keys().next().value);
+    return false;
+  }
+  rec.note = text;
   queueBatch(tab, 'update', summarize(rec));
   return true;
+}
+
+// 建记录时补挂起备注（消费即删，避免老备注贴到下一次同 URL 的请求上）
+function applyPendingNote(rec) {
+  if (!pendingNotes.size) return;
+  const note = pendingNotes.get(rec.url);
+  if (note == null) return;
+  pendingNotes.delete(rec.url);
+  rec.note = note;
 }
 
 module.exports = { summarize, fullRecord, attachCapture, replay, flushBatch, markNote, resetAutoSave, autoSaveState, matchSaveRule, syncMock, mockState };
