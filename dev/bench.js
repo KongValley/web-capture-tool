@@ -101,8 +101,8 @@ const PANEL_BENCH = `(() => {
 
   // 4) 过滤（输入事件 → 全列表可见性重算）
   const f = document.getElementById('filter');
-  out.filter = bench(() => { f.value = 'path/1'; f.dispatchEvent(new Event('input', { bubbles: true })); f.value = ''; f.dispatchEvent(new Event('input', { bubbles: true })); });
-  out.filtered = Number(document.getElementById('nReq').textContent);
+  // 命中数必须在过滤「生效时」读，否则清空后再读 nReq 拿到的恒是总行数
+  out.filter = bench(() => { f.value = 'path/1'; f.dispatchEvent(new Event('input', { bubbles: true })); out.filtered = Number(document.getElementById('nReq').textContent); f.value = ''; f.dispatchEvent(new Event('input', { bubbles: true })); });
 
   // 5) 列预设切换（全列表重画）
   const col = document.getElementById('colSet');
@@ -152,9 +152,9 @@ async function run({ state, capture, session, gpu }) {
     add('突发请求（主进程 CPU）', cpuMs(cpu), 'ms');
     add('  每请求主进程 CPU', (cpuMs(cpu) / BURST).toFixed(3), 'ms');
     await waitFor(() => state.records.length >= BURST + 2, 120000, '记录入内存');
-    const domReady = Date.now() - t0;
+    const memReady = Date.now() - t0;
     await waitFor(async () => Number(await peval('rows.size')) >= BURST, 60000, '面板渲染完成');
-    add('面板渲染完成（含 100ms 批）', Date.now() - t0, 'ms', `DOM 就绪 ${domReady}ms`);
+    add('面板渲染完成（含 100ms 批）', Date.now() - t0, 'ms', `记录入内存 ${memReady}ms`);
 
     // ---- 本地测试服务器自身开销（对照）：net.request 直读同一批 URL，不经 CDP / 面板 ----
     try {

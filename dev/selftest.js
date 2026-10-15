@@ -126,6 +126,16 @@ function startServer() {
         res.end(JSON.stringify({ 'needle-refresh': true }));
         return;
       }
+      if (u.pathname === '/api/xss') {                         // 断言 166/167：详情面板必须把抓取内容当纯文本
+        res.writeHead(200, Object.assign({ 'Content-Type': 'text/plain' }, noStore));
+        res.end('</pre><img src=x onerror="window.__xss=1">');
+        return;
+      }
+      if (u.pathname === '/api/fail') {                        // 断言 170：设置导入后的 Mock 改写
+        res.writeHead(500, Object.assign({ 'Content-Type': 'application/json' }, noStore));
+        res.end(JSON.stringify({ ok: false }));
+        return;
+      }
       if (u.pathname === '/dl.bin') {                          // 断言 145：带 Content-Disposition 的下载
         res.writeHead(200, Object.assign({ 'Content-Type': 'application/octet-stream', 'Content-Disposition': 'attachment; filename="probe.bin"' }, noStore));
         res.end(Buffer.from('probe-download'));
@@ -159,7 +169,9 @@ function startServer() {
       res.writeHead(404, noStore); res.end('nope');
     });
     server.on('upgrade', (req, socket) => {
+      socket.on('error', () => { /* 客户端 RST 忽略 */ });
       const key = req.headers['sec-websocket-key'];
+      if (!key) { socket.destroy(); return; }
       const accept = crypto.createHash('sha1').update(key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64');
       socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ' + accept + '\r\n\r\n');
       const payload = Buffer.from('hello-ws');
@@ -282,6 +294,14 @@ async function run({ state, store, gpu, extract, settings, automation, format, f
     require('electron').app.exit(2);
   }, 600000);
 
+  // 面板侧的两个执行器 + 产物目录：提到 try 之外，套件末尾那几项（会改全局状态）也要用
+  const panel = state.win.webContents;
+  const peval = (expr) => panel.executeJavaScript(expr, true);
+  const pinvoke = (channel, ...args) => panel.executeJavaScript(
+    `require('electron').ipcRenderer.invoke(${JSON.stringify(channel)}, ...${JSON.stringify(args)})`, true);
+  const outDir = path.join(os.tmpdir(), `wct-selftest-out-${Date.now()}`);
+  fs.mkdirSync(outDir, { recursive: true });
+
   try {
     await waitFor(() => wc.debugger.isAttached() && state.status === '抓取中', 15000, 'CDP 就绪');
     await wc.loadURL(base + '/');
@@ -313,8 +333,6 @@ async function run({ state, store, gpu, extract, settings, automation, format, f
     check('document.title 已采集', pd.title === 'selftest', pd.title);
 
     // ---- 面板 UI（renderer.js 端到端：列表渲染 / 详情展开 / WebSocket 计数）----
-    const panel = state.win.webContents;
-    const peval = (expr) => panel.executeJavaScript(expr, true);
     const listState = await peval(`(() => {
       const rows = [...document.querySelectorAll('#list .row')];
       const hit = rows.find(r => r.children[2].textContent.includes('/api/data'));
@@ -523,11 +541,6 @@ async function run({ state, store, gpu, extract, settings, automation, format, f
 
     // ================================================== 68-97 打磨与新增功能
 
-    const pinvoke = (channel, ...args) => panel.executeJavaScript(
-      `require('electron').ipcRenderer.invoke(${JSON.stringify(channel)}, ...${JSON.stringify(args)})`, true);
-    const outDir = path.join(os.tmpdir(), `wct-selftest-out-${Date.now()}`);
-    fs.mkdirSync(outDir, { recursive: true });
-
     // 68 响应体截断查看
     try {
       const html = await peval(`bodyBlock({ id: -1, body: 'x'.repeat(250000), bodyBase64: false })`);
@@ -547,9 +560,9 @@ async function run({ state, store, gpu, extract, settings, automation, format, f
       const dragTo = (w) => `(() => {
         const x = Math.max(8, window.innerWidth - ${w});
         const sp = document.getElementById('splitter');
-        sp.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, clientX: x, clientY: 200 }));
-        window.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: x, clientY: 200 }));
-        window.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, clientX: x, clientY: 200 }));
+        sp.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, clientX: x, clientY: 200, buttons: 1 }));
+        window.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: x, clientY: 200, buttons: 1 }));
+        window.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, clientX: x, clientY: 200, buttons: 0 }));
         return Math.round(document.getElementById('panel').getBoundingClientRect().width);
       })()`;
       const drag = await peval(dragTo(700));
@@ -573,6 +586,32 @@ async function run({ state, store, gpu, extract, settings, automation, format, f
       await pinvoke('cap:setEnabled', true);
       check('详情渲染节流（200ms 合并）', t2 - t1 === 1, `渲染次数 ${t1} → ${t2}`);
     } catch (e) { check('详情渲染节流（200ms 合并）', false, e.message); }
+
+    // 166 详情面板把抓取内容当纯文本（不是 HTML）
+    try {
+      await state.view.webContents.loadURL(base + '/api/xss');
+      const rec166 = await waitFor(() => state.records.find((r) => r.url === base + '/api/xss' && r.body), 20000, 'XSS 样本记录');
+      await peval(`(() => { el.filter.value = ''; el.filter.dispatchEvent(new Event('input', { bubbles: true })); select(${rec166.id}); return true; })()`);
+      await waitFor(() => peval(`document.getElementById('detail').textContent.includes('onerror')`), 8000, '详情渲染 XSS 样本').catch(() => {});
+      const xss166 = await peval(`({
+        imgs: document.querySelectorAll('#detail img').length,
+        text: document.getElementById('detail').textContent.includes('onerror'),
+        tag: document.getElementById('detail').querySelector('img') ? 'injected' : 'text-only',
+      })`);
+      await state.view.webContents.loadURL(base + '/');
+      check('详情内容不被解析为 HTML', xss166.imgs === 0 && xss166.text && xss166.tag === 'text-only',
+        `注入 img=${xss166.imgs} 原文可见=${xss166.text}`);
+    } catch (e) { check('详情内容不被解析为 HTML', false, e.message); }
+
+    // 167 面板拒绝页面发起的导航（详情里注入的 <a>/<meta refresh> 不能把窗口带走）
+    try {
+      const before167 = state.win.webContents.getURL();
+      await peval(`(() => { window.location.href = 'http://127.0.0.1:1/blocked'; return true; })()`).catch(() => {});
+      await sleep(600);
+      const after167 = state.win.webContents.getURL();
+      check('面板拒绝页面发起的导航', after167 === before167 && after167.startsWith('file://'),
+        `${before167} → ${after167}`);
+    } catch (e) { check('面板拒绝页面发起的导航', false, e.message); }
 
     // 72 诊断日志
     try {
@@ -894,10 +933,16 @@ async function run({ state, store, gpu, extract, settings, automation, format, f
     // 95 多标签创建与隔离
     try {
       const before95 = (await pinvoke('cap:tabList')).length;   // 会话恢复可能已经重建了若干标签
+      const tabReady = (marker) => waitFor(async () => {
+        const tabs = await pinvoke('cap:tabList');
+        if (!tabs.some((t) => String(t.url).includes(marker))) return false;
+        await pinvoke('cap:tabActivate', tabs.find((t) => String(t.url).includes(marker)).id);
+        return String((await pinvoke('cap:list')).url).includes(marker);
+      }, 15000, `标签 ${marker} 就绪`);
       await pinvoke('cap:tabNew', `${base}/page/2?tab=2`);
-      await sleep(1800);
+      await tabReady('tab=2');
       await pinvoke('cap:tabNew', `${base}/page/3?tab=3`);
-      await sleep(1800);
+      await tabReady('tab=3');
       const tabs = await pinvoke('cap:tabList');
       const per = [];
       for (const t of tabs) {
@@ -1073,6 +1118,30 @@ async function run({ state, store, gpu, extract, settings, automation, format, f
         `导出 reqDelay=${exported.settings.reqDelay} 导入 applied=${im.applied} 内存=${memAfter} 磁盘=${afterImport.settings.reqDelay} 坏文件=${bad.ok}`);
     } catch (e) { check('设置导出/导入', false, e.message); }
 
+    // 104b 导入的 Mock 规则立刻生效（不同步 Fetch 域的话规则要到重启才起作用）
+    try {
+      const cfgMock = await pinvoke('cap:cfgAll');
+      const fMock = path.join(outDir, 'cfg-mock.json');
+      fs.writeFileSync(fMock, JSON.stringify({
+        version: 1,
+        settings: Object.assign({}, cfgMock, {
+          mock: {
+            on: true,
+            rules: [{ on: true, urlRe: `^http://127\\.0\\.0\\.1:\\d+/api/fail`, status: 204,
+              headers: 'X-Mock-Import: 1', body: '', bodyBase64: false }],
+          },
+        }),
+      }), 'utf8');
+      const imMock = await pinvoke('cap:cfgImport', { file: fMock });
+      const msMock = await pinvoke('cap:mockGet');
+      await sleep(300);
+      const gotMock = await extract.evalPage(`fetch('/api/fail').then((r) => r.status).catch((e) => 'err:' + e.message)`);
+      const uiMock = await peval(`({ nReq: document.getElementById('nReq').textContent })`);
+      const offMock = await pinvoke('cap:mockSet', { on: false, rules: [] });
+      check('导入的 Mock 规则立即生效', imMock.ok && msMock.ok && msMock.mock.on === true && gotMock === 204 && offMock.ok,
+        `导入=${imMock.ok} 开关=${msMock.mock && msMock.mock.on} /api/fail 实际状态码=${gotMock}（规则 204）`);
+    } catch (e) { check('导入的 Mock 规则立即生效', false, e.message); }
+
     // 105 快捷键补齐（F5 / Alt+←→ / Ctrl+S）
     try {
       const spy = await peval(`(() => {
@@ -1117,6 +1186,8 @@ async function run({ state, store, gpu, extract, settings, automation, format, f
     try {
       const follow = await peval(`(() => {
         const list = document.getElementById('list');
+        listNew = 0; updateListNew();           // 只量这 60+3 条自己的未读数，不带上游遗留
+        scrollListToBottom();                   // 从底部开始，才测得到「跟随」
         for (let i = 0; i < 60; i++) appendRecord({ id: 991000 + i, method: 'GET', url: 'http://pad/' + i, type: 'XHR', status: 200, size: 1, duration: 1, time: new Date().toISOString() });
         if (list.scrollHeight <= list.clientHeight) return { scrollable: false };
         list.scrollTop = 0;
@@ -1165,16 +1236,16 @@ async function run({ state, store, gpu, extract, settings, automation, format, f
     try {
       const before109 = (await pinvoke('cap:tabList')).length;
       const nt = await pinvoke('cap:tabNew', `${base}/page/2`);
-      await sleep(1200);
-      const l109 = await pinvoke('cap:list');
+      await waitFor(() => pinvoke('cap:list').then((d) => String(d.url).includes('/page/2')), 15000, '新标签已导航').catch(() => {});
+      // 抓包还在往新标签里追加，条数必须取「关闭那一刻」的：closeTab 返回的快照才是撤销要对齐的基准
       const cl = await pinvoke('cap:tabClose', nt.id);
       const un = await pinvoke('cap:tabUndo');
       const un2 = await pinvoke('cap:tabUndo');
       const after109 = await pinvoke('cap:tabList');
       check('关闭标签可撤销',
-        cl.ok && cl.undoMs === 10000 && un.ok && un.records === l109.records.length
+        cl.ok && cl.undoMs === 10000 && un.ok && un.records > 0 && un.records === cl.records
           && after109.length === before109 + 1 && un2.ok === false,
-        `关闭=${cl.ok} 撤销记录=${un.records}/${l109.records.length} 标签 ${before109}→${after109.length}（新建+关闭+撤销）二次撤销=${un2.error}`);
+        `关闭=${cl.ok} 撤销记录=${un.records}（快照 ${cl.records}）标签 ${before109}→${after109.length}（新建+关闭+撤销）二次撤销=${un2.error}`);
     } catch (e) { check('关闭标签可撤销', false, e.message); }
 
     // 110 右键菜单（标签 / 记录行）
@@ -1222,7 +1293,7 @@ async function run({ state, store, gpu, extract, settings, automation, format, f
       session.saveSync();
       const sess = JSON.parse(fs.readFileSync(session.filePath(), 'utf8'));
       const restored112 = await pinvoke('cap:sessionRestore');
-      await sleep(1500);
+      await waitFor(async () => (await pinvoke('cap:tabList')).length === tabsBefore112 + sess.tabs.length, 15000, '恢复的标签已建').catch(() => {});
       const tabsAfter112 = (await pinvoke('cap:tabList')).length;
       const l112 = await pinvoke('cap:list');
       const domRestored = await peval(`(() => {
@@ -1321,6 +1392,19 @@ async function run({ state, store, gpu, extract, settings, automation, format, f
         w1.n >= 1 && w1.all && paused.before === paused.after && cleared === 0 && frames116.ok && frames116.frames.length > 0,
         `过滤后 ${w1.n} 行全命中=${w1.all} 暂停不动=${paused.before === paused.after} 清空后=${cleared} 主进程帧=${frames116.frames.length}`);
     } catch (e) { check('WebSocket 视图过滤/暂停/清空', false, e.message); }
+
+    // 116b WebSocket 视图 DOM 上限（面板与主进程一致保留最近 2000 帧）
+    try {
+      const cap116b = await peval(`(() => {
+        const box = document.getElementById('ws');
+        box.innerHTML = '';
+        for (let i = 0; i < 2100; i++) appendWs({ kind: 'recv', requestId: 'r' + i, opcode: 1, payload: 'frame-' + i, time: Date.now() });
+        return { kids: box.children.length, n: document.getElementById('nWs').textContent, last: box.lastElementChild.textContent };
+      })()`);
+      check('WebSocket 视图 DOM 上限', cap116b.kids === 2000 && cap116b.n === '2000' && cap116b.last.includes('frame-2099'),
+        `DOM=${cap116b.kids} 计数=${cap116b.n} 末帧=${cap116b.last.slice(-12)}`);
+      await peval(`(() => { document.getElementById('wsClear').click(); return true; })()`);
+    } catch (e) { check('WebSocket 视图 DOM 上限', false, e.message); }
 
     // 117 「关闭其他」标签
     try {
@@ -1452,13 +1536,14 @@ async function run({ state, store, gpu, extract, settings, automation, format, f
     // 123 Postman 导出
     try {
       const rec123 = state.records.find((r) => r.method === 'POST' && r.postData) || state.records[state.records.length - 1];
+      const idCount123 = state.records.filter((r) => r.id === rec123.id).length;   // 撞号时导出就会多出一条
       const f123 = path.join(outDir, 'postman.json');
       const r123 = await pinvoke('cap:exportPostman', { ids: [rec123.id], file: f123 });
       const col = r123.ok && fs.existsSync(f123) ? JSON.parse(fs.readFileSync(f123, 'utf8')) : null;
       check('Postman 导出',
         r123.ok && !!col && String(col.info.schema).includes('v2.1.0') && col.item.length === 1
           && col.item[0].request.method === rec123.method && col.item[0].request.header.length >= 1,
-        r123.error || `${path.basename(f123)} item=${col && col.item.length} method=${col && col.item[0].request.method} header=${col && col.item[0].request.header.length}`);
+        r123.error || `${path.basename(f123)} item=${col && col.item.length} method=${col && col.item[0].request.method} header=${col && col.item[0].request.header.length} 同 id 记录数=${idCount123}`);
     } catch (e) { check('Postman 导出', false, e.message); }
 
     // 124 Markdown 表格
@@ -1576,6 +1661,15 @@ async function run({ state, store, gpu, extract, settings, automation, format, f
         w130.ok && w130.done.length === 3 && w130.failed.length === 0 && !leftCk && !leftLs && log130 === '',
         `done=${w130.done.join('/')} failed=${w130.failed.join('/')} 残留 cookie=${leftCk} localStorage=${leftLs} 日志残留=${log130.length} 字符`);
     } catch (e) { check('一键清理运行时数据', false, e.message); }
+
+    // 172 自检沙盒隔离真实登录态（cap:wipe 只清沙盒里的持久分区）
+    try {
+      const ud172 = require('electron').app.getPath('userData');
+      const part172 = require('electron').session.fromPartition(PARTITION).getStoragePath();
+      check('自检沙盒隔离真实登录态',
+        ud172.includes('wct-selftest') && String(part172).includes('wct-selftest'),
+        `userData=${ud172} 分区=${part172}`);
+    } catch (e) { check('自检沙盒隔离真实登录态', false, e.message); }
 
     // 131 抓包事件批处理（100ms 合并后与主进程一致；已 drop 的更新不复活行）
     try {
@@ -1734,6 +1828,26 @@ async function run({ state, store, gpu, extract, settings, automation, format, f
       check('瀑布图跟随筛选', wf137.bars === wf137.expect && wf137.expect >= 1 && wf137.info.includes('命中'),
         `条形=${wf137.bars}/${wf137.expect} 信息=${JSON.stringify(wf137.info)}`);
     } catch (e) { check('瀑布图跟随筛选', false, e.message); }
+
+    // 168 三个视图互斥显示（切到 WebSocket / 瀑布时请求列表必须让位）
+    try {
+      const disp168 = await peval(`(() => {
+        const d = (id) => getComputedStyle(document.getElementById(id)).display;
+        view = 'list'; syncTabs();
+        const list0 = d('list'), wf0 = d('wfView'), ws0 = d('wsView');
+        view = 'wf'; syncTabs();
+        const listW = d('list'), wf1 = d('wfView');
+        view = 'ws'; syncTabs();
+        const listS = d('list'), ws1 = d('wsView');
+        view = 'list'; syncTabs();
+        return { list0, wf0, ws0, listW, wf1, listS, ws1, back: d('list') };
+      })()`);
+      check('视图切换互斥显示',
+        disp168.list0 === 'block' && disp168.wf0 === 'none' && disp168.ws0 === 'none'
+        && disp168.listW === 'none' && disp168.wf1 === 'flex'
+        && disp168.listS === 'none' && disp168.ws1 === 'flex' && disp168.back === 'block',
+        `list=${disp168.list0}/${disp168.listW}/${disp168.listS}/${disp168.back} wf=${disp168.wf0}→${disp168.wf1} ws=${disp168.ws0}→${disp168.ws1}`);
+    } catch (e) { check('视图切换互斥显示', false, e.message); }
 
     // 138 响应体命中随新记录刷新
     try {
@@ -2246,7 +2360,7 @@ async function run({ state, store, gpu, extract, settings, automation, format, f
     check('自检执行', false, `${e.message} | status=${state.status} attached=${wc.debugger.isAttached()}`);
   }
 
-  // ---------------- 67 GPU 判定不误触发（运行 20 秒后复核瞬时状态已稳定）----------------
+  // ---------------- 67 GPU 判定不误触发（复核间隔 3s，见 GPU_RECHECK_MS）----------------
   try {
     const forced = process.argv.includes('--software-rendering');
     const settled = gpu.statusLooksSoftware(gpu.currentStatus());
@@ -2254,6 +2368,9 @@ async function run({ state, store, gpu, extract, settings, automation, format, f
       `softwareMode=${state.softwareMode} 稳定状态=${gpu.describe().gpuCompositing || '(未知)'} 强制参数=${forced}`);
 
     // 157 软件渲染下面板自动降级（关掉全屏模糊与阴影：老机器/无显卡时这几项最贵）
+    // 运行期判定也会经 cap:gpu 通知面板，所以等它对齐，而不是只比启动时那一次
+    await waitFor(() => state.win.webContents.executeJavaScript(
+      `document.body.classList.contains('soft') === ${!!state.softwareMode}`, true), 5000, '面板软件渲染降级').catch(() => {});
     const soft = await state.win.webContents.executeJavaScript(`document.body.classList.contains('soft')`, true);
     check('软件渲染面板降级', soft === state.softwareMode,
       `面板 class=${soft ? 'soft' : '（无）'} softwareMode=${state.softwareMode}`);
@@ -2261,10 +2378,152 @@ async function run({ state, store, gpu, extract, settings, automation, format, f
     check('GPU 判定不误触发', false, e.message);
   }
 
+  // 178 活动标签内存记录 id 唯一（撞号会让「按 id 取详情/导出」拿到另一条）
+  try {
+    const seen178 = new Set();
+    const dup178 = [];
+    for (const r of state.records) {
+      if (seen178.has(r.id)) dup178.push(r.id);
+      seen178.add(r.id);
+    }
+    check('内存记录 id 唯一', dup178.length === 0,
+      `记录 ${state.records.length} 条 / 唯一 id ${seen178.size} 个 / 重复 ${dup178.slice(0, 5).join(',') || '无'}`);
+  } catch (e) { check('内存记录 id 唯一', false, e.message); }
+
+  // 177 敏感权限默认拒绝（127.0.0.1 是安全上下文，不修的话 getCurrentPosition 会被放行）
+  try {
+    const geo = await extract.evalPage(`new Promise((res) => {
+      if (!navigator.geolocation) return res('denied:no-api');
+      navigator.geolocation.getCurrentPosition(() => res('granted'), (e) => res('denied:' + e.code), { timeout: 4000 });
+    })`);
+    const denied177 = String(geo).startsWith('denied');
+    const log177 = logger.tail(80).includes('已拒绝页面权限请求');
+    check('敏感权限默认拒绝', denied177 && log177, `定位回调=${geo} 日志已记录=${log177}`);
+  } catch (e) { check('敏感权限默认拒绝', false, e.message); }
+
+  // ---- 批次 2：数据完整性。都会改全局状态，放在套件末尾 ----
+
+  // 173 次要头缓存不随请求数增长（暂停抓取时记录不建，extraInfo 若照存就是 1:1 的泄漏）
+  // 暂停/恢复的切换瞬间可能有零星事件顺序残留，所以判据是「远小于请求数」而不是精确为 0。
+  try {
+    await state.view.webContents.loadURL(base + '/');
+    await sleep(600);
+    await pinvoke('cap:setEnabled', false);
+    await extract.evalPage(`Promise.all(Array.from({ length: 40 }, (_, i) => fetch('/api/needle?off=' + i).then((r) => r.text()))).catch(() => {})`).catch(() => {});
+    await sleep(1200);
+    const pendOff = state.activeTab.pendingExtra.size;
+    await pinvoke('cap:setEnabled', true);
+    await extract.evalPage(`Promise.all(Array.from({ length: 20 }, (_, i) => fetch('/api/needle?p=' + i).then((r) => r.text()))).catch(() => {})`).catch(() => {});
+    await sleep(1200);
+    const pendOn = state.activeTab.pendingExtra.size;
+    check('次要头缓存不随请求数增长', pendOff <= 5 && pendOn <= 5,
+      `暂停 40 请求后残留=${pendOff}，恢复后再 20 请求残留=${pendOn}（修复前分别是 40 / 随请求数增长，上限 500）`);
+  } catch (e) { check('次要头缓存不随请求数增长', false, e.message); }
+
+  // 174 同一 URL 并发响应落盘不互相覆盖（uniquePathUnder 的存在性检查必须串行）
+  try {
+    const saveDir174 = path.join(outDir, 'autosave-race');
+    fs.rmSync(saveDir174, { recursive: true, force: true });
+    await pinvoke('cap:saveRuleSet', { on: true, dir: saveDir174, urlRe: '/api/data\\?race=1', types: 'all', mimes: '' });
+    await extract.evalPage(`Promise.all([fetch('/api/data?race=1'), fetch('/api/data?race=1')]).then((r) => r.map((x) => x.text()))`).catch(() => {});
+    await waitFor(() => capture.autoSaveState().n >= 2, 20000, '并发响应落盘').catch(() => {});
+    await sleep(500);
+    const st174 = capture.autoSaveState();
+    const dir174 = path.join(saveDir174, 'site');
+    const files174 = [];
+    const walk174 = (d, pre) => {
+      for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+        if (e.isDirectory()) walk174(path.join(d, e.name), pre);
+        else files174.push(pre + e.name);
+      }
+    };
+    if (fs.existsSync(dir174)) walk174(dir174, '');
+    await pinvoke('cap:saveRuleSet', { on: false, dir: saveDir174, urlRe: '/api/data\\?race=1', types: 'all', mimes: '' });
+    // 同 URL 的查询串在文件名里是 _q_<hash>（与离线包同一套命名），重名再插 -1
+    check('并发响应落盘不覆盖', st174.n >= 2 && files174.length === st174.n && files174.length === 2
+      && files174.every((f) => /^data_q_[0-9a-f]{8}(-\d+)?\.json$/.test(f)) && files174.some((f) => /-\d+\.json$/.test(f)),
+      `计数=${st174.n} 文件=[${files174.join(', ')}]`);
+  } catch (e) { check('并发响应落盘不覆盖', false, e.message); }
+
+  // 175 退出收尾不丢 summary（等在飞写入落定后再同步补写）
+  try {
+    const st175 = await pinvoke('cap:recStart', { shots: false });
+    await extract.evalPage(`fetch('/api/data?quitting=1').then((r) => r.text())`).catch(() => {});
+    await sleep(400);
+    await recorder.flushAsync('quit');
+    const lines175 = fs.readFileSync(st175.file, 'utf8').trim().split('\n').filter(Boolean);
+    const last175 = JSON.parse(lines175[lines175.length - 1]);
+    const md175 = fs.existsSync(st175.mdFile) ? fs.readFileSync(st175.mdFile, 'utf8') : '';
+    check('退出收尾不丢 summary', last175.k === 'summary' && last175.reason === 'quit' && md175.includes('停止原因：退出'),
+      `最后一行 k=${last175.k} reason=${last175.reason} md=${md175.includes('停止原因：退出')}`);
+  } catch (e) { check('退出收尾不丢 summary', false, e.message); }
+
+  // 176 会话写盘原子且可重叠（无 .tmp 残留、重叠调用不报错）
+  try {
+    const sa176 = await session.save();
+    const sb176 = await session.save();
+    const onDisk176 = JSON.parse(fs.readFileSync(session.filePath(), 'utf8'));
+    const tmp176 = fs.existsSync(session.filePath() + '.tmp') || fs.existsSync(session.filePath() + '.sync.tmp');
+    check('会话写盘原子且可重叠', sa176.ok && sb176.ok && Array.isArray(onDisk176.records) && !tmp176,
+      `第一=${sa176.ok} 第二=${sb176.skipped ? 'skipped(互斥)' : 'ok'} 落盘=${onDisk176.records.length} 条 tmp 残留=${tmp176}`);
+  } catch (e) { check('会话写盘原子且可重叠', false, e.message); }
+
+  // ---- 编号不回退：这三项会改活动标签的状态（清空 / 恢复 / 切标签），放在套件末尾 ----
+
+  // 169 清空后编号不回退（撞号会让新记录既不显示、详情又取到旧记录）
+  try {
+    await state.view.webContents.loadURL(base + '/');
+    await waitFor(() => state.records.some((r) => r.url === base + '/api/data'), 20000, '清空前抓包就绪');
+    const seqBefore = state.activeTab.seq;
+    await pinvoke('cap:clear');
+    await peval(`(() => { resetListDom(); clearDetail(); return true; })()`);
+    await extract.evalPage(`fetch('/api/data?afterclear=1').then((r) => r.text())`).catch(() => {});
+    const fresh169 = await waitFor(() => state.records.find((r) => String(r.url).includes('afterclear=1')), 20000, '清空后的新记录');
+    await waitFor(() => peval('rows.has(' + fresh169.id + ')'), 8000, '新记录进了面板').catch(() => {});
+    const inRows169 = await peval('rows.has(' + fresh169.id + ')');
+    const detail169 = await pinvoke('cap:detail', fresh169.id);
+    check('清空后编号不回退', state.activeTab.seq > seqBefore && fresh169.id > seqBefore && inRows169 === true
+      && !!detail169 && String(detail169.url).includes('afterclear=1'),
+      `seq ${seqBefore}→${state.activeTab.seq} 新id=${fresh169.id} 面板可见=${inRows169} 详情URL=${detail169 && String(detail169.url).slice(-40)}`);
+  } catch (e) { check('清空后编号不回退', false, e.message); }
+
+  // 170 会话恢复后编号续接
+  try {
+    session.saveSync();
+    const maxRestored = Math.max(0, ...JSON.parse(fs.readFileSync(session.filePath(), 'utf8')).records.map((x) => x.id || 0));
+    const rs170 = await pinvoke('cap:sessionRestore');
+    await extract.evalPage(`fetch('/api/data?afterrestore=1').then((r) => r.text())`).catch(() => {});
+    const fresh170 = await waitFor(() => state.records.find((r) => String(r.url).includes('afterrestore=1')), 20000, '恢复后的新记录');
+    const detail170 = await pinvoke('cap:detail', fresh170.id);
+    check('会话恢复后编号续接', rs170.ok && fresh170.id > maxRestored
+      && !!detail170 && String(detail170.url).includes('afterrestore=1'),
+      `恢复 ${rs170.count} 条（max id=${maxRestored}）新 id=${fresh170.id} 详情URL=${detail170 && String(detail170.url).slice(-40)}`);
+  } catch (e) { check('会话恢复后编号续接', false, e.message); }
+
+  // 171 切标签收起详情（id 只在标签内唯一，留着旧详情会复制到错的那条）
+  try {
+    await state.view.webContents.loadURL(base + '/');
+    await waitFor(() => state.records.some((r) => r.body != null), 20000, '切标签前抓包就绪');
+    const rec171 = state.records.find((r) => r.body != null);
+    await peval(`select(${rec171 ? rec171.id : 0})`);
+    await waitFor(() => peval('detailId != null'), 5000, '详情已打开').catch(() => {});
+    if (state.tabs.length < 2) await pinvoke('cap:tabNew', `${base}/page/2`);
+    const target171 = state.tabs.find((t) => t !== state.activeTab);
+    await pinvoke('cap:tabActivate', target171.id);
+    await waitFor(() => peval('selected === null'), 8000, '切标签后收起详情').catch(() => {});
+    const st171 = await peval(`({ sel: selected, html: document.getElementById('detail').innerHTML })`);
+    check('切标签收起详情', st171.sel === null && st171.html === '',
+      `selected=${st171.sel} 详情残留 ${st171.html.length} 字符`);
+  } catch (e) { check('切标签收起详情', false, e.message); }
+
   const failed = results.filter((r) => !r.pass).length;
   console.log(`\n${results.length - failed}/${results.length} 通过`);
   clearTimeout(watchdog);
   server.close();
+  // 产物目录（含离线包镜像树）只在失败时保留，方便排查
+  if (!failed) {
+    try { fs.rmSync(outDir, { recursive: true, force: true }); } catch (e) { /* 有句柄占用就算了 */ }
+  }
   require('electron').app.exit(failed ? 1 : 0);
 }
 

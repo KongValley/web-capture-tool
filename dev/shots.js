@@ -120,7 +120,7 @@ function startFixture(cb) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function make(inj) {
-  const { state, layout } = inj;
+  const { state, layout, toolbarH } = inj;
   const wc = () => state.win.webContents;
   const peval = (code) => wc().executeJavaScript(code, true);
   const page = (code) => state.view.webContents.executeJavaScript(code, true);
@@ -147,9 +147,9 @@ function make(inj) {
     if (!rect) rect = null;
     else if (rect === 'window') rect = null;
     else if (rect === 'panel') {
-      // 从工具栏下面开始截：面板图要的是面板本身，三条工具栏（顶到 y=164）裁掉更干净
+      // 从工具栏下面开始截：面板图要的是面板本身，工具栏（高度由 TOOLBAR_H 注入）裁掉更干净
       const { width, height } = state.win.getContentBounds();
-      rect = { x: Math.max(0, width - PANEL_W), y: 164, width: Math.min(PANEL_W, width), height: Math.max(0, height - 164) };
+      rect = { x: Math.max(0, width - PANEL_W), y: toolbarH, width: Math.min(PANEL_W, width), height: Math.max(0, height - toolbarH) };
     }
     await hideBanners();
     await sleep(SETTLE);
@@ -305,8 +305,10 @@ function make(inj) {
       rules: [{ on: true, urlRe: '^http://127\\.0\\.0\\.1:\\d+/api/fail', status: 200, headers: 'X-Mock: 1\nContent-Type: application/json', body: '{"ok":true,"mocked":true}', bodyBase64: false }],
     });
     await capture.syncMock();
+    const nMock = Number(await peval('rows.size'));
     await page('location.reload()');
-    await waitFor(async () => Number(await peval('rows.size')) >= 8, 20000, 'Mock 命中后重新抓取');
+    // rows.size 是面板累计值、本轮之前就 >= 8，所以必须等「新增记录且命中改写后的状态码」
+    await waitFor(async () => await peval(`rows.size > ${nMock} && [...rows.values()].some((v) => v.rec && String(v.rec.url).includes('/api/fail') && v.rec.status === 200)`), 20000, 'Mock 命中后重新抓取');
     await sleep(300);
     await click('mockRule');
     await waitFor(modalVisible, 8000, 'Mock');
