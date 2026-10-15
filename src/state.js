@@ -3,7 +3,8 @@
  * 共享状态与常量。所有模块只通过本文件读写共享状态，禁止反向依赖 main.js（避免循环 require）。
  */
 const PARTITION = 'persist:capture';   // 持久分区：Cookie / localStorage 跨重启保留
-const TOOLBAR_H = 164;                 // 四行工具栏总高（44 + 40 + 40 + 40），必须与 index.html 的 #body 高度一致
+const TOOLBAR_H = 164;                 // 四行工具栏的初始总高（44 + 40 + 40 + 40）；工具栏会按窗口宽度换行，
+                                       // 真实高度由面板量出后经 cap:toolbarH 写回 state.toolbarH（见 ui/renderer.js）
 const MAX_RECORDS = 5000;
 const MAX_BODY = 32 * 1024 * 1024;         // 单条响应体上限
 const MAX_TOTAL_BODY = 256 * 1024 * 1024;  // 全部响应体总量上限
@@ -13,6 +14,7 @@ const state = {
   win: null,
   view: null,                  // 活动标签的 BrowserView（镜像字段，既有代码直接用）
   panelWidth: 520,
+  toolbarH: TOOLBAR_H,         // 工具栏实际占用高度（面板换行后上报，原生视图的 y 起点）
   enabled: true,
   status: '初始化中',
   records: [],                 // 活动标签的记录（镜像）

@@ -2742,6 +2742,20 @@ function fillCfgControls(cfgAll) {
   }
 }
 
+/* ---------------------------------------------- 工具栏高度上报（视图跟着下移） */
+// 工具栏随窗口/面板宽度换行，只有本进程知道换行后的真实高度：量出来回传，主进程据此摆放原生视图。
+let lastToolbarH = 0;
+const reportToolbarH = () => {
+  const h = Math.ceil($('tabstrip').getBoundingClientRect().bottom);
+  if (h < 80 || h === lastToolbarH) return;
+  lastToolbarH = h;
+  ipcRenderer.invoke('cap:toolbarH', h);
+};
+const toolbarRo = new ResizeObserver(reportToolbarH);
+toolbarRo.observe($('toolbar2'));
+toolbarRo.observe($('toolbar3'));
+window.addEventListener('resize', reportToolbarH);
+
 (async () => {
   const d = await ipcRenderer.invoke('cap:list');
   // 无显卡 / 软件渲染：关掉全屏模糊与阴影这类合成开销（老机器上最贵的一项）
@@ -2763,4 +2777,5 @@ function fillCfgControls(cfgAll) {
       { id: 'discardSession', label: '忽略' },
     ]);
   }
+  reportToolbarH();
 })();

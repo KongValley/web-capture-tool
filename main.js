@@ -81,13 +81,13 @@ if (state.softwareMode) app.disableHardwareAcceleration();
 /* ------------------------------------------------------------------ 视图 */
 
 function layout() {
-  const { win, view, panelWidth } = state;
+  const { win, view, panelWidth, toolbarH } = state;
   if (!win || win.isDestroyed() || !view) return;
   const { width, height } = win.getContentBounds();
   view.setBounds({
-    x: 0, y: Math.round(TOOLBAR_H),
+    x: 0, y: Math.round(toolbarH),
     width: Math.round(Math.max(120, width - panelWidth)),
-    height: Math.round(Math.max(120, height - TOOLBAR_H)),
+    height: Math.round(Math.max(120, height - toolbarH)),
   });
 }
 
@@ -449,6 +449,12 @@ function registerIpc() {
     store.save();
     layout();
     return state.panelWidth;
+  });
+  // 工具栏换行后的真实高度：面板量出后回传，原生视图的 y 起点跟着走（不落盘，每次启动重新量）
+  ipcMain.handle('cap:toolbarH', (_e, h) => {
+    const v = Math.max(80, Math.min(1000, Math.round(Number(h) || 0)));
+    if (v !== state.toolbarH) { state.toolbarH = v; layout(); }
+    return state.toolbarH;
   });
   ipcMain.handle('cap:pageData', () => extract.collectPageData().then((pd) => ({
     url: pd.url, title: pd.title, htmlLength: pd.html.length, html: pd.html,
@@ -1153,7 +1159,7 @@ app.whenReady().then(() => {
     require('./dev/bench.js').run({ state, capture, session: sessionStore, gpu });
   }
   if (state.shots) {
-    require('./dev/shots.js').run({ state, layout, settings, capture, session: sessionStore, toolbarH: TOOLBAR_H });
+    require('./dev/shots.js').run({ state, layout, settings, capture, session: sessionStore, toolbarH: state.toolbarH || TOOLBAR_H });
   }
   app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
 });

@@ -59,16 +59,18 @@
   button.ghost:hover:not(:disabled) { background: var(--elev); }
   :focus-visible { outline: none; box-shadow: 0 0 0 2px var(--accent-dim); }
 
-  /* 工具栏（四行高度必须与 state.js 的 TOOLBAR_H = 164 一致） */
+  /* 工具栏（前三行高度随宽度换行变化，面板量出真实高度后回传主进程摆放视图） */
   #toolbar {
     height: 44px; display: flex; align-items: center; gap: 6px; padding: 0 8px;
     border-bottom: 1px solid var(--line); background: var(--panel);
   }
   #toolbar2, #toolbar3 {
-    height: 40px; display: flex; align-items: center; gap: 6px; padding: 0 8px;
+    min-height: 40px; display: flex; align-items: center; gap: 6px; padding: 4px 8px;
     border-bottom: 1px solid var(--line); background: var(--panel);
-    overflow-x: auto; overflow-y: hidden; white-space: nowrap;
+    flex-wrap: wrap; row-gap: 4px; white-space: nowrap; overflow-x: auto;
   }
+  /* 控件不收缩：装不下就整行换行，而不是把输入框挤扁 */
+  #toolbar2 > *, #toolbar3 > * { flex: none; }
   .lbl { color: var(--muted); font-size: 12px; flex: none; }
   #recToggle.on { background: #f8514922; border-color: var(--err); color: var(--err); }
 

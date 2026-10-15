@@ -147,9 +147,10 @@ function make(inj) {
     if (!rect) rect = null;
     else if (rect === 'window') rect = null;
     else if (rect === 'panel') {
-      // 从工具栏下面开始截：面板图要的是面板本身，工具栏（高度由 TOOLBAR_H 注入）裁掉更干净
+      // 从工具栏下面开始截：面板图要的是面板本身，工具栏高度按运行时上报的实际值裁（换行后比常量高）
+      const h = state.toolbarH || toolbarH;
       const { width, height } = state.win.getContentBounds();
-      rect = { x: Math.max(0, width - PANEL_W), y: toolbarH, width: Math.min(PANEL_W, width), height: Math.max(0, height - toolbarH) };
+      rect = { x: Math.max(0, width - PANEL_W), y: h, width: Math.min(PANEL_W, width), height: Math.max(0, height - h) };
     }
     await hideBanners();
     await sleep(SETTLE);
